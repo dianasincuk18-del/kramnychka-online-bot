@@ -595,15 +595,15 @@ def build_product_keyboard(product_id, products, index, mode="category", categor
 
     if index > 0:
         if mode == "sale":
-            nav_buttons.append(inline_button("⬅️ Попередній", f"product_page_{index - 1}"))
+            nav_buttons.append(inline_button("⬅️ Попередній товар", f"product_page_{index - 1}"))
         else:
-            nav_buttons.append(inline_button("⬅️ Попередній", f"product_page_{index - 1}"))
+            nav_buttons.append(inline_button("⬅️ Попередній товар", f"product_page_{index - 1}"))
 
     if index < total - 1:
         if mode == "sale":
-            nav_buttons.append(inline_button("➡️ Наступний", f"product_page_{index + 1}"))
+            nav_buttons.append(inline_button("➡️ Наступний товар", f"product_page_{index + 1}"))
         else:
-            nav_buttons.append(inline_button("➡️ Наступний", f"product_page_{index + 1}"))
+            nav_buttons.append(inline_button("➡️ Наступний товар", f"product_page_{index + 1}"))
 
     if nav_buttons:
         buttons.append(nav_buttons)
@@ -658,6 +658,14 @@ def show_product_card(chat_id, products, index=0, mode="category", category_id="
     product = products[index]
     product_id = product.get("ID товару")
 
+    USER_STATES[str(chat_id)] = {
+        "step": "viewing_products",
+        "products": products,
+        "index": index,
+        "mode": mode,
+        "category_id": category_id
+    }
+
     photos = get_product_photos(product)
     photo_index = max(0, min(int(photo_index), len(photos) - 1)) if photos else 0
 
@@ -685,6 +693,14 @@ def update_product_card(chat_id, message_id, products, index=0, mode="category",
     index = max(0, min(int(index), total - 1))
     product = products[index]
     product_id = product.get("ID товару")
+
+    USER_STATES[str(chat_id)] = {
+        "step": "viewing_products",
+        "products": products,
+        "index": index,
+        "mode": mode,
+        "category_id": category_id
+    }
 
     photos = get_product_photos(product)
     photo_index = max(0, min(int(photo_index), len(photos) - 1)) if photos else 0
@@ -1823,14 +1839,17 @@ def webhook():
 
         elif data_value.startswith("catpage_"):
             parts = data_value.split("_")
-            category_id = parts[1]
-            page = int(parts[2])
-            products = get_active_products_by_category(category_id)
-            update_product_card(chat_id, message_id, products, page, "category", category_id, 0, callback_message)
+            page = int(parts[-1])
+            state = USER_STATES.get(str(chat_id), {})
+            products = state.get("products", [])
+            mode = state.get("mode", "category")
+            category_id = state.get("category_id", "")
+            update_product_card(chat_id, message_id, products, page, mode, category_id, 0, callback_message)
 
         elif data_value.startswith("sale_page_"):
             page = int(data_value.replace("sale_page_", ""))
-            products = get_sale_products()
+            state = USER_STATES.get(str(chat_id), {})
+            products = state.get("products", get_sale_products())
             update_product_card(chat_id, message_id, products, page, "sale", "", 0, callback_message)
 
         elif data_value == "product_unavailable":
