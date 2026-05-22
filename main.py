@@ -376,6 +376,7 @@ def show_product_card(chat_id, products, index=0, mode="category", category_id="
     index = max(0, min(int(index), total - 1))
     product = products[index]
     product_id = product.get("ID товару")
+    photo = str(product.get("Фото")).strip()
 
     text = product_text(product, index, total)
 
@@ -404,10 +405,15 @@ def show_product_card(chat_id, products, index=0, mode="category", category_id="
 
     keyboard = {"inline_keyboard": buttons}
 
-    send_message(chat_id, text, keyboard)
+    if photo:
+        send_photo(chat_id, photo, text, keyboard)
+    else:
+        send_message(chat_id, text, keyboard)
 
 
-def update_product_card(chat_id, message_id, products, index=0, mode="category", category_id=""):
+def update_product_card(chat_id, callback_message, products, index=0, mode="category", category_id=""):
+    message_id = callback_message["message_id"]
+
     if not products:
         edit_message(
             chat_id,
@@ -421,6 +427,7 @@ def update_product_card(chat_id, message_id, products, index=0, mode="category",
     index = max(0, min(int(index), total - 1))
     product = products[index]
     product_id = product.get("ID товару")
+    photo = str(product.get("Фото")).strip()
 
     text = product_text(product, index, total)
 
@@ -449,7 +456,14 @@ def update_product_card(chat_id, message_id, products, index=0, mode="category",
 
     keyboard = {"inline_keyboard": buttons}
 
-    edit_message(chat_id, message_id, text, keyboard)
+    # Якщо поточне повідомлення вже з фото — редагуємо підпис.
+    # Якщо без фото, а в товару є фото — надсилаємо нову фотокартку.
+    if "photo" in callback_message:
+        edit_caption(chat_id, message_id, text, keyboard)
+    elif photo:
+        send_photo(chat_id, photo, text, keyboard)
+    else:
+        edit_message(chat_id, message_id, text, keyboard)
 
 
 def show_products_by_category(chat_id, category_id):
@@ -1041,12 +1055,12 @@ def webhook():
             category_id = parts[1]
             page = int(parts[2])
             products = get_active_products_by_category(category_id)
-            update_product_card(chat_id, message_id, products, page, "category", category_id)
+            update_product_card(chat_id, callback_message, products, page, "category", category_id)
 
         elif data_value.startswith("sale_page_"):
             page = int(data_value.replace("sale_page_", ""))
             products = get_sale_products()
-            update_product_card(chat_id, message_id, products, page, "sale")
+            update_product_card(chat_id, callback_message, products, page, "sale")
 
         elif data_value.startswith("add_one_"):
             product_id = data_value.replace("add_one_", "")
