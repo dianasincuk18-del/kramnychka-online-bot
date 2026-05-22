@@ -365,6 +365,34 @@ def get_active_categories():
     ]
 
 
+
+def get_active_subcategories(category_id):
+    subcategories = get_records("Підкатегорії")
+    result = []
+
+    for item in subcategories:
+        active = str(item.get("Активна", "")).strip().lower()
+        item_category_id = str(item.get("ID категорії", "")).strip()
+
+        if item_category_id == str(category_id) and active in ["так", "yes", "1", "true", "активна"]:
+            result.append(item)
+
+    return result
+
+
+def get_products_by_subcategory(subcategory_id):
+    products = get_records("Товари")
+    result = []
+
+    for product in products:
+        active = str(product.get("Активний", "")).strip().lower()
+        product_subcategory_id = str(product.get("ID підкатегорії", "")).strip()
+
+        if product_subcategory_id == str(subcategory_id) and active in ["так", "yes", "1", "true", "активний"]:
+            result.append(product)
+
+    return result
+
 def get_category_by_button_text(text):
     clean_text = str(text).replace("📁", "").strip()
     categories = get_active_categories()
@@ -593,6 +621,69 @@ def update_product_card(chat_id, callback_message, products, index=0, mode="cate
         send_photo(chat_id, photo, text, keyboard)
     else:
         edit_message(chat_id, message_id, text, keyboard)
+
+
+
+def show_subcategories(chat_id, category_id, callback_message=None):
+    subcategories = get_active_subcategories(category_id)
+
+    if not subcategories:
+        text = "У цій категорії поки немає підкатегорій 😔"
+        keyboard = {
+            "inline_keyboard": [
+                [inline_button("⬅️ Назад до категорій", "back_categories")]
+            ]
+        }
+
+        if callback_message:
+            edit_message(chat_id, callback_message["message_id"], text, keyboard)
+        else:
+            send_message(chat_id, text, keyboard)
+        return
+
+    buttons = []
+
+    for subcategory in subcategories:
+        subcategory_id = subcategory.get("ID підкатегорії")
+        name = subcategory.get("Назва підкатегорії")
+        buttons.append([inline_button(name, f"subcategory_{subcategory_id}")])
+
+    buttons.append([inline_button("⬅️ Назад до категорій", "back_categories")])
+
+    keyboard = {"inline_keyboard": buttons}
+    text = "Оберіть підкатегорію 👇"
+
+    if callback_message:
+        edit_message(chat_id, callback_message["message_id"], text, keyboard)
+    else:
+        send_message(chat_id, text, keyboard)
+
+
+def show_products_by_subcategory(chat_id, subcategory_id, callback_message=None):
+    products = get_products_by_subcategory(subcategory_id)
+
+    if not products:
+        text = "У цій підкатегорії поки немає товарів 😔"
+        keyboard = {
+            "inline_keyboard": [
+                [inline_button("⬅️ Назад до категорій", "back_categories")]
+            ]
+        }
+
+        if callback_message:
+            edit_message(chat_id, callback_message["message_id"], text, keyboard)
+        else:
+            send_message(chat_id, text, keyboard)
+        return
+
+    USER_STATES[str(chat_id)] = {
+        "step": "viewing_products",
+        "products": products,
+        "index": 0,
+        "subcategory_id": subcategory_id
+    }
+
+    show_product_card(chat_id, products, 0, callback_message)
 
 
 def show_products_by_category(chat_id, category_id):
