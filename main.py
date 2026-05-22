@@ -477,6 +477,79 @@ def product_text(product, index=None, total=None):
     return text
 
 
+def get_product_photos(product):
+    photos = []
+
+    for key in ["Фото 1", "Фото 2", "Фото 3", "Фото 4", "Фото 5"]:
+        value = str(product.get(key, "") or "").strip()
+        if value:
+            photos.append(value)
+
+    old_photo = str(product.get("Фото", "") or "").strip()
+    if old_photo and old_photo not in photos:
+        # Підтримка старої колонки "Фото".
+        # Якщо там кілька посилань через кому — теж розділяємо.
+        if "," in old_photo:
+            for part in old_photo.split(","):
+                part = part.strip()
+                if part and part not in photos:
+                    photos.append(part)
+        else:
+            photos.append(old_photo)
+
+    return photos
+
+
+def build_product_keyboard(product_id, products, index, mode="category", category_id="", photo_index=0):
+    total = len(products)
+    product = products[index]
+    photos = get_product_photos(product)
+    photo_total = len(photos)
+
+    availability = str(product.get("Наявність", "") or "").strip().lower()
+
+    if availability == "немає":
+        buttons = [
+            [inline_button("❌ Немає в наявності", "product_unavailable")]
+        ]
+    else:
+        buttons = [
+            [inline_button("🛒 Додати в кошик", f"add_one_{product_id}")]
+        ]
+
+    if photo_total > 1:
+        prev_photo = photo_index - 1 if photo_index > 0 else photo_total - 1
+        next_photo = photo_index + 1 if photo_index < photo_total - 1 else 0
+
+        buttons.append([
+            inline_button("⬅️ Фото", f"photo_{mode}_{category_id}_{index}_{prev_photo}"),
+            inline_button(f"Фото {photo_index + 1}/{photo_total}", "photo_counter"),
+            inline_button("➡️ Фото", f"photo_{mode}_{category_id}_{index}_{next_photo}")
+        ])
+
+    nav_buttons = []
+
+    if index > 0:
+        if mode == "sale":
+            nav_buttons.append(inline_button("⬅️ Попередній", f"sale_page_{index - 1}"))
+        else:
+            nav_buttons.append(inline_button("⬅️ Попередній", f"catpage_{category_id}_{index - 1}"))
+
+    if index < total - 1:
+        if mode == "sale":
+            nav_buttons.append(inline_button("➡️ Наступний", f"sale_page_{index + 1}"))
+        else:
+            nav_buttons.append(inline_button("➡️ Наступний", f"catpage_{category_id}_{index + 1}"))
+
+    if nav_buttons:
+        buttons.append(nav_buttons)
+
+    buttons.append([inline_button("🛒 Перейти в кошик", "open_cart")])
+
+    return {"inline_keyboard": buttons}
+
+
+
 # =========================
 # BOT LOGIC
 # =========================
@@ -510,7 +583,8 @@ def show_catalog_menu(chat_id):
     )
 
 
-def show_product_card(chat_id, products, index=0, mode="category", category_id=""):
+
+def show_product_card(chat_id, products, index=0, mode="category", category_id="", photo_index=0):
     if not products:
         send_message(chat_id, "Товарів поки немає 😔", main_menu(is_admin(chat_id)))
         return
@@ -519,49 +593,20 @@ def show_product_card(chat_id, products, index=0, mode="category", category_id="
     index = max(0, min(int(index), total - 1))
     product = products[index]
     product_id = product.get("ID товару")
-    photo = str(product.get("Фото")).strip()
+
+    photos = get_product_photos(product)
+    photo_index = max(0, min(int(photo_index), len(photos) - 1)) if photos else 0
 
     text = product_text(product, index, total)
+    keyboard = build_product_keyboard(product_id, products, index, mode, category_id, photo_index)
 
-    availability = str(product.get("Наявність", "") or "").strip().lower()
-
-    if availability == "немає":
-        buttons = [
-            [inline_button("❌ Немає в наявності", "product_unavailable")]
-        ]
-    else:
-        buttons = [
-            [inline_button("🛒 Додати в кошик", f"add_one_{product_id}")]
-        ]
-
-    nav_buttons = []
-
-    if index > 0:
-        if mode == "sale":
-            nav_buttons.append(inline_button("⬅️ Попередній", f"sale_page_{index - 1}"))
-        else:
-            nav_buttons.append(inline_button("⬅️ Попередній", f"catpage_{category_id}_{index - 1}"))
-
-    if index < total - 1:
-        if mode == "sale":
-            nav_buttons.append(inline_button("➡️ Наступний", f"sale_page_{index + 1}"))
-        else:
-            nav_buttons.append(inline_button("➡️ Наступний", f"catpage_{category_id}_{index + 1}"))
-
-    if nav_buttons:
-        buttons.append(nav_buttons)
-
-    buttons.append([inline_button("🛒 Перейти в кошик", "open_cart")])
-
-    keyboard = {"inline_keyboard": buttons}
-
-    if photo:
-        send_photo(chat_id, photo, text, keyboard)
+    if photos:
+        send_photo(chat_id, photos[photo_index], text, keyboard)
     else:
         send_message(chat_id, text, keyboard)
 
 
-def update_product_card(chat_id, callback_message, products, index=0, mode="category", category_id=""):
+def update_product_card(chat_id, callback_message, products, index=0, mode="category", category_id="", photo_index=0):
     message_id = callback_message["message_id"]
 
     if not products:
@@ -577,52 +622,19 @@ def update_product_card(chat_id, callback_message, products, index=0, mode="cate
     index = max(0, min(int(index), total - 1))
     product = products[index]
     product_id = product.get("ID товару")
-    photo = str(product.get("Фото")).strip()
+
+    photos = get_product_photos(product)
+    photo_index = max(0, min(int(photo_index), len(photos) - 1)) if photos else 0
 
     text = product_text(product, index, total)
+    keyboard = build_product_keyboard(product_id, products, index, mode, category_id, photo_index)
 
-    availability = str(product.get("Наявність", "") or "").strip().lower()
-
-    if availability == "немає":
-        buttons = [
-            [inline_button("❌ Немає в наявності", "product_unavailable")]
-        ]
-    else:
-        buttons = [
-            [inline_button("🛒 Додати в кошик", f"add_one_{product_id}")]
-        ]
-
-    nav_buttons = []
-
-    if index > 0:
-        if mode == "sale":
-            nav_buttons.append(inline_button("⬅️ Попередній", f"sale_page_{index - 1}"))
-        else:
-            nav_buttons.append(inline_button("⬅️ Попередній", f"catpage_{category_id}_{index - 1}"))
-
-    if index < total - 1:
-        if mode == "sale":
-            nav_buttons.append(inline_button("➡️ Наступний", f"sale_page_{index + 1}"))
-        else:
-            nav_buttons.append(inline_button("➡️ Наступний", f"catpage_{category_id}_{index + 1}"))
-
-    if nav_buttons:
-        buttons.append(nav_buttons)
-
-    buttons.append([inline_button("🛒 Перейти в кошик", "open_cart")])
-
-    keyboard = {"inline_keyboard": buttons}
-
-    # Якщо поточне повідомлення вже з фото — редагуємо підпис.
-    # Якщо без фото, а в товару є фото — надсилаємо нову фотокартку.
     if "photo" in callback_message:
         edit_caption(chat_id, message_id, text, keyboard)
-    elif photo:
-        send_photo(chat_id, photo, text, keyboard)
+    elif photos:
+        send_photo(chat_id, photos[photo_index], text, keyboard)
     else:
         edit_message(chat_id, message_id, text, keyboard)
-
-
 
 def show_subcategories(chat_id, category_id, callback_message=None):
     subcategories = get_active_subcategories(category_id)
@@ -1689,17 +1701,38 @@ def webhook():
         if callback_id:
             answer_callback(callback_id)
 
-        if data_value.startswith("catpage_"):
+        if data_value.startswith("photo_"):
+            # Формат: photo_mode_categoryid_productindex_photoindex
+            parts = data_value.split("_")
+            mode = parts[1]
+            category_id = parts[2]
+            product_index = int(parts[3])
+            photo_index = int(parts[4])
+
+            if mode == "sale":
+                products = get_sale_products()
+            else:
+                products = get_active_products_by_category(category_id)
+
+            try:
+                update_product_card(chat_id, message_id, products, product_index, mode, category_id, photo_index, callback_message)
+            except TypeError:
+                update_product_card(chat_id, callback_message, products, product_index, mode, category_id, photo_index)
+
+        elif data_value == "photo_counter":
+            answer_callback(callback_id)
+
+        elif data_value.startswith("catpage_"):
             parts = data_value.split("_")
             category_id = parts[1]
             page = int(parts[2])
             products = get_active_products_by_category(category_id)
-            update_product_card(chat_id, callback_message, products, page, "category", category_id)
+            update_product_card(chat_id, callback_message, products, page, "category", category_id, 0)
 
         elif data_value.startswith("sale_page_"):
             page = int(data_value.replace("sale_page_", ""))
             products = get_sale_products()
-            update_product_card(chat_id, callback_message, products, page, "sale")
+            update_product_card(chat_id, callback_message, products, page, "sale", "", 0)
 
         elif data_value == "product_unavailable":
             answer_callback(callback_id)
