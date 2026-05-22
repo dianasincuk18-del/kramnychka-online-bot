@@ -679,6 +679,27 @@ def start_order(chat_id):
     send_message(chat_id, "Введіть, будь ласка, Ваше ПІБ:")
 
 
+def handle_contact_state(chat_id, text, user):
+    state = USER_STATES.get(str(chat_id))
+
+    if not state:
+        return False
+
+    if state.get("step") == "contact_waiting_full_name":
+        state["contact_full_name"] = text.strip()
+        state["step"] = "contact_waiting_phone"
+        send_message(chat_id, "Введіть, будь ласка, Ваш номер телефону:")
+        return True
+
+    if state.get("step") == "contact_waiting_phone":
+        state["contact_phone"] = text.strip()
+        finish_contact_request(chat_id, user, state)
+        USER_STATES.pop(str(chat_id), None)
+        return True
+
+    return False
+
+
 def handle_order_state(chat_id, text, user):
     state = USER_STATES.get(str(chat_id))
 
@@ -795,20 +816,35 @@ def notify_admin(full_name, phone, address, products, total, need_contact, teleg
 
 
 def contact_manager(chat_id, user):
-    first_name = user.get("first_name", "")
+    USER_STATES[str(chat_id)] = {
+        "step": "contact_waiting_full_name",
+        "contact_full_name": "",
+        "contact_phone": ""
+    }
 
     send_message(
         chat_id,
         "📞 <b>Зв’язатися з менеджером</b>\n\n"
-        "Вашу заявку передано менеджеру. Вам скоро напишуть 💛",
+        "Введіть, будь ласка, Ваше ПІБ:"
+    )
+
+
+def finish_contact_request(chat_id, user, state):
+    full_name = state.get("contact_full_name", "")
+    phone = state.get("contact_phone", "")
+
+    send_message(
+        chat_id,
+        "✅ Вашу заявку передано менеджеру.\n"
+        "Вам скоро напишуть або зателефонують 💛",
         main_menu(is_admin(chat_id))
     )
 
     if ADMIN_CHAT_ID:
         text = (
             "📞 <b>Нова заявка на зв’язок</b>\n\n"
-            f"Клієнт хоче, щоб менеджер з ним зв’язався.\n"
-            f"<b>Ім’я:</b> {first_name or '—'}"
+            f"<b>ПІБ:</b> {full_name}\n"
+            f"<b>Телефон:</b> {phone}"
         )
 
         send_message(ADMIN_CHAT_ID, text)
@@ -1251,6 +1287,8 @@ def webhook():
             start(chat_id)
         elif text == "/myid":
             show_my_id(chat_id)
+        elif handle_contact_state(chat_id, text, user):
+            pass
         elif handle_admin_state(chat_id, text):
             pass
         elif handle_order_state(chat_id, text, user):
