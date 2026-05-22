@@ -793,45 +793,57 @@ def show_delivery_payment(chat_id):
 # ADMIN CABINET
 # =========================
 
-def show_admin_cabinet(chat_id, callback_message=None):
-    if not is_admin(chat_id):
-        send_message(chat_id, "Цей розділ доступний тільки адміністратору.", main_menu(False))
-        return
-
+def get_status_stats():
     orders = get_orders_with_rows()
 
-    new_orders = []
-    processed_orders = []
-    total_new = 0
-    total_processed = 0
+    stats = {
+        "Нове": {"count": 0, "sum": 0},
+        "В обробці": {"count": 0, "sum": 0},
+        "Відправлено": {"count": 0, "sum": 0},
+        "Скасовано": {"count": 0, "sum": 0},
+        "Опрацьовано": {"count": 0, "sum": 0},
+    }
 
     for order in orders:
-        status = str(order.get("Статус")).strip().lower()
+        status = str(order.get("Статус")).strip()
+
+        if status not in stats:
+            status = "Нове"
 
         try:
             value = float(order.get("Сума") or 0)
         except:
             value = 0
 
-        if status == "нове":
-            new_orders.append(order)
-            total_new += value
-        elif status == "опрацьовано":
-            processed_orders.append(order)
-            total_processed += value
+        stats[status]["count"] += 1
+        stats[status]["sum"] += value
+
+    return stats
+
+
+def show_admin_cabinet(chat_id, callback_message=None):
+    if not is_admin(chat_id):
+        send_message(chat_id, "Цей розділ доступний тільки адміністратору.", main_menu(False))
+        return
+
+    stats = get_status_stats()
 
     text = (
         "👑 <b>Кабінет</b>\n\n"
-        f"🆕 Нові замовлення: <b>{len(new_orders)}</b>\n"
-        f"💰 Сума нових: <b>{total_new} грн</b>\n\n"
-        f"✅ Опрацьовані: <b>{len(processed_orders)}</b>\n"
-        f"💰 Сума опрацьованих: <b>{total_processed} грн</b>"
+        f"🆕 Нові: <b>{stats['Нове']['count']}</b> / {stats['Нове']['sum']} грн\n"
+        f"🟡 В обробці: <b>{stats['В обробці']['count']}</b> / {stats['В обробці']['sum']} грн\n"
+        f"🚚 Відправлено: <b>{stats['Відправлено']['count']}</b> / {stats['Відправлено']['sum']} грн\n"
+        f"❌ Скасовано: <b>{stats['Скасовано']['count']}</b> / {stats['Скасовано']['sum']} грн\n"
+        f"✅ Опрацьовано: <b>{stats['Опрацьовано']['count']}</b> / {stats['Опрацьовано']['sum']} грн"
     )
 
     keyboard = {
         "inline_keyboard": [
-            [inline_button("🆕 Нові замовлення", "admin_new_orders")],
-            [inline_button("✅ Опрацьовані", "admin_processed_orders")],
+            [inline_button("🆕 Нові", "admin_status_Нове")],
+            [inline_button("🟡 В обробці", "admin_status_В обробці")],
+            [inline_button("🚚 Відправлено", "admin_status_Відправлено")],
+            [inline_button("❌ Скасовано", "admin_status_Скасовано")],
+            [inline_button("✅ Опрацьовано", "admin_status_Опрацьовано")],
             [inline_button("💰 Сума замовлень", "admin_orders_sum")]
         ]
     }
@@ -842,15 +854,29 @@ def show_admin_cabinet(chat_id, callback_message=None):
         send_message(chat_id, text, keyboard)
 
 
-def show_admin_new_orders(chat_id, callback_message=None):
+def status_emoji(status):
+    if status == "Нове":
+        return "🆕"
+    if status == "В обробці":
+        return "🟡"
+    if status == "Відправлено":
+        return "🚚"
+    if status == "Скасовано":
+        return "❌"
+    if status == "Опрацьовано":
+        return "✅"
+    return "📦"
+
+
+def show_orders_by_status(chat_id, status, callback_message=None):
     if not is_admin(chat_id):
         return
 
     orders = get_orders_with_rows()
-    new_orders = [o for o in orders if str(o.get("Статус")).strip().lower() == "нове"]
+    filtered = [o for o in orders if str(o.get("Статус")).strip() == status]
 
-    if not new_orders:
-        text = "Нових замовлень немає ✅"
+    if not filtered:
+        text = f"{status_emoji(status)} Замовлень зі статусом <b>{status}</b> немає."
         keyboard = {"inline_keyboard": [[inline_button("⬅️ Назад у кабінет", "admin_back")]]}
 
         if callback_message:
@@ -859,10 +885,10 @@ def show_admin_new_orders(chat_id, callback_message=None):
             send_message(chat_id, text, keyboard)
         return
 
-    order = new_orders[-1]
+    order = filtered[-1]
 
     text = (
-        "🆕 <b>Останнє нове замовлення</b>\n\n"
+        f"{status_emoji(status)} <b>Замовлення: {status}</b>\n\n"
         f"<b>Дата:</b> {order.get('Дата')}\n"
         f"<b>ПІБ:</b> {order.get('ПІБ')}\n"
         f"<b>Телефон:</b> {order.get('Телефон')}\n"
@@ -871,13 +897,18 @@ def show_admin_new_orders(chat_id, callback_message=None):
         f"<b>Сума:</b> {order.get('Сума')} грн\n"
         f"<b>Потрібно зв’язатись:</b> {order.get('Потрібно зв’язатись')}\n"
         f"<b>Статус:</b> {order.get('Статус')}\n\n"
-        f"Усього нових: <b>{len(new_orders)}</b>"
+        f"Усього у цьому статусі: <b>{len(filtered)}</b>"
     )
+
+    row_index = order.get("row_index")
 
     keyboard = {
         "inline_keyboard": [
-            [inline_button("✅ Опрацьовано", f"mark_processed_{order.get('row_index')}")],
-            [inline_button("🔄 Оновити", "admin_new_orders")],
+            [inline_button("🟡 В обробці", f"set_status_{row_index}_В обробці")],
+            [inline_button("🚚 Відправлено", f"set_status_{row_index}_Відправлено")],
+            [inline_button("❌ Скасовано", f"set_status_{row_index}_Скасовано")],
+            [inline_button("✅ Опрацьовано", f"set_status_{row_index}_Опрацьовано")],
+            [inline_button("🔄 Оновити", f"admin_status_{status}")],
             [inline_button("⬅️ Назад у кабінет", "admin_back")]
         ]
     }
@@ -888,67 +919,21 @@ def show_admin_new_orders(chat_id, callback_message=None):
         send_message(chat_id, text, keyboard)
 
 
-def show_admin_processed_orders(chat_id, callback_message=None):
-    if not is_admin(chat_id):
-        return
-
-    orders = get_orders_with_rows()
-    processed_orders = [o for o in orders if str(o.get("Статус")).strip().lower() == "опрацьовано"]
-
-    if not processed_orders:
-        text = "Опрацьованих замовлень поки немає."
-        keyboard = {"inline_keyboard": [[inline_button("⬅️ Назад у кабінет", "admin_back")]]}
-
-        if callback_message:
-            edit_message(chat_id, callback_message["message_id"], text, keyboard)
-        else:
-            send_message(chat_id, text, keyboard)
-        return
-
-    order = processed_orders[-1]
-
-    text = (
-        "✅ <b>Останнє опрацьоване замовлення</b>\n\n"
-        f"<b>Дата:</b> {order.get('Дата')}\n"
-        f"<b>ПІБ:</b> {order.get('ПІБ')}\n"
-        f"<b>Телефон:</b> {order.get('Телефон')}\n"
-        f"<b>Адреса:</b> {order.get('Адреса доставки')}\n"
-        f"<b>Товари:</b> {order.get('Товари')}\n"
-        f"<b>Сума:</b> {order.get('Сума')} грн\n"
-        f"<b>Потрібно зв’язатись:</b> {order.get('Потрібно зв’язатись')}\n"
-        f"<b>Статус:</b> {order.get('Статус')}\n\n"
-        f"Усього опрацьованих: <b>{len(processed_orders)}</b>"
-    )
-
-    keyboard = {
-        "inline_keyboard": [
-            [inline_button("🔄 Оновити", "admin_processed_orders")],
-            [inline_button("⬅️ Назад у кабінет", "admin_back")]
-        ]
-    }
-
-    if callback_message:
-        edit_message(chat_id, callback_message["message_id"], text, keyboard)
-    else:
-        send_message(chat_id, text, keyboard)
-
-
-def mark_order_processed(chat_id, row_index, callback_message=None):
+def set_order_status(chat_id, row_index, status, callback_message=None):
     if not is_admin(chat_id):
         return
 
     try:
-        update_cell("Замовлення", int(row_index), 10, "Опрацьовано")
+        update_cell("Замовлення", int(row_index), 10, status)
 
         text = (
-            "✅ <b>Замовлення опрацьовано</b>\n\n"
-            "Статус у таблиці змінено на: <b>Опрацьовано</b>"
+            f"{status_emoji(status)} <b>Статус змінено</b>\n\n"
+            f"Новий статус замовлення: <b>{status}</b>"
         )
 
         keyboard = {
             "inline_keyboard": [
-                [inline_button("🆕 Оновити нові замовлення", "admin_new_orders")],
-                [inline_button("✅ Перейти в опрацьовані", "admin_processed_orders")],
+                [inline_button("🔄 Оновити цей статус", f"admin_status_{status}")],
                 [inline_button("⬅️ Назад у кабінет", "admin_back")]
             ]
         }
@@ -966,30 +951,16 @@ def show_admin_orders_sum(chat_id, callback_message=None):
     if not is_admin(chat_id):
         return
 
-    orders = get_orders_with_rows()
-    total_all = 0
-    total_new = 0
-    total_processed = 0
-
-    for order in orders:
-        try:
-            value = float(order.get("Сума") or 0)
-        except:
-            value = 0
-
-        total_all += value
-
-        status = str(order.get("Статус")).strip().lower()
-
-        if status == "нове":
-            total_new += value
-        elif status == "опрацьовано":
-            total_processed += value
+    stats = get_status_stats()
+    total_all = sum(v["sum"] for v in stats.values())
 
     text = (
         "💰 <b>Сума замовлень</b>\n\n"
-        f"🆕 Нові: <b>{total_new} грн</b>\n"
-        f"✅ Опрацьовані: <b>{total_processed} грн</b>\n"
+        f"🆕 Нові: <b>{stats['Нове']['sum']} грн</b>\n"
+        f"🟡 В обробці: <b>{stats['В обробці']['sum']} грн</b>\n"
+        f"🚚 Відправлено: <b>{stats['Відправлено']['sum']} грн</b>\n"
+        f"❌ Скасовано: <b>{stats['Скасовано']['sum']} грн</b>\n"
+        f"✅ Опрацьовано: <b>{stats['Опрацьовано']['sum']} грн</b>\n\n"
         f"📦 Усі разом: <b>{total_all} грн</b>"
     )
 
@@ -999,6 +970,19 @@ def show_admin_orders_sum(chat_id, callback_message=None):
         edit_message(chat_id, callback_message["message_id"], text, keyboard)
     else:
         send_message(chat_id, text, keyboard)
+
+
+# старі функції залишаємо як аліаси, щоб не ламати старі кнопки
+def show_admin_new_orders(chat_id, callback_message=None):
+    show_orders_by_status(chat_id, "Нове", callback_message)
+
+
+def show_admin_processed_orders(chat_id, callback_message=None):
+    show_orders_by_status(chat_id, "Опрацьовано", callback_message)
+
+
+def mark_order_processed(chat_id, row_index, callback_message=None):
+    set_order_status(chat_id, row_index, "Опрацьовано", callback_message)
 
 
 # =========================
@@ -1106,6 +1090,16 @@ def webhook():
 
         elif data_value == "need_contact_no":
             finish_order(chat_id, user, "Ні", callback_message)
+
+        elif data_value.startswith("admin_status_"):
+            status = data_value.replace("admin_status_", "")
+            show_orders_by_status(chat_id, status, callback_message)
+
+        elif data_value.startswith("set_status_"):
+            parts = data_value.split("_", 3)
+            row_index = parts[2]
+            status = parts[3]
+            set_order_status(chat_id, row_index, status, callback_message)
 
         elif data_value == "admin_new_orders":
             show_admin_new_orders(chat_id, callback_message)
