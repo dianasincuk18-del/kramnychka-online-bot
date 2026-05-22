@@ -275,6 +275,27 @@ def edit_caption(chat_id, message_id, caption, keyboard=None):
         print("edit_caption error:", e)
 
 
+def edit_media_photo(chat_id, message_id, photo_url, caption, keyboard=None):
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "media": json.dumps({
+            "type": "photo",
+            "media": photo_url,
+            "caption": caption,
+            "parse_mode": "HTML"
+        }, ensure_ascii=False)
+    }
+
+    if keyboard:
+        payload["reply_markup"] = json.dumps(keyboard, ensure_ascii=False)
+
+    try:
+        requests.post(f"{BASE_URL}/editMessageMedia", json=payload, timeout=15)
+    except Exception as e:
+        print("edit_media_photo error:", e)
+
+
 def answer_callback(callback_id):
     try:
         requests.post(
@@ -645,9 +666,8 @@ def show_product_card(chat_id, products, index=0, mode="category", category_id="
         send_message(chat_id, text, keyboard)
 
 
-def update_product_card(chat_id, callback_message, products, index=0, mode="category", category_id="", photo_index=0):
-    message_id = callback_message["message_id"]
 
+def update_product_card(chat_id, message_id, products, index=0, mode="category", category_id="", photo_index=0, callback_message=None):
     if not products:
         edit_message(
             chat_id,
@@ -668,10 +688,8 @@ def update_product_card(chat_id, callback_message, products, index=0, mode="cate
     text = product_text(product, index, total)
     keyboard = build_product_keyboard(product_id, products, index, mode, category_id, photo_index)
 
-    if "photo" in callback_message:
-        edit_caption(chat_id, message_id, text, keyboard)
-    elif photos:
-        send_photo(chat_id, photos[photo_index], text, keyboard)
+    if photos:
+        edit_media_photo(chat_id, message_id, photos[photo_index], text, keyboard)
     else:
         edit_message(chat_id, message_id, text, keyboard)
 
@@ -1773,7 +1791,6 @@ def webhook():
             answer_callback(callback_id)
 
         if data_value.startswith("photo_"):
-            # Формат: photo_mode_categoryid_productindex_photoindex
             parts = data_value.split("_")
             mode = parts[1]
             category_id = parts[2]
@@ -1785,10 +1802,7 @@ def webhook():
             else:
                 products = get_active_products_by_category(category_id)
 
-            try:
-                update_product_card(chat_id, message_id, products, product_index, mode, category_id, photo_index, callback_message)
-            except TypeError:
-                update_product_card(chat_id, callback_message, products, product_index, mode, category_id, photo_index)
+            update_product_card(chat_id, message_id, products, product_index, mode, category_id, photo_index, callback_message)
 
         elif data_value == "photo_counter":
             answer_callback(callback_id)
@@ -1798,12 +1812,12 @@ def webhook():
             category_id = parts[1]
             page = int(parts[2])
             products = get_active_products_by_category(category_id)
-            update_product_card(chat_id, callback_message, products, page, "category", category_id, 0)
+            update_product_card(chat_id, message_id, products, page, "category", category_id, 0, callback_message)
 
         elif data_value.startswith("sale_page_"):
             page = int(data_value.replace("sale_page_", ""))
             products = get_sale_products()
-            update_product_card(chat_id, callback_message, products, page, "sale", "", 0)
+            update_product_card(chat_id, message_id, products, page, "sale", "", 0, callback_message)
 
         elif data_value == "product_unavailable":
             answer_callback(callback_id)
