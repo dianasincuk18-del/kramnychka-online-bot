@@ -275,6 +275,7 @@ def edit_caption(chat_id, message_id, caption, keyboard=None):
         print("edit_caption error:", e)
 
 
+
 def edit_media_photo(chat_id, message_id, photo_url, caption, keyboard=None):
     payload = {
         "chat_id": chat_id,
@@ -291,9 +292,12 @@ def edit_media_photo(chat_id, message_id, photo_url, caption, keyboard=None):
         payload["reply_markup"] = json.dumps(keyboard, ensure_ascii=False)
 
     try:
-        requests.post(f"{BASE_URL}/editMessageMedia", json=payload, timeout=15)
+        r = requests.post(f"{BASE_URL}/editMessageMedia", data=payload, timeout=15)
+        if not r.ok:
+            print("edit_media_photo telegram error:", r.text)
     except Exception as e:
         print("edit_media_photo error:", e)
+
 
 
 def answer_callback(callback_id):
@@ -582,24 +586,24 @@ def build_product_keyboard(product_id, products, index, mode="category", categor
         next_photo = photo_index + 1 if photo_index < photo_total - 1 else 0
 
         buttons.append([
-            inline_button("⬅️ Фото", f"photo_{mode}_{category_id}_{index}_{prev_photo}"),
+            inline_button("⬅️ Фото", f"photo_{index}_{prev_photo}"),
             inline_button(f"Фото {photo_index + 1}/{photo_total}", "photo_counter"),
-            inline_button("➡️ Фото", f"photo_{mode}_{category_id}_{index}_{next_photo}")
+            inline_button("➡️ Фото", f"photo_{index}_{next_photo}")
         ])
 
     nav_buttons = []
 
     if index > 0:
         if mode == "sale":
-            nav_buttons.append(inline_button("⬅️ Попередній", f"sale_page_{index - 1}"))
+            nav_buttons.append(inline_button("⬅️ Попередній", f"product_page_{index - 1}"))
         else:
-            nav_buttons.append(inline_button("⬅️ Попередній", f"catpage_{category_id}_{index - 1}"))
+            nav_buttons.append(inline_button("⬅️ Попередній", f"product_page_{index - 1}"))
 
     if index < total - 1:
         if mode == "sale":
-            nav_buttons.append(inline_button("➡️ Наступний", f"sale_page_{index + 1}"))
+            nav_buttons.append(inline_button("➡️ Наступний", f"product_page_{index + 1}"))
         else:
-            nav_buttons.append(inline_button("➡️ Наступний", f"catpage_{category_id}_{index + 1}"))
+            nav_buttons.append(inline_button("➡️ Наступний", f"product_page_{index + 1}"))
 
     if nav_buttons:
         buttons.append(nav_buttons)
@@ -772,6 +776,7 @@ def show_products_by_subcategory(chat_id, subcategory_id, callback_message=None)
         "step": "viewing_products",
         "products": products,
         "index": 0,
+        "mode": "subcategory",
         "subcategory_id": subcategory_id
     }
 
@@ -1791,21 +1796,30 @@ def webhook():
             answer_callback(callback_id)
 
         if data_value.startswith("photo_"):
+            # Формат: photo_productindex_photoindex
             parts = data_value.split("_")
-            mode = parts[1]
-            category_id = parts[2]
-            product_index = int(parts[3])
-            photo_index = int(parts[4])
+            product_index = int(parts[1])
+            photo_index = int(parts[2])
 
-            if mode == "sale":
-                products = get_sale_products()
-            else:
-                products = get_active_products_by_category(category_id)
+            state = USER_STATES.get(str(chat_id), {})
+            products = state.get("products", [])
+            mode = state.get("mode", "category")
+            category_id = state.get("category_id", "") or state.get("subcategory_id", "")
 
             update_product_card(chat_id, message_id, products, product_index, mode, category_id, photo_index, callback_message)
 
         elif data_value == "photo_counter":
             answer_callback(callback_id)
+
+        elif data_value.startswith("product_page_"):
+            page = int(data_value.replace("product_page_", ""))
+            state = USER_STATES.get(str(chat_id), {})
+            products = state.get("products", [])
+            mode = state.get("mode", "category")
+            category_id = state.get("category_id", "") or state.get("subcategory_id", "")
+            state["index"] = page
+            USER_STATES[str(chat_id)] = state
+            update_product_card(chat_id, message_id, products, page, mode, category_id, 0, callback_message)
 
         elif data_value.startswith("catpage_"):
             parts = data_value.split("_")
