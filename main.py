@@ -550,6 +550,29 @@ def show_delivery_payment(chat_id):
     send_message(chat_id, text, main_menu(is_admin(chat_id)))
 
 
+
+def get_orders_with_rows():
+    rows = get_values("Замовлення")
+    result = []
+
+    for i, row in enumerate(rows[1:], start=2):
+        result.append({
+            "row_index": i,
+            "Дата": row[0] if len(row) > 0 else "",
+            "Telegram ID": row[1] if len(row) > 1 else "",
+            "ПІБ": row[2] if len(row) > 2 else "",
+            "Телефон": row[3] if len(row) > 3 else "",
+            "Адреса доставки": row[4] if len(row) > 4 else "",
+            "Товари": row[5] if len(row) > 5 else "",
+            "Сума": row[6] if len(row) > 6 else "",
+            "Потрібно зв’язатись": row[7] if len(row) > 7 else "",
+            "Коментар": row[8] if len(row) > 8 else "",
+            "Статус": row[9] if len(row) > 9 else ""
+        })
+
+    return result
+
+
 # =========================
 # ADMIN CABINET
 # =========================
@@ -559,29 +582,40 @@ def show_admin_cabinet(chat_id):
         send_message(chat_id, "Цей розділ доступний тільки адміністратору.", main_menu(False))
         return
 
-    orders = get_records("Замовлення")
+    orders = get_orders_with_rows()
 
     new_orders = []
-    total_sum = 0
+    processed_orders = []
+    total_new = 0
+    total_processed = 0
 
     for order in orders:
         status = str(order.get("Статус")).strip().lower()
+
+        try:
+            value = float(order.get("Сума") or 0)
+        except:
+            value = 0
+
         if status == "нове":
             new_orders.append(order)
-            try:
-                total_sum += float(order.get("Сума") or 0)
-            except:
-                pass
+            total_new += value
+        elif status == "опрацьовано":
+            processed_orders.append(order)
+            total_processed += value
 
     text = (
         "👑 <b>Кабінет</b>\n\n"
         f"🆕 Нові замовлення: <b>{len(new_orders)}</b>\n"
-        f"💰 Сума нових замовлень: <b>{total_sum} грн</b>\n\n"
+        f"💰 Сума нових: <b>{total_new} грн</b>\n\n"
+        f"✅ Опрацьовані: <b>{len(processed_orders)}</b>\n"
+        f"💰 Сума опрацьованих: <b>{total_processed} грн</b>"
     )
 
     keyboard = {
         "inline_keyboard": [
-            [inline_button("📋 Показати нові замовлення", "admin_new_orders")],
+            [inline_button("🆕 Нові замовлення", "admin_new_orders")],
+            [inline_button("✅ Опрацьовані", "admin_processed_orders")],
             [inline_button("💰 Сума замовлень", "admin_orders_sum")]
         ]
     }
@@ -593,12 +627,14 @@ def show_admin_new_orders(chat_id):
     if not is_admin(chat_id):
         return
 
-    orders = get_records("Замовлення")
+    orders = get_orders_with_rows()
     new_orders = [o for o in orders if str(o.get("Статус")).strip().lower() == "нове"]
 
     if not new_orders:
         send_message(chat_id, "Нових замовлень немає ✅", main_menu(True))
         return
+
+    send_message(chat_id, "🆕 <b>Нові замовлення</b>\n\nПоказую останні 10 нових замовлень 👇")
 
     for idx, order in enumerate(new_orders[-10:], start=1):
         text = (
@@ -612,16 +648,73 @@ def show_admin_new_orders(chat_id):
             f"<b>Потрібно зв’язатись:</b> {order.get('Потрібно зв’язатись')}\n"
             f"<b>Статус:</b> {order.get('Статус')}"
         )
+
+        keyboard = {
+            "inline_keyboard": [
+                [inline_button("✅ Опрацьовано", f"mark_processed_{order.get('row_index')}")]
+            ]
+        }
+
+        send_message(chat_id, text, keyboard)
+
+
+def show_admin_processed_orders(chat_id):
+    if not is_admin(chat_id):
+        return
+
+    orders = get_orders_with_rows()
+    processed_orders = [o for o in orders if str(o.get("Статус")).strip().lower() == "опрацьовано"]
+
+    if not processed_orders:
+        send_message(chat_id, "Опрацьованих замовлень поки немає.", main_menu(True))
+        return
+
+    send_message(chat_id, "✅ <b>Опрацьовані замовлення</b>\n\nПоказую останні 10 опрацьованих замовлень 👇")
+
+    for idx, order in enumerate(processed_orders[-10:], start=1):
+        text = (
+            f"✅ <b>Опрацьоване замовлення #{idx}</b>\n\n"
+            f"<b>Дата:</b> {order.get('Дата')}\n"
+            f"<b>ПІБ:</b> {order.get('ПІБ')}\n"
+            f"<b>Телефон:</b> {order.get('Телефон')}\n"
+            f"<b>Адреса:</b> {order.get('Адреса доставки')}\n"
+            f"<b>Товари:</b> {order.get('Товари')}\n"
+            f"<b>Сума:</b> {order.get('Сума')} грн\n"
+            f"<b>Потрібно зв’язатись:</b> {order.get('Потрібно зв’язатись')}\n"
+            f"<b>Статус:</b> {order.get('Статус')}"
+        )
+
         send_message(chat_id, text)
+
+
+def mark_order_processed(chat_id, row_index):
+    if not is_admin(chat_id):
+        return
+
+    try:
+        update_cell("Замовлення", int(row_index), 10, "Опрацьовано")
+
+        keyboard = {
+            "inline_keyboard": [
+                [inline_button("🆕 Показати нові", "admin_new_orders")],
+                [inline_button("✅ Опрацьовані", "admin_processed_orders")]
+            ]
+        }
+
+        send_message(chat_id, "✅ Замовлення позначено як опрацьоване.", keyboard)
+
+    except Exception:
+        send_message(chat_id, "Не вдалося змінити статус. Спробуйте ще раз.", main_menu(True))
 
 
 def show_admin_orders_sum(chat_id):
     if not is_admin(chat_id):
         return
 
-    orders = get_records("Замовлення")
+    orders = get_orders_with_rows()
     total_all = 0
     total_new = 0
+    total_processed = 0
 
     for order in orders:
         try:
@@ -631,13 +724,18 @@ def show_admin_orders_sum(chat_id):
 
         total_all += value
 
-        if str(order.get("Статус")).strip().lower() == "нове":
+        status = str(order.get("Статус")).strip().lower()
+
+        if status == "нове":
             total_new += value
+        elif status == "опрацьовано":
+            total_processed += value
 
     text = (
         "💰 <b>Сума замовлень</b>\n\n"
-        f"Нові замовлення: <b>{total_new} грн</b>\n"
-        f"Усі замовлення: <b>{total_all} грн</b>"
+        f"🆕 Нові: <b>{total_new} грн</b>\n"
+        f"✅ Опрацьовані: <b>{total_processed} грн</b>\n"
+        f"📦 Усі разом: <b>{total_all} грн</b>"
     )
 
     send_message(chat_id, text, main_menu(True))
@@ -728,6 +826,13 @@ def webhook():
 
         elif data_value == "admin_new_orders":
             show_admin_new_orders(chat_id)
+
+        elif data_value == "admin_processed_orders":
+            show_admin_processed_orders(chat_id)
+
+        elif data_value.startswith("mark_processed_"):
+            row_index = data_value.replace("mark_processed_", "")
+            mark_order_processed(chat_id, row_index)
 
         elif data_value == "admin_orders_sum":
             show_admin_orders_sum(chat_id)
