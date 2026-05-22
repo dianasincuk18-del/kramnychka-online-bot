@@ -564,8 +564,8 @@ def get_product_photos(product):
     return photos
 
 
+
 def build_product_keyboard(product_id, products, index, mode="category", category_id="", photo_index=0):
-    total = len(products)
     product = products[index]
     photos = get_product_photos(product)
     photo_total = len(photos)
@@ -591,32 +591,9 @@ def build_product_keyboard(product_id, products, index, mode="category", categor
             inline_button("➡️ Фото", f"photo_{index}_{next_photo}")
         ])
 
-    nav_buttons = []
-
-    if index > 0:
-        if mode == "sale":
-            nav_buttons.append(inline_button("⬅️ Попередній товар", f"product_page_{index - 1}"))
-        else:
-            nav_buttons.append(inline_button("⬅️ Попередній товар", f"product_page_{index - 1}"))
-
-    if index < total - 1:
-        if mode == "sale":
-            nav_buttons.append(inline_button("➡️ Наступний товар", f"product_page_{index + 1}"))
-        else:
-            nav_buttons.append(inline_button("➡️ Наступний товар", f"product_page_{index + 1}"))
-
-    if nav_buttons:
-        buttons.append(nav_buttons)
-
     buttons.append([inline_button("🛒 Перейти в кошик", "open_cart")])
 
     return {"inline_keyboard": buttons}
-
-
-
-# =========================
-# BOT LOGIC
-# =========================
 
 def start(chat_id):
     USER_STATES.pop(str(chat_id), None)
@@ -771,6 +748,7 @@ def show_subcategories(chat_id, category_id, callback_message=None):
         send_message(chat_id, text, keyboard)
 
 
+
 def show_products_by_subcategory(chat_id, subcategory_id, callback_message=None):
     products = get_products_by_subcategory(subcategory_id)
 
@@ -796,8 +774,17 @@ def show_products_by_subcategory(chat_id, subcategory_id, callback_message=None)
         "subcategory_id": subcategory_id
     }
 
-    show_product_card(chat_id, products, 0, callback_message)
+    send_message(chat_id, f"📦 Знайдено товарів: <b>{len(products)}</b>")
 
+    for idx, product in enumerate(products):
+        show_product_card(
+            chat_id=chat_id,
+            products=products,
+            index=idx,
+            mode="subcategory",
+            category_id=str(subcategory_id),
+            photo_index=0
+        )
 
 def show_products_by_category(chat_id, category_id):
     products = get_active_products_by_category(category_id)
@@ -1827,15 +1814,6 @@ def webhook():
         elif data_value == "photo_counter":
             answer_callback(callback_id)
 
-        elif data_value.startswith("product_page_"):
-            page = int(data_value.replace("product_page_", ""))
-            state = USER_STATES.get(str(chat_id), {})
-            products = state.get("products", [])
-            mode = state.get("mode", "category")
-            category_id = state.get("category_id", "") or state.get("subcategory_id", "")
-            state["index"] = page
-            USER_STATES[str(chat_id)] = state
-            update_product_card(chat_id, message_id, products, page, mode, category_id, 0, callback_message)
 
         elif data_value.startswith("catpage_"):
             parts = data_value.split("_")
