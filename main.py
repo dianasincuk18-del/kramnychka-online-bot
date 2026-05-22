@@ -229,6 +229,7 @@ def main_menu(is_admin=False):
     keyboard = [
         [{"text": "📦 Каталог"}, {"text": "🔥 Акції"}],
         [{"text": "🛒 Кошик"}, {"text": "✅ Замовити"}],
+        [{"text": "📦 Мої замовлення"}],
         [{"text": "🚚 Доставка і оплата"}]
     ]
 
@@ -772,6 +773,33 @@ def notify_admin(full_name, phone, address, products, total, need_contact, teleg
     send_message(ADMIN_CHAT_ID, text)
 
 
+def show_my_orders(chat_id):
+    orders = get_orders_with_rows()
+    my_orders = [o for o in orders if str(o.get("Telegram ID")) == str(chat_id)]
+
+    if not my_orders:
+        send_message(
+            chat_id,
+            "У Вас поки немає замовлень 🛒",
+            main_menu(is_admin(chat_id))
+        )
+        return
+
+    order = my_orders[-1]
+
+    text = (
+        "📦 <b>Мої замовлення</b>\n\n"
+        "Показую Ваше останнє замовлення 👇\n\n"
+        f"<b>Дата:</b> {order.get('Дата')}\n"
+        f"<b>Товари:</b> {order.get('Товари')}\n"
+        f"<b>Сума:</b> {order.get('Сума')} грн\n"
+        f"<b>Адреса доставки:</b> {order.get('Адреса доставки')}\n"
+        f"<b>Статус:</b> {order.get('Статус')}"
+    )
+
+    send_message(chat_id, text, main_menu(is_admin(chat_id)))
+
+
 def show_delivery_payment(chat_id):
     settings = get_records("Налаштування")
 
@@ -1057,6 +1085,8 @@ def webhook():
             show_cart(chat_id)
         elif text == "✅ Замовити":
             start_order(chat_id)
+        elif text == "📦 Мої замовлення":
+            show_my_orders(chat_id)
         elif text == "🚚 Доставка і оплата":
             show_delivery_payment(chat_id)
         elif text == "👑 Кабінет":
