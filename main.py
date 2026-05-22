@@ -4,6 +4,7 @@ import requests
 import gspread
 from flask import Flask, request
 from oauth2client.service_account import ServiceAccountCredentials
+from datetime import datetime
 
 app = Flask(__name__)
 
@@ -12,6 +13,8 @@ SHEET_ID = os.environ.get("SHEET_ID")
 GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS_JSON")
 
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+USER_STATES = {}
 
 
 def get_sheet():
@@ -102,6 +105,8 @@ def inline_button(text, callback_data):
 
 
 def start(chat_id):
+    USER_STATES.pop(str(chat_id), None)
+
     text = (
         "Привіт 👋\n\n"
         "Вітаю у нашій крамничці 🛍\n"
@@ -257,13 +262,68 @@ def show_cart(chat_id):
     send_message(chat_id, text, keyboard)
 
 
-def create_order(chat_id, user):
+def start_order(chat_id):
     cart = get_user_cart(chat_id)
 
     if not cart:
         send_message(chat_id, "Кошик порожній, немає що замовляти 😔", main_menu())
         return
 
+    USER_STATES[str(chat_id)] = {
+        "step": "waiting_full_name",
+        "full_name": "",
+        "phone": "",
+        "address": "",
+        "need_contact": ""
+    }
+
+    send_message(chat_id, "Введіть, будь ласка, Ваше ПІБ:")
+
+
+def handle_order_state(chat_id, text, user):
+    state = USER_STATES.get(str(chat_id))
+
+    if not state:
+        return False
+
+    if state["step"] == "waiting_full_name":
+        state["full_name"] = text.strip()
+        state["step"] = "waiting_phone"
+        send_message(chat_id, "Введіть, будь ласка, Ваш номер телефону:")
+        return True
+
+    if state["step"] == "waiting_phone":
+        state["phone"] = text.strip()
+        state["step"] = "waiting_address"
+        send_message(chat_id, "Введіть, будь ласка, адресу доставки:")
+        return True
+
+    if state["step"] == "waiting_address":
+        state["address"] = text.strip()
+        state["step"] = "waiting_need_contact"
+
+        keyboard = {
+            "inline_keyboard": [
+                [inline_button("Так, зв’яжіться зі мною", "need_contact_yes")],
+                [inline_button("Ні, не потрібно", "need_contact_no")]
+            ]
+        }
+
+        send_message(chat_id, "Чи потрібно зв’язатись з Вами для уточнення деталей?", keyboard)
+        return True
+
+    return False
+
+
+def finish_order(chat_id, user, need_contact):
+    cart = get_user_cart(chat_id)
+
+    if not cart:
+        USER_STATES.pop(str(chat_id), None)
+        send_message(chat_id, "Кошик порожній, немає що замовляти 😔", main_menu())
+        return
+
+    state = USER_STATES.get(str(chat_id), {})
     total = 0
     products_text = []
 
@@ -274,28 +334,30 @@ def create_order(chat_id, user):
         total += summa
         products_text.append(f"{name} x{qty}")
 
-    full_name = user.get("first_name", "")
-    username = user.get("username", "")
+    order_date = datetime.now().strftime("%d.%m.%Y %H:%M")
 
     append_row("Замовлення", [
-        "",
+        order_date,
         chat_id,
-        full_name,
-        username,
+        state.get("full_name", ""),
+        state.get("phone", ""),
+        state.get("address", ""),
         ", ".join(products_text),
         total,
+        need_contact,
         "",
         "Нове"
     ])
 
     clear_user_cart(chat_id)
+    USER_STATES.pop(str(chat_id), None)
 
     send_message(
-    chat_id,
-    "✅ Замовлення прийнято!\n\n"
-    "Наш менеджер скоро зв’яжеться з Вами для уточнення деталей 💛",
-    main_menu()
-)
+        chat_id,
+        "✅ Замовлення прийнято!\n\n"
+        "Дякуємо! Ми передали Ваше замовлення менеджеру 💛",
+        main_menu()
+    )
 
 
 def show_delivery_payment(chat_id):
@@ -332,6 +394,8 @@ def webhook():
 
         if text == "/start":
             start(chat_id)
+        elif handle_order_state(chat_id, text, user):
+            pass
         elif text == "📦 Каталог":
             show_categories(chat_id)
         elif text == "🗂 Категорії":
@@ -343,7 +407,7 @@ def webhook():
         elif text == "🛒 Кошик":
             show_cart(chat_id)
         elif text == "✅ Замовити":
-            create_order(chat_id, user)
+            start_order(chat_id)
         elif text == "🚚 Доставка і оплата":
             show_delivery_payment(chat_id)
         else:
@@ -362,10 +426,15 @@ def webhook():
             product_id = data_value.replace("add_", "")
             add_to_cart(chat_id, product_id)
         elif data_value == "order_now":
-            create_order(chat_id, user)
+            start_order(chat_id)
         elif data_value == "clear_cart":
             clear_user_cart(chat_id)
+            USER_STATES.pop(str(chat_id), None)
             send_message(chat_id, "🗑 Кошик очищено.", main_menu())
+        elif data_value == "need_contact_yes":
+            finish_order(chat_id, user, "Так")
+        elif data_value == "need_contact_no":
+            finish_order(chat_id, user, "Ні")
 
     return "ok"
 
