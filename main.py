@@ -317,6 +317,8 @@ def product_text(product, index=None, total=None):
     name = product.get("Назва товару")
     description = product.get("Опис")
     price = product.get("Ціна")
+    old_price = str(product.get("Стара ціна", "")).strip()
+    sale_price = str(product.get("Акційна ціна", "")).strip()
     sale = str(product.get("Акція")).strip()
 
     text = ""
@@ -326,10 +328,17 @@ def product_text(product, index=None, total=None):
 
     text += f"<b>{name}</b>\n\n"
     text += f"{description}\n\n"
-    text += f"💰 Ціна: <b>{price} грн</b>"
+
+    if old_price and sale_price:
+        text += f"💸 Стара ціна: <s>{old_price} грн</s>\n"
+        text += f"🔥 Акційна ціна: <b>{sale_price} грн</b>"
+    elif sale_price:
+        text += f"🔥 Акційна ціна: <b>{sale_price} грн</b>"
+    else:
+        text += f"💰 Ціна: <b>{price} грн</b>"
 
     if sale:
-        text += f"\n🔥 Акція: <b>{sale}</b>"
+        text += f"\n🎁 Акція: <b>{sale}</b>"
 
     return text
 
