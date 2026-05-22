@@ -251,7 +251,7 @@ def send_photo(chat_id, photo_url, caption, keyboard=None):
 
 
 
-def send_document(chat_id, document_url, caption, keyboard=None):
+def send_document(chat_id, document_url, caption="", keyboard=None):
     payload = {
         "chat_id": chat_id,
         "document": document_url,
@@ -602,7 +602,6 @@ def get_product_photos(product):
 
 
 
-
 def build_product_keyboard(product_id, products, index, mode="category", category_id="", photo_index=0):
     product = products[index]
     photos = get_product_photos(product)
@@ -656,19 +655,6 @@ def show_catalog_menu(chat_id):
 
 
 
-def send_product_photos_gallery(chat_id, photos):
-    if not photos:
-        return
-
-    for photo_url in photos:
-        ok = send_photo(chat_id, photo_url, "")
-
-        if not ok:
-            send_document(chat_id, photo_url, "")
-
-
-
-
 def show_more_product_photos(chat_id, product_index):
     state = USER_STATES.get(str(chat_id), {})
     products = state.get("products", [])
@@ -700,6 +686,7 @@ def show_more_product_photos(chat_id, product_index):
             send_document(chat_id, photo_url, "")
 
 
+
 def show_product_card(chat_id, products, index=0, mode="category", category_id="", photo_index=0):
     if not products:
         send_message(chat_id, "Товарів поки немає 😔", main_menu(is_admin(chat_id)))
@@ -722,7 +709,6 @@ def show_product_card(chat_id, products, index=0, mode="category", category_id="
     text = product_text(product, index, total)
     keyboard = build_product_keyboard(product_id, products, index, mode, category_id, 0)
 
-    # Красивий формат: головне фото разом із карткою товару.
     if photos:
         ok = send_photo(chat_id, photos[0], text, keyboard)
 
@@ -1877,10 +1863,21 @@ def webhook():
             answer_callback(callback_id)
 
         if data_value.startswith("photo_"):
-            answer_callback(callback_id)
+            # Формат: photo_productindex_photoindex
+            parts = data_value.split("_")
+            product_index = int(parts[1])
+            photo_index = int(parts[2])
+
+            state = USER_STATES.get(str(chat_id), {})
+            products = state.get("products", [])
+            mode = state.get("mode", "category")
+            category_id = state.get("category_id", "") or state.get("subcategory_id", "")
+
+            update_product_card(chat_id, message_id, products, product_index, mode, category_id, photo_index, callback_message)
 
         elif data_value == "photo_counter":
             answer_callback(callback_id)
+
 
         elif data_value.startswith("catpage_"):
             parts = data_value.split("_")
