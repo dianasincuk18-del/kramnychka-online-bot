@@ -47,6 +47,47 @@ def get_values(sheet_name):
     return worksheet.get_all_values()
 
 
+def get_or_create_worksheet(sheet_name, headers):
+    sh = get_sheet()
+
+    try:
+        ws = sh.worksheet(sheet_name)
+    except Exception:
+        ws = sh.add_worksheet(title=sheet_name, rows=1000, cols=len(headers))
+        ws.append_row(headers, value_input_option="USER_ENTERED")
+
+    values = ws.get_all_values()
+    if not values:
+        ws.append_row(headers, value_input_option="USER_ENTERED")
+
+    return ws
+
+
+def append_contact_request(row):
+    headers = ["Дата", "Telegram ID", "ПІБ", "Телефон", "Статус"]
+    ws = get_or_create_worksheet("Заявки", headers)
+    ws.append_row(row, value_input_option="USER_ENTERED")
+
+
+def get_contact_requests_with_rows():
+    headers = ["Дата", "Telegram ID", "ПІБ", "Телефон", "Статус"]
+    ws = get_or_create_worksheet("Заявки", headers)
+    rows = ws.get_all_values()
+    result = []
+
+    for i, row in enumerate(rows[1:], start=2):
+        result.append({
+            "row_index": i,
+            "Дата": row[0] if len(row) > 0 else "",
+            "Telegram ID": row[1] if len(row) > 1 else "",
+            "ПІБ": row[2] if len(row) > 2 else "",
+            "Телефон": row[3] if len(row) > 3 else "",
+            "Статус": row[4] if len(row) > 4 else ""
+        })
+
+    return result
+
+
 def append_row(sheet_name, row):
     sh = get_sheet()
     worksheet = sh.worksheet(sheet_name)
@@ -833,6 +874,16 @@ def finish_contact_request(chat_id, user, state):
     full_name = state.get("contact_full_name", "")
     phone = state.get("contact_phone", "")
 
+    request_date = datetime.now().strftime("%d.%m.%Y %H:%M")
+
+    append_contact_request([
+        request_date,
+        chat_id,
+        full_name,
+        phone,
+        "Нова"
+    ])
+
     send_message(
         chat_id,
         "✅ Вашу заявку передано менеджеру.\n"
@@ -951,6 +1002,7 @@ def show_admin_cabinet(chat_id, callback_message=None):
             [inline_button("🚚 Відправлено", "admin_status_Відправлено")],
             [inline_button("❌ Скасовано", "admin_status_Скасовано")],
             [inline_button("✅ Опрацьовано", "admin_status_Опрацьовано")],
+            [inline_button("📞 Заявки на зв’язок", "contact_requests")],
             [inline_button("🔍 Пошук", "admin_search")],
             [inline_button("📅 Фільтр за датою", "admin_date_filter")],
             [inline_button("💰 Сума замовлень", "admin_orders_sum")]
@@ -1249,6 +1301,117 @@ def handle_admin_state(chat_id, text):
     return False
 
 
+def show_contact_requests(chat_id, callback_message=None):
+    if not is_admin(chat_id):
+        return
+
+    requests_list = get_contact_requests_with_rows()
+    new_requests = [r for r in requests_list if str(r.get("Статус")).strip().lower() in ["нова", "нове", ""]]
+    processed_requests = [r for r in requests_list if str(r.get("Статус")).strip().lower() == "опрацьовано"]
+
+    text = (
+        "📞 <b>Заявки на зв’язок</b>\n\n"
+        f"🆕 Нові заявки: <b>{len(new_requests)}</b>\n"
+        f"✅ Опрацьовані: <b>{len(processed_requests)}</b>"
+    )
+
+    keyboard = {
+        "inline_keyboard": [
+            [inline_button("🆕 Нові заявки", "contact_requests_new")],
+            [inline_button("✅ Опрацьовані заявки", "contact_requests_processed")],
+            [inline_button("⬅️ Назад у кабінет", "admin_back")]
+        ]
+    }
+
+    if callback_message:
+        edit_message(chat_id, callback_message["message_id"], text, keyboard)
+    else:
+        send_message(chat_id, text, keyboard)
+
+
+def show_contact_requests_by_status(chat_id, status, callback_message=None):
+    if not is_admin(chat_id):
+        return
+
+    requests_list = get_contact_requests_with_rows()
+
+    if status == "Нова":
+        filtered = [r for r in requests_list if str(r.get("Статус")).strip().lower() in ["нова", "нове", ""]]
+        title = "🆕 Нова заявка на зв’язок"
+    else:
+        filtered = [r for r in requests_list if str(r.get("Статус")).strip().lower() == "опрацьовано"]
+        title = "✅ Опрацьована заявка"
+
+    if not filtered:
+        text = "Заявок у цьому розділі немає."
+        keyboard = {
+            "inline_keyboard": [
+                [inline_button("⬅️ Назад до заявок", "contact_requests")]
+            ]
+        }
+
+        if callback_message:
+            edit_message(chat_id, callback_message["message_id"], text, keyboard)
+        else:
+            send_message(chat_id, text, keyboard)
+        return
+
+    item = filtered[-1]
+
+    text = (
+        f"{title}\n\n"
+        f"<b>Дата:</b> {item.get('Дата')}\n"
+        f"<b>ПІБ:</b> {item.get('ПІБ')}\n"
+        f"<b>Телефон:</b> {item.get('Телефон')}\n"
+        f"<b>Статус:</b> {item.get('Статус')}\n\n"
+        f"Усього в розділі: <b>{len(filtered)}</b>"
+    )
+
+    buttons = []
+
+    if status == "Нова":
+        buttons.append([inline_button("✅ Опрацьовано", f"contact_done_{item.get('row_index')}")])
+
+    buttons.append([inline_button("🔄 Оновити", "contact_requests_new" if status == "Нова" else "contact_requests_processed")])
+    buttons.append([inline_button("⬅️ Назад до заявок", "contact_requests")])
+
+    keyboard = {"inline_keyboard": buttons}
+
+    if callback_message:
+        edit_message(chat_id, callback_message["message_id"], text, keyboard)
+    else:
+        send_message(chat_id, text, keyboard)
+
+
+def mark_contact_request_done(chat_id, row_index, callback_message=None):
+    if not is_admin(chat_id):
+        return
+
+    try:
+        update_cell("Заявки", int(row_index), 5, "Опрацьовано")
+
+        text = (
+            "✅ <b>Заявку опрацьовано</b>\n\n"
+            "Статус заявки змінено на: <b>Опрацьовано</b>"
+        )
+
+        keyboard = {
+            "inline_keyboard": [
+                [inline_button("🆕 Нові заявки", "contact_requests_new")],
+                [inline_button("⬅️ Назад до заявок", "contact_requests")]
+            ]
+        }
+
+        if callback_message:
+            edit_message(chat_id, callback_message["message_id"], text, keyboard)
+        else:
+            send_message(chat_id, text, keyboard)
+
+    except Exception:
+        send_message(chat_id, "Не вдалося змінити статус заявки. Спробуйте ще раз.", main_menu(True))
+
+
+
 # старі функції залишаємо як аліаси, щоб не ламати старі кнопки
 def show_admin_new_orders(chat_id, callback_message=None):
     show_orders_by_status(chat_id, "Нове", callback_message)
@@ -1417,6 +1580,19 @@ def webhook():
         elif data_value.startswith("mark_processed_"):
             row_index = data_value.replace("mark_processed_", "")
             mark_order_processed(chat_id, row_index, callback_message)
+
+        elif data_value == "contact_requests":
+            show_contact_requests(chat_id, callback_message)
+
+        elif data_value == "contact_requests_new":
+            show_contact_requests_by_status(chat_id, "Нова", callback_message)
+
+        elif data_value == "contact_requests_processed":
+            show_contact_requests_by_status(chat_id, "Опрацьовано", callback_message)
+
+        elif data_value.startswith("contact_done_"):
+            row_index = data_value.replace("contact_done_", "")
+            mark_contact_request_done(chat_id, row_index, callback_message)
 
         elif data_value == "admin_orders_sum":
             show_admin_orders_sum(chat_id, callback_message)
