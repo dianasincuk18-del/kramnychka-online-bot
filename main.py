@@ -785,17 +785,17 @@ def show_my_orders(chat_id):
         )
         return
 
-    order = my_orders[-1]
+    text = "📦 <b>Мої замовлення</b>\n\n"
 
-    text = (
-        "📦 <b>Мої замовлення</b>\n\n"
-        "Показую Ваше останнє замовлення 👇\n\n"
-        f"<b>Дата:</b> {order.get('Дата')}\n"
-        f"<b>Товари:</b> {order.get('Товари')}\n"
-        f"<b>Сума:</b> {order.get('Сума')} грн\n"
-        f"<b>Адреса доставки:</b> {order.get('Адреса доставки')}\n"
-        f"<b>Статус:</b> {order.get('Статус')}"
-    )
+    for idx, order in enumerate(my_orders, start=1):
+        text += (
+            f"<b>Замовлення #{idx}</b>\n"
+            f"Дата: {order.get('Дата')}\n"
+            f"Товари: {order.get('Товари')}\n"
+            f"Сума: {order.get('Сума')} грн\n"
+            f"Адреса доставки: {order.get('Адреса доставки')}\n"
+            f"Статус: <b>{order.get('Статус')}</b>\n\n"
+        )
 
     send_message(chat_id, text, main_menu(is_admin(chat_id)))
 
