@@ -601,11 +601,9 @@ def get_product_photos(product):
 
 
 
+
 def build_product_keyboard(product_id, products, index, mode="category", category_id="", photo_index=0):
     product = products[index]
-    photos = get_product_photos(product)
-    photo_total = len(photos)
-
     availability = str(product.get("Наявність", "") or "").strip().lower()
 
     if availability == "немає":
@@ -616,16 +614,6 @@ def build_product_keyboard(product_id, products, index, mode="category", categor
         buttons = [
             [inline_button("🛒 Додати в кошик", f"add_one_{product_id}")]
         ]
-
-    if photo_total > 1:
-        prev_photo = photo_index - 1 if photo_index > 0 else photo_total - 1
-        next_photo = photo_index + 1 if photo_index < photo_total - 1 else 0
-
-        buttons.append([
-            inline_button("⬅️ Фото", f"photo_{index}_{prev_photo}"),
-            inline_button(f"Фото {photo_index + 1}/{photo_total}", "photo_counter"),
-            inline_button("➡️ Фото", f"photo_{index}_{next_photo}")
-        ])
 
     buttons.append([inline_button("🛒 Перейти в кошик", "open_cart")])
 
@@ -661,6 +649,18 @@ def show_catalog_menu(chat_id):
 
 
 
+def send_product_photos_gallery(chat_id, photos):
+    if not photos:
+        return
+
+    for photo_url in photos:
+        ok = send_photo(chat_id, photo_url, "")
+
+        if not ok:
+            send_document(chat_id, photo_url, "")
+
+
+
 def show_product_card(chat_id, products, index=0, mode="category", category_id="", photo_index=0):
     if not products:
         send_message(chat_id, "Товарів поки немає 😔", main_menu(is_admin(chat_id)))
@@ -680,23 +680,14 @@ def show_product_card(chat_id, products, index=0, mode="category", category_id="
     }
 
     photos = get_product_photos(product)
-    photo_index = max(0, min(int(photo_index), len(photos) - 1)) if photos else 0
-
     text = product_text(product, index, total)
-    keyboard = build_product_keyboard(product_id, products, index, mode, category_id, photo_index)
+    keyboard = build_product_keyboard(product_id, products, index, mode, category_id, 0)
 
-    if photos:
-        ok = send_photo(chat_id, photos[photo_index], text, keyboard)
+    # Показуємо всі фото товару одразу.
+    send_product_photos_gallery(chat_id, photos)
 
-        if not ok:
-            doc_ok = send_document(chat_id, photos[photo_index], text, keyboard)
-
-            if not doc_ok:
-                send_message(chat_id, text, keyboard)
-    else:
-        send_message(chat_id, text, keyboard)
-
-
+    # Окремо показуємо картку товару з описом і кнопками.
+    send_message(chat_id, text, keyboard)
 
 def update_product_card(chat_id, message_id, products, index=0, mode="category", category_id="", photo_index=0, callback_message=None):
     if not products:
@@ -1841,21 +1832,10 @@ def webhook():
             answer_callback(callback_id)
 
         if data_value.startswith("photo_"):
-            # Формат: photo_productindex_photoindex
-            parts = data_value.split("_")
-            product_index = int(parts[1])
-            photo_index = int(parts[2])
-
-            state = USER_STATES.get(str(chat_id), {})
-            products = state.get("products", [])
-            mode = state.get("mode", "category")
-            category_id = state.get("category_id", "") or state.get("subcategory_id", "")
-
-            update_product_card(chat_id, message_id, products, product_index, mode, category_id, photo_index, callback_message)
+            answer_callback(callback_id)
 
         elif data_value == "photo_counter":
             answer_callback(callback_id)
-
 
         elif data_value.startswith("catpage_"):
             parts = data_value.split("_")
