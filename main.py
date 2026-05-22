@@ -291,11 +291,11 @@ def create_order(chat_id, user):
     clear_user_cart(chat_id)
 
     send_message(
-        chat_id,
-        "✅ Замовлення прийнято!\n\n"
-        "Ми скоро зв’яжемося з тобою для уточнення деталей 💛",
-        main_menu()
-    )
+    chat_id,
+    "✅ Замовлення прийнято!\n\n"
+    "Наш менеджер скоро зв’яжеться з Вами для уточнення деталей 💛",
+    main_menu()
+)
 
 
 def show_delivery_payment(chat_id):
