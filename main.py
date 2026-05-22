@@ -103,6 +103,24 @@ def find_user_cart_rows(telegram_id):
     return result
 
 
+def find_cart_row_by_product(telegram_id, product_id):
+    rows = get_values("Кошик")
+
+    for i, row in enumerate(rows[1:], start=2):
+        if len(row) > 1 and str(row[0]) == str(telegram_id) and str(row[1]) == str(product_id):
+            return {
+                "row_index": i,
+                "telegram_id": row[0] if len(row) > 0 else "",
+                "product_id": row[1] if len(row) > 1 else "",
+                "name": row[2] if len(row) > 2 else "",
+                "price": row[3] if len(row) > 3 else "",
+                "qty": row[4] if len(row) > 4 else "",
+                "sum": row[5] if len(row) > 5 else ""
+            }
+
+    return None
+
+
 # =========================
 # TELEGRAM HELPERS
 # =========================
@@ -142,9 +160,8 @@ def send_photo(chat_id, photo_url, caption, keyboard=None):
 
 def main_menu(is_admin=False):
     keyboard = [
-        [{"text": "📦 Каталог"}, {"text": "🗂 Категорії"}],
-        [{"text": "🔥 Акції"}, {"text": "🛒 Кошик"}],
-        [{"text": "✅ Замовити"}],
+        [{"text": "📦 Каталог"}, {"text": "🔥 Акції"}],
+        [{"text": "🛒 Кошик"}, {"text": "✅ Замовити"}],
         [{"text": "🚚 Доставка і оплата"}]
     ]
 
@@ -256,7 +273,7 @@ def send_product(chat_id, product):
 
     keyboard = {
         "inline_keyboard": [
-            [inline_button("🛒 Додати в кошик", f"choose_qty_{product_id}")]
+            [inline_button("🛒 Додати в кошик", f"add_one_{product_id}")]
         ]
     }
 
@@ -266,39 +283,7 @@ def send_product(chat_id, product):
         send_message(chat_id, text, keyboard)
 
 
-def show_qty_choice(chat_id, product_id):
-    products = get_records("Товари")
-    product = None
-
-    for p in products:
-        if str(p.get("ID товару")) == str(product_id):
-            product = p
-            break
-
-    if not product:
-        send_message(chat_id, "Товар не знайдено 😔", main_menu(is_admin(chat_id)))
-        return
-
-    name = product.get("Назва товару")
-
-    keyboard = {
-        "inline_keyboard": [
-            [
-                inline_button("1 шт", f"add_{product_id}_1"),
-                inline_button("2 шт", f"add_{product_id}_2"),
-                inline_button("3 шт", f"add_{product_id}_3")
-            ],
-            [
-                inline_button("4 шт", f"add_{product_id}_4"),
-                inline_button("5 шт", f"add_{product_id}_5")
-            ]
-        ]
-    }
-
-    send_message(chat_id, f"Оберіть кількість товару:\n<b>{name}</b>", keyboard)
-
-
-def add_to_cart(chat_id, product_id, qty=1):
+def add_to_cart(chat_id, product_id):
     products = get_records("Товари")
     product = None
 
@@ -313,64 +298,100 @@ def add_to_cart(chat_id, product_id, qty=1):
 
     name = product.get("Назва товару")
     price = float(product.get("Ціна") or 0)
-    qty = int(qty)
-    summa = price * qty
 
-    append_row("Кошик", [chat_id, product_id, name, price, qty, summa])
+    existing = find_cart_row_by_product(chat_id, product_id)
+
+    if existing:
+        row_index = existing["row_index"]
+        old_qty = int(float(existing["qty"] or 1))
+        new_qty = old_qty + 1
+        new_sum = price * new_qty
+
+        update_cell("Кошик", row_index, 5, new_qty)
+        update_cell("Кошик", row_index, 6, new_sum)
+    else:
+        new_qty = 1
+        new_sum = price
+        append_row("Кошик", [chat_id, product_id, name, price, new_qty, new_sum])
+
     send_message(
         chat_id,
-        f"✅ Товар <b>{name}</b> додано в кошик.\nКількість: <b>{qty} шт.</b>\nСума: <b>{summa} грн</b>",
+        f"✅ Товар <b>{name}</b> додано в кошик.\nКількість: <b>{new_qty} шт.</b>\nСума: <b>{new_sum} грн</b>",
         main_menu(is_admin(chat_id))
     )
 
 
 def show_cart(chat_id):
-    cart = get_user_cart(chat_id)
+    items = find_user_cart_rows(chat_id)
 
-    if not cart:
+    if not items:
         send_message(chat_id, "Твій кошик поки порожній 🛒", main_menu(is_admin(chat_id)))
         return
 
     total = 0
     text = "🛒 <b>Твій кошик:</b>\n\n"
-
-    for item in cart:
-        name = item.get("Назва товару")
-        price = float(item.get("Ціна") or 0)
-        qty = int(item.get("Кількість") or 1)
-        summa = float(item.get("Сума") or price * qty)
-        total += summa
-        text += f"• {name} — {qty} шт. × {price} грн = <b>{summa} грн</b>\n"
-
-    text += f"\n💰 Разом: <b>{total} грн</b>"
-
-    keyboard = {
-        "inline_keyboard": [
-            [inline_button("✅ Оформити замовлення", "order_now")],
-            [inline_button("❌ Видалити товар", "delete_item_menu")],
-            [inline_button("🗑 Очистити кошик", "clear_cart")]
-        ]
-    }
-
-    send_message(chat_id, text, keyboard)
-
-
-def show_delete_item_menu(chat_id):
-    items = find_user_cart_rows(chat_id)
-
-    if not items:
-        send_message(chat_id, "Кошик порожній 🛒", main_menu(is_admin(chat_id)))
-        return
-
     buttons = []
 
     for item in items:
-        title = f"❌ {item['name']} — {item['qty']} шт."
-        buttons.append([inline_button(title, f"delete_cart_row_{item['row_index']}")])
+        name = item["name"]
+        price = float(item["price"] or 0)
+        qty = int(float(item["qty"] or 1))
+        summa = float(item["sum"] or price * qty)
+        row_index = item["row_index"]
 
-    buttons.append([inline_button("⬅️ Назад до кошика", "back_to_cart")])
+        total += summa
+        text += f"• {name} — {qty} шт. × {price} грн = <b>{summa} грн</b>\n"
 
-    send_message(chat_id, "Оберіть товар, який потрібно видалити:", {"inline_keyboard": buttons})
+        buttons.append([
+            inline_button("➖", f"cart_minus_{row_index}"),
+            inline_button(f"{qty} шт", f"cart_qty_{row_index}"),
+            inline_button("➕", f"cart_plus_{row_index}"),
+            inline_button("❌", f"delete_cart_row_{row_index}")
+        ])
+
+    text += f"\n💰 Разом: <b>{total} грн</b>"
+
+    buttons.append([inline_button("✅ Оформити замовлення", "order_now")])
+    buttons.append([inline_button("🗑 Очистити кошик", "clear_cart")])
+
+    send_message(chat_id, text, {"inline_keyboard": buttons})
+
+
+def change_cart_qty(chat_id, row_index, delta):
+    rows = get_values("Кошик")
+
+    try:
+        row_index = int(row_index)
+        row = rows[row_index - 1]
+    except:
+        send_message(chat_id, "Не вдалося змінити кількість. Спробуйте ще раз.", main_menu(is_admin(chat_id)))
+        return
+
+    if len(row) < 6 or str(row[0]) != str(chat_id):
+        send_message(chat_id, "Цей товар не знайдено у Вашому кошику.", main_menu(is_admin(chat_id)))
+        return
+
+    try:
+        price = float(row[3] or 0)
+        qty = int(float(row[4] or 1))
+    except:
+        price = 0
+        qty = 1
+
+    new_qty = qty + int(delta)
+
+    if new_qty <= 0:
+        delete_row("Кошик", row_index)
+        send_message(chat_id, "❌ Товар видалено з кошика.", main_menu(is_admin(chat_id)))
+        show_cart(chat_id)
+        return
+
+    new_sum = price * new_qty
+
+    update_cell("Кошик", row_index, 5, new_qty)
+    update_cell("Кошик", row_index, 6, new_sum)
+
+    show_cart(chat_id)
 
 
 def delete_cart_item(chat_id, row_index):
@@ -649,8 +670,6 @@ def webhook():
             pass
         elif text == "📦 Каталог":
             show_categories(chat_id)
-        elif text == "🗂 Категорії":
-            show_categories(chat_id)
         elif text == "🔥 Акції":
             show_sales(chat_id)
         elif text == "🛒 Кошик":
@@ -674,16 +693,20 @@ def webhook():
             category_id = data_value.replace("cat_", "")
             show_products_by_category(chat_id, category_id)
 
-        elif data_value.startswith("choose_qty_"):
-            product_id = data_value.replace("choose_qty_", "")
-            show_qty_choice(chat_id, product_id)
+        elif data_value.startswith("add_one_"):
+            product_id = data_value.replace("add_one_", "")
+            add_to_cart(chat_id, product_id)
 
-        elif data_value.startswith("add_"):
-            parts = data_value.split("_")
-            if len(parts) >= 3:
-                product_id = parts[1]
-                qty = parts[2]
-                add_to_cart(chat_id, product_id, qty)
+        elif data_value.startswith("cart_plus_"):
+            row_index = data_value.replace("cart_plus_", "")
+            change_cart_qty(chat_id, row_index, 1)
+
+        elif data_value.startswith("cart_minus_"):
+            row_index = data_value.replace("cart_minus_", "")
+            change_cart_qty(chat_id, row_index, -1)
+
+        elif data_value.startswith("cart_qty_"):
+            show_cart(chat_id)
 
         elif data_value == "order_now":
             start_order(chat_id)
@@ -693,15 +716,9 @@ def webhook():
             USER_STATES.pop(str(chat_id), None)
             send_message(chat_id, "🗑 Кошик очищено.", main_menu(is_admin(chat_id)))
 
-        elif data_value == "delete_item_menu":
-            show_delete_item_menu(chat_id)
-
         elif data_value.startswith("delete_cart_row_"):
             row_index = data_value.replace("delete_cart_row_", "")
             delete_cart_item(chat_id, row_index)
-
-        elif data_value == "back_to_cart":
-            show_cart(chat_id)
 
         elif data_value == "need_contact_yes":
             finish_order(chat_id, user, "Так")
