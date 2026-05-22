@@ -228,10 +228,8 @@ def answer_callback(callback_id):
 def main_menu(is_admin=False):
     keyboard = [
         [{"text": "📦 Каталог"}, {"text": "🔥 Акції"}],
-        [{"text": "🛒 Кошик"}, {"text": "✅ Замовити"}],
-        [{"text": "📦 Мої замовлення"}],
-        [{"text": "📞 Зв’язатися з менеджером"}],
-        [{"text": "🚚 Доставка і оплата"}]
+        [{"text": "🛒 Кошик"}, {"text": "📦 Мої замовлення"}],
+        [{"text": "📞 Зв’язатися з менеджером"}, {"text": "🚚 Доставка і оплата"}]
     ]
 
     if is_admin:
@@ -268,6 +266,26 @@ def categories_menu():
 
 def inline_button(text, callback_data):
     return {"text": text, "callback_data": callback_data}
+
+
+def safe_text(value, default="—"):
+    value = str(value or "").strip()
+    return value if value else default
+
+
+def safe_float(value, default=0):
+    try:
+        return float(value or default)
+    except:
+        return default
+
+
+def back_to_main_inline():
+    return {
+        "inline_keyboard": [
+            [inline_button("⬅️ Назад у меню", "back_main")]
+        ]
+    }
 
 
 def is_admin(chat_id):
@@ -316,12 +334,12 @@ def get_sale_products():
 
 
 def product_text(product, index=None, total=None):
-    name = product.get("Назва товару")
-    description = product.get("Опис")
-    price = product.get("Ціна")
-    old_price = str(product.get("Стара ціна", "")).strip()
-    sale_price = str(product.get("Акційна ціна", "")).strip()
-    sale = str(product.get("Акція")).strip()
+    name = safe_text(product.get("Назва товару"), "Товар без назви")
+    description = safe_text(product.get("Опис"), "")
+    price = safe_text(product.get("Ціна"), "0")
+    old_price = str(product.get("Стара ціна", "") or "").strip()
+    sale_price = str(product.get("Акційна ціна", "") or "").strip()
+    sale = str(product.get("Акція") or "").strip()
 
     text = ""
 
@@ -329,7 +347,9 @@ def product_text(product, index=None, total=None):
         text += f"📦 Товар {index + 1} з {total}\n\n"
 
     text += f"<b>{name}</b>\n\n"
-    text += f"{description}\n\n"
+
+    if description:
+        text += f"{description}\n\n"
 
     if old_price and sale_price:
         text += f"💸 Стара ціна: <s>{old_price} грн</s>\n"
@@ -510,8 +530,8 @@ def add_to_cart(chat_id, product_id, callback_message=None):
         send_message(chat_id, "Товар не знайдено 😔", main_menu(is_admin(chat_id)))
         return
 
-    name = product.get("Назва товару")
-    price = float(product.get("Ціна") or 0)
+    name = safe_text(product.get("Назва товару"), "Товар")
+    price = safe_float(product.get("Акційна ціна") or product.get("Ціна") or 0)
 
     existing = find_cart_row_by_product(chat_id, product_id)
 
@@ -806,7 +826,7 @@ def show_my_orders(chat_id):
         send_message(
             chat_id,
             "У Вас поки немає замовлень 🛒",
-            main_menu(is_admin(chat_id))
+            back_to_main_inline()
         )
         return
 
@@ -815,14 +835,14 @@ def show_my_orders(chat_id):
     for idx, order in enumerate(my_orders, start=1):
         text += (
             f"<b>Замовлення #{idx}</b>\n"
-            f"Дата: {order.get('Дата')}\n"
-            f"Товари: {order.get('Товари')}\n"
-            f"Сума: {order.get('Сума')} грн\n"
-            f"Адреса доставки: {order.get('Адреса доставки')}\n"
-            f"Статус: <b>{order.get('Статус')}</b>\n\n"
+            f"Дата: {safe_text(order.get('Дата'))}\n"
+            f"Товари: {safe_text(order.get('Товари'))}\n"
+            f"Сума: {safe_text(order.get('Сума'), '0')} грн\n"
+            f"Адреса доставки: {safe_text(order.get('Адреса доставки'))}\n"
+            f"Статус: <b>{safe_text(order.get('Статус'), 'Нове')}</b>\n\n"
         )
 
-    send_message(chat_id, text, main_menu(is_admin(chat_id)))
+    send_message(chat_id, text, back_to_main_inline())
 
 
 def show_delivery_payment(chat_id):
@@ -839,7 +859,7 @@ def show_delivery_payment(chat_id):
         value = row.get("Значення")
         text += f"<b>{param}:</b>\n{value}\n\n"
 
-    send_message(chat_id, text, main_menu(is_admin(chat_id)))
+    send_message(chat_id, text, back_to_main_inline())
 
 
 # =========================
@@ -1122,11 +1142,11 @@ def format_orders_list(orders, title):
 
     for idx, order in enumerate(orders[-10:], start=1):
         text += (
-            f"<b>{idx}. {order.get('Дата')}</b>\n"
-            f"{order.get('ПІБ')} | {order.get('Телефон')}\n"
-            f"{order.get('Товари')}\n"
-            f"Сума: <b>{order.get('Сума')} грн</b>\n"
-            f"Статус: <b>{order.get('Статус')}</b>\n\n"
+            f"<b>{idx}. {safe_text(order.get('Дата'))}</b>\n"
+            f"{safe_text(order.get('ПІБ'))} | {safe_text(order.get('Телефон'))}\n"
+            f"{safe_text(order.get('Товари'))}\n"
+            f"Сума: <b>{safe_text(order.get('Сума'), '0')} грн</b>\n"
+            f"Статус: <b>{safe_text(order.get('Статус'), 'Нове')}</b>\n\n"
         )
 
     if len(orders) > 10:
@@ -1170,6 +1190,14 @@ def handle_admin_state(chat_id, text):
 
     if state.get("step") == "admin_date_filter":
         date_query = text.strip()
+
+        if len(date_query) != 10 or date_query.count(".") != 2:
+            send_message(
+                chat_id,
+                "Дата має бути у форматі <code>дд.мм.рррр</code>.\nНаприклад: <code>22.05.2026</code>"
+            )
+            return True
+
         orders = get_orders_with_rows()
 
         found = [
@@ -1241,8 +1269,6 @@ def webhook():
             show_sales(chat_id)
         elif text == "🛒 Кошик":
             show_cart(chat_id)
-        elif text == "✅ Замовити":
-            start_order(chat_id)
         elif text == "📦 Мої замовлення":
             show_my_orders(chat_id)
         elif text == "📞 Зв’язатися з менеджером":
@@ -1295,6 +1321,14 @@ def webhook():
 
         elif data_value == "open_cart":
             show_cart(chat_id, callback_message)
+
+        elif data_value == "back_main":
+            edit_message(
+                chat_id,
+                message_id,
+                "🏠 <b>Головне меню</b>\n\nОберіть дію нижче 👇",
+                back_to_main_inline()
+            )
 
         elif data_value == "order_now":
             start_order(chat_id)
