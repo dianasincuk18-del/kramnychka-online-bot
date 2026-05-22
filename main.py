@@ -251,6 +251,32 @@ def send_photo(chat_id, photo_url, caption, keyboard=None):
 
 
 
+def send_document(chat_id, document_url, caption, keyboard=None):
+    payload = {
+        "chat_id": chat_id,
+        "document": document_url,
+        "caption": caption,
+        "parse_mode": "HTML"
+    }
+
+    if keyboard:
+        payload["reply_markup"] = json.dumps(keyboard, ensure_ascii=False)
+
+    try:
+        response = requests.post(f"{BASE_URL}/sendDocument", json=payload, timeout=20)
+
+        if not response.ok:
+            print("send_document telegram error:", response.text)
+            return False
+
+        return True
+
+    except Exception as e:
+        print("send_document error:", e)
+        return False
+
+
+
 def edit_message(chat_id, message_id, text, keyboard=None):
     payload = {
         "chat_id": chat_id,
@@ -663,7 +689,10 @@ def show_product_card(chat_id, products, index=0, mode="category", category_id="
         ok = send_photo(chat_id, photos[photo_index], text, keyboard)
 
         if not ok:
-            send_message(chat_id, text, keyboard)
+            doc_ok = send_document(chat_id, photos[photo_index], text, keyboard)
+
+            if not doc_ok:
+                send_message(chat_id, text, keyboard)
     else:
         send_message(chat_id, text, keyboard)
 
