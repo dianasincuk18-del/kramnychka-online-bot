@@ -325,6 +325,45 @@ def categories_menu():
     }
 
 
+
+def subcategories_menu(category_id):
+    subcategories = get_active_subcategories(category_id)
+    keyboard = []
+
+    row = []
+    for subcategory in subcategories:
+        row.append({"text": f"📂 {subcategory.get('Назва підкатегорії')}"})
+
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+
+    if row:
+        keyboard.append(row)
+
+    keyboard.append([{"text": "⬅️ Назад"}])
+
+    return {
+        "keyboard": keyboard,
+        "resize_keyboard": True
+    }
+
+
+def get_subcategory_by_button_text(text, category_id=None):
+    clean_text = str(text).replace("📂", "").strip()
+    subcategories = get_records("Підкатегорії")
+
+    for subcategory in subcategories:
+        active = str(subcategory.get("Активна", "")).strip().lower()
+        name = str(subcategory.get("Назва підкатегорії", "")).strip()
+        item_category_id = str(subcategory.get("ID категорії", "")).strip()
+
+        if active in ["так", "yes", "1", "true", "активна"] and name == clean_text:
+            if category_id is None or str(category_id) == item_category_id:
+                return subcategory
+
+    return None
+
 def inline_button(text, callback_data):
     return {"text": text, "callback_data": callback_data}
 
@@ -635,6 +674,29 @@ def update_product_card(chat_id, callback_message, products, index=0, mode="cate
         send_photo(chat_id, photos[photo_index], text, keyboard)
     else:
         edit_message(chat_id, message_id, text, keyboard)
+
+def show_subcategories_reply(chat_id, category_id):
+    subcategories = get_active_subcategories(category_id)
+
+    if not subcategories:
+        send_message(
+            chat_id,
+            "У цій категорії поки немає підкатегорій 😔",
+            categories_menu()
+        )
+        return
+
+    USER_STATES[str(chat_id)] = {
+        "step": "choosing_subcategory",
+        "category_id": category_id
+    }
+
+    send_message(
+        chat_id,
+        "📂 <b>Підкатегорії</b>\n\nОберіть підкатегорію нижче 👇",
+        subcategories_menu(category_id)
+    )
+
 
 def show_subcategories(chat_id, category_id, callback_message=None):
     subcategories = get_active_subcategories(category_id)
@@ -1669,11 +1731,20 @@ def webhook():
         elif handle_order_state(chat_id, text, user):
             pass
         elif text == "⬅️ Назад":
-            start(chat_id)
+            state = USER_STATES.get(str(chat_id), {})
+            if state.get("step") == "choosing_subcategory":
+                USER_STATES.pop(str(chat_id), None)
+                show_catalog_menu(chat_id)
+            else:
+                USER_STATES.pop(str(chat_id), None)
+                start(chat_id)
         elif text == "📦 Каталог":
             show_catalog_menu(chat_id)
         elif category:
-            show_products_by_category(chat_id, category.get("ID категорії"))
+            show_subcategories_reply(chat_id, category.get("ID категорії"))
+        elif get_subcategory_by_button_text(text, USER_STATES.get(str(chat_id), {}).get("category_id")):
+            subcategory = get_subcategory_by_button_text(text, USER_STATES.get(str(chat_id), {}).get("category_id"))
+            show_products_by_subcategory(chat_id, subcategory.get("ID підкатегорії"))
         elif text == "🔥 Акції":
             show_sales(chat_id)
         elif text == "🛒 Кошик":
