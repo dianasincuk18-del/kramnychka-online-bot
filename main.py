@@ -192,9 +192,11 @@ def edit_message(chat_id, message_id, text, keyboard=None):
         payload["reply_markup"] = json.dumps(keyboard, ensure_ascii=False)
 
     try:
-        requests.post(f"{BASE_URL}/editMessageText", json=payload, timeout=15)
+        response = requests.post(f"{BASE_URL}/editMessageText", json=payload, timeout=15)
+        return response.ok
     except Exception as e:
         print("edit_message error:", e)
+        return False
 
 
 def edit_caption(chat_id, message_id, caption, keyboard=None):
@@ -209,9 +211,11 @@ def edit_caption(chat_id, message_id, caption, keyboard=None):
         payload["reply_markup"] = json.dumps(keyboard, ensure_ascii=False)
 
     try:
-        requests.post(f"{BASE_URL}/editMessageCaption", json=payload, timeout=15)
+        response = requests.post(f"{BASE_URL}/editMessageCaption", json=payload, timeout=15)
+        return response.ok
     except Exception as e:
         print("edit_caption error:", e)
+        return False
 
 
 def edit_callback_message(callback_message, text, keyboard=None):
@@ -219,9 +223,12 @@ def edit_callback_message(callback_message, text, keyboard=None):
     message_id = callback_message["message_id"]
 
     if "photo" in callback_message:
-        edit_caption(chat_id, message_id, text, keyboard)
+        ok = edit_caption(chat_id, message_id, text, keyboard)
     else:
-        edit_message(chat_id, message_id, text, keyboard)
+        ok = edit_message(chat_id, message_id, text, keyboard)
+
+    if not ok:
+        send_message(chat_id, text, keyboard)
 
 
 def answer_callback(callback_id):
