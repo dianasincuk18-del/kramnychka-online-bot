@@ -919,16 +919,49 @@ def show_orders_by_status(chat_id, status, callback_message=None):
         send_message(chat_id, text, keyboard)
 
 
+def notify_client_status_change(client_chat_id, status):
+    if not client_chat_id:
+        return
+
+    messages = {
+        "В обробці": "🟡 Ваше замовлення вже в обробці. Дякуємо за очікування 💛",
+        "Відправлено": "🚚 Ваше замовлення відправлено. Очікуйте доставку 💛",
+        "Скасовано": "❌ Ваше замовлення скасовано. Якщо це помилка — напишіть нам 💛",
+        "Опрацьовано": "✅ Ваше замовлення опрацьовано. Дякуємо, що обрали нас 💛",
+        "Нове": "🆕 Ваше замовлення прийнято 💛"
+    }
+
+    text = messages.get(status, f"📦 Статус Вашого замовлення змінено на: {status}")
+
+    try:
+        send_message(client_chat_id, text)
+    except Exception as e:
+        print("notify_client_status_change error:", e)
+
+
 def set_order_status(chat_id, row_index, status, callback_message=None):
     if not is_admin(chat_id):
         return
 
     try:
+        orders = get_orders_with_rows()
+        target_order = None
+
+        for order in orders:
+            if str(order.get("row_index")) == str(row_index):
+                target_order = order
+                break
+
+        client_chat_id = target_order.get("Telegram ID") if target_order else ""
+
         update_cell("Замовлення", int(row_index), 10, status)
+
+        notify_client_status_change(client_chat_id, status)
 
         text = (
             f"{status_emoji(status)} <b>Статус змінено</b>\n\n"
-            f"Новий статус замовлення: <b>{status}</b>"
+            f"Новий статус замовлення: <b>{status}</b>\n"
+            f"Клієнту надіслано сповіщення ✅"
         )
 
         keyboard = {
