@@ -333,13 +333,8 @@ def show_categories(chat_id, callback_message=None):
         send_message(chat_id, text, keyboard)
 
 
-def show_products_by_category(chat_id, category_id, callback_message=None):
-    products = get_records("Товари")
-    filtered = [
-        p for p in products
-        if str(p.get("ID категорії")) == str(category_id)
-        and str(p.get("Активний")).strip().lower() in ["так", "yes", "true", "1"]
-    ]
+def show_products_by_category(chat_id, category_id, callback_message=None, page=0):
+    filtered = get_active_products_by_category(category_id)
 
     if not filtered:
         text = "У цій категорії поки немає товарів 😔"
@@ -351,30 +346,22 @@ def show_products_by_category(chat_id, category_id, callback_message=None):
             send_message(chat_id, text, keyboard)
         return
 
-    header = "📦 <b>Товари в категорії</b>\n\nОсь що є в наявності 👇"
-    keyboard = {"inline_keyboard": [[inline_button("⬅️ Назад до каталогу", "open_catalog")]]}
-
-    if callback_message:
-        edit_callback_message(callback_message, header, keyboard)
-    else:
-        send_message(chat_id, header, keyboard)
-
-    for product in filtered:
-        send_product(chat_id, product)
+    show_product_card(
+        chat_id=chat_id,
+        products=filtered,
+        index=int(page),
+        callback_message=callback_message,
+        mode="category",
+        category_id=category_id
+    )
 
 
-def show_sales(chat_id, callback_message=None):
-    products = get_records("Товари")
-    sale_products = [
-        p for p in products
-        if str(p.get("Акція")).strip() != ""
-        and str(p.get("Активний")).strip().lower() in ["так", "yes", "true", "1"]
-    ]
-
-    keyboard = {"inline_keyboard": [[inline_button("⬅️ Назад", "back_main")]]}
+def show_sales(chat_id, callback_message=None, page=0):
+    sale_products = get_sale_products()
 
     if not sale_products:
         text = "Поки немає активних акцій 😔"
+        keyboard = {"inline_keyboard": [[inline_button("⬅️ Назад", "back_main")]]}
 
         if callback_message:
             edit_callback_message(callback_message, text, keyboard)
@@ -382,15 +369,13 @@ def show_sales(chat_id, callback_message=None):
             send_message(chat_id, text, keyboard)
         return
 
-    text = "🔥 <b>Акції</b>\n\nПоказую активні акційні товари 👇"
-
-    if callback_message:
-        edit_callback_message(callback_message, text, keyboard)
-    else:
-        send_message(chat_id, text, keyboard)
-
-    for product in sale_products:
-        send_product(chat_id, product)
+    show_product_card(
+        chat_id=chat_id,
+        products=sale_products,
+        index=int(page),
+        callback_message=callback_message,
+        mode="sale"
+    )
 
 
 def send_product(chat_id, product):
@@ -1012,7 +997,17 @@ def webhook():
         if callback_id:
             answer_callback(callback_id)
 
-        if data_value.startswith("cat_"):
+        if data_value.startswith("catpage_"):
+            parts = data_value.split("_")
+            category_id = parts[1]
+            page = int(parts[2])
+            show_products_by_category(chat_id, category_id, callback_message, page)
+
+        elif data_value.startswith("sale_page_"):
+            page = int(data_value.replace("sale_page_", ""))
+            show_sales(chat_id, callback_message, page)
+
+        elif data_value.startswith("cat_"):
             category_id = data_value.replace("cat_", "")
             show_products_by_category(chat_id, category_id, callback_message)
 
