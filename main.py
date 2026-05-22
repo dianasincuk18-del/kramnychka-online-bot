@@ -602,8 +602,12 @@ def get_product_photos(product):
 
 
 
+
 def build_product_keyboard(product_id, products, index, mode="category", category_id="", photo_index=0):
     product = products[index]
+    photos = get_product_photos(product)
+    extra_photos = photos[1:] if len(photos) > 1 else []
+
     availability = str(product.get("Наявність", "") or "").strip().lower()
 
     if availability == "немає":
@@ -614,6 +618,9 @@ def build_product_keyboard(product_id, products, index, mode="category", categor
         buttons = [
             [inline_button("🛒 Додати в кошик", f"add_one_{product_id}")]
         ]
+
+    if extra_photos:
+        buttons.append([inline_button("📸 Більше фото", f"more_photos_{index}")])
 
     buttons.append([inline_button("🛒 Перейти в кошик", "open_cart")])
 
@@ -661,6 +668,38 @@ def send_product_photos_gallery(chat_id, photos):
 
 
 
+
+def show_more_product_photos(chat_id, product_index):
+    state = USER_STATES.get(str(chat_id), {})
+    products = state.get("products", [])
+
+    if not products:
+        send_message(chat_id, "Не знайшла товар для перегляду фото 😔")
+        return
+
+    product_index = int(product_index)
+
+    if product_index < 0 or product_index >= len(products):
+        send_message(chat_id, "Не знайшла товар для перегляду фото 😔")
+        return
+
+    product = products[product_index]
+    photos = get_product_photos(product)
+    extra_photos = photos[1:] if len(photos) > 1 else []
+
+    if not extra_photos:
+        send_message(chat_id, "Додаткових фото для цього товару немає 😔")
+        return
+
+    send_message(chat_id, "📸 Додаткові фото товару:")
+
+    for photo_url in extra_photos:
+        ok = send_photo(chat_id, photo_url, "")
+
+        if not ok:
+            send_document(chat_id, photo_url, "")
+
+
 def show_product_card(chat_id, products, index=0, mode="category", category_id="", photo_index=0):
     if not products:
         send_message(chat_id, "Товарів поки немає 😔", main_menu(is_admin(chat_id)))
@@ -683,11 +722,17 @@ def show_product_card(chat_id, products, index=0, mode="category", category_id="
     text = product_text(product, index, total)
     keyboard = build_product_keyboard(product_id, products, index, mode, category_id, 0)
 
-    # Показуємо всі фото товару одразу.
-    send_product_photos_gallery(chat_id, photos)
+    # Красивий формат: головне фото разом із карткою товару.
+    if photos:
+        ok = send_photo(chat_id, photos[0], text, keyboard)
 
-    # Окремо показуємо картку товару з описом і кнопками.
-    send_message(chat_id, text, keyboard)
+        if not ok:
+            doc_ok = send_document(chat_id, photos[0], text, keyboard)
+
+            if not doc_ok:
+                send_message(chat_id, text, keyboard)
+    else:
+        send_message(chat_id, text, keyboard)
 
 def update_product_card(chat_id, message_id, products, index=0, mode="category", category_id="", photo_index=0, callback_message=None):
     if not products:
@@ -1851,6 +1896,10 @@ def webhook():
             state = USER_STATES.get(str(chat_id), {})
             products = state.get("products", get_sale_products())
             update_product_card(chat_id, message_id, products, page, "sale", "", 0, callback_message)
+
+        elif data_value.startswith("more_photos_"):
+            product_index = data_value.replace("more_photos_", "")
+            show_more_product_photos(chat_id, product_index)
 
         elif data_value == "product_unavailable":
             answer_callback(callback_id)
