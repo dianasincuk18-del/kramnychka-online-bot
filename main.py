@@ -230,6 +230,7 @@ def main_menu(is_admin=False):
         [{"text": "📦 Каталог"}, {"text": "🔥 Акції"}],
         [{"text": "🛒 Кошик"}, {"text": "✅ Замовити"}],
         [{"text": "📦 Мої замовлення"}],
+        [{"text": "📞 Зв’язатися з менеджером"}],
         [{"text": "🚚 Доставка і оплата"}]
     ]
 
@@ -773,6 +774,30 @@ def notify_admin(full_name, phone, address, products, total, need_contact, teleg
     send_message(ADMIN_CHAT_ID, text)
 
 
+def contact_manager(chat_id, user):
+    username = user.get("username", "")
+    first_name = user.get("first_name", "")
+
+    send_message(
+        chat_id,
+        "📞 <b>Зв’язатися з менеджером</b>\n\n"
+        "Ми передали Ваш запит менеджеру. Вам скоро напишуть 💛",
+        main_menu(is_admin(chat_id))
+    )
+
+    if ADMIN_CHAT_ID:
+        client_link = f"@{username}" if username else f"Telegram ID: {chat_id}"
+
+        text = (
+            "📞 <b>Клієнт хоче зв’язатися з менеджером</b>\n\n"
+            f"<b>Ім’я:</b> {first_name}\n"
+            f"<b>Контакт:</b> {client_link}\n"
+            f"<b>Telegram ID:</b> {chat_id}"
+        )
+
+        send_message(ADMIN_CHAT_ID, text)
+
+
 def show_my_orders(chat_id):
     orders = get_orders_with_rows()
     my_orders = [o for o in orders if str(o.get("Telegram ID")) == str(chat_id)]
@@ -854,6 +879,8 @@ def show_admin_cabinet(chat_id, callback_message=None):
         send_message(chat_id, "Цей розділ доступний тільки адміністратору.", main_menu(False))
         return
 
+    USER_STATES.pop(str(chat_id), None)
+
     stats = get_status_stats()
 
     text = (
@@ -872,6 +899,8 @@ def show_admin_cabinet(chat_id, callback_message=None):
             [inline_button("🚚 Відправлено", "admin_status_Відправлено")],
             [inline_button("❌ Скасовано", "admin_status_Скасовано")],
             [inline_button("✅ Опрацьовано", "admin_status_Опрацьовано")],
+            [inline_button("🔍 Пошук", "admin_search")],
+            [inline_button("📅 Фільтр за датою", "admin_date_filter")],
             [inline_button("💰 Сума замовлень", "admin_orders_sum")]
         ]
     }
@@ -896,9 +925,37 @@ def status_emoji(status):
     return "📦"
 
 
+def order_details_text(order, title="Замовлення"):
+    return (
+        f"📦 <b>{title}</b>\n\n"
+        f"<b>Дата:</b> {order.get('Дата')}\n"
+        f"<b>ПІБ:</b> {order.get('ПІБ')}\n"
+        f"<b>Телефон:</b> {order.get('Телефон')}\n"
+        f"<b>Адреса:</b> {order.get('Адреса доставки')}\n"
+        f"<b>Товари:</b> {order.get('Товари')}\n"
+        f"<b>Сума:</b> {order.get('Сума')} грн\n"
+        f"<b>Потрібно зв’язатись:</b> {order.get('Потрібно зв’язатись')}\n"
+        f"<b>Статус:</b> {order.get('Статус')}"
+    )
+
+
+def order_status_keyboard(row_index, extra_back="admin_back"):
+    return {
+        "inline_keyboard": [
+            [inline_button("🟡 В обробці", f"set_status_{row_index}_В обробці")],
+            [inline_button("🚚 Відправлено", f"set_status_{row_index}_Відправлено")],
+            [inline_button("❌ Скасовано", f"set_status_{row_index}_Скасовано")],
+            [inline_button("✅ Опрацьовано", f"set_status_{row_index}_Опрацьовано")],
+            [inline_button("⬅️ Назад у кабінет", extra_back)]
+        ]
+    }
+
+
 def show_orders_by_status(chat_id, status, callback_message=None):
     if not is_admin(chat_id):
         return
+
+    USER_STATES.pop(str(chat_id), None)
 
     orders = get_orders_with_rows()
     filtered = [o for o in orders if str(o.get("Статус")).strip() == status]
@@ -914,28 +971,15 @@ def show_orders_by_status(chat_id, status, callback_message=None):
         return
 
     order = filtered[-1]
-
-    text = (
-        f"{status_emoji(status)} <b>Замовлення: {status}</b>\n\n"
-        f"<b>Дата:</b> {order.get('Дата')}\n"
-        f"<b>ПІБ:</b> {order.get('ПІБ')}\n"
-        f"<b>Телефон:</b> {order.get('Телефон')}\n"
-        f"<b>Адреса:</b> {order.get('Адреса доставки')}\n"
-        f"<b>Товари:</b> {order.get('Товари')}\n"
-        f"<b>Сума:</b> {order.get('Сума')} грн\n"
-        f"<b>Потрібно зв’язатись:</b> {order.get('Потрібно зв’язатись')}\n"
-        f"<b>Статус:</b> {order.get('Статус')}\n\n"
-        f"Усього у цьому статусі: <b>{len(filtered)}</b>"
-    )
-
-    row_index = order.get("row_index")
+    text = order_details_text(order, f"{status_emoji(status)} Замовлення: {status}")
+    text += f"\n\nУсього у цьому статусі: <b>{len(filtered)}</b>"
 
     keyboard = {
         "inline_keyboard": [
-            [inline_button("🟡 В обробці", f"set_status_{row_index}_В обробці")],
-            [inline_button("🚚 Відправлено", f"set_status_{row_index}_Відправлено")],
-            [inline_button("❌ Скасовано", f"set_status_{row_index}_Скасовано")],
-            [inline_button("✅ Опрацьовано", f"set_status_{row_index}_Опрацьовано")],
+            [inline_button("🟡 В обробці", f"set_status_{order.get('row_index')}_В обробці")],
+            [inline_button("🚚 Відправлено", f"set_status_{order.get('row_index')}_Відправлено")],
+            [inline_button("❌ Скасовано", f"set_status_{order.get('row_index')}_Скасовано")],
+            [inline_button("✅ Опрацьовано", f"set_status_{order.get('row_index')}_Опрацьовано")],
             [inline_button("🔄 Оновити", f"admin_status_{status}")],
             [inline_button("⬅️ Назад у кабінет", "admin_back")]
         ]
@@ -983,7 +1027,6 @@ def set_order_status(chat_id, row_index, status, callback_message=None):
         client_chat_id = target_order.get("Telegram ID") if target_order else ""
 
         update_cell("Замовлення", int(row_index), 10, status)
-
         notify_client_status_change(client_chat_id, status)
 
         text = (
@@ -1012,6 +1055,8 @@ def show_admin_orders_sum(chat_id, callback_message=None):
     if not is_admin(chat_id):
         return
 
+    USER_STATES.pop(str(chat_id), None)
+
     stats = get_status_stats()
     total_all = sum(v["sum"] for v in stats.values())
 
@@ -1031,6 +1076,117 @@ def show_admin_orders_sum(chat_id, callback_message=None):
         edit_message(chat_id, callback_message["message_id"], text, keyboard)
     else:
         send_message(chat_id, text, keyboard)
+
+
+def start_admin_search(chat_id, callback_message=None):
+    if not is_admin(chat_id):
+        return
+
+    USER_STATES[str(chat_id)] = {"step": "admin_search"}
+
+    text = (
+        "🔍 <b>Пошук замовлення</b>\n\n"
+        "Напишіть ПІБ, телефон або Telegram ID клієнта:"
+    )
+
+    if callback_message:
+        edit_message(chat_id, callback_message["message_id"], text)
+    else:
+        send_message(chat_id, text)
+
+
+def start_admin_date_filter(chat_id, callback_message=None):
+    if not is_admin(chat_id):
+        return
+
+    USER_STATES[str(chat_id)] = {"step": "admin_date_filter"}
+
+    text = (
+        "📅 <b>Фільтр за датою</b>\n\n"
+        "Введіть дату у форматі:\n"
+        "<code>дд.мм.рррр</code>\n\n"
+        "Наприклад: <code>22.05.2026</code>"
+    )
+
+    if callback_message:
+        edit_message(chat_id, callback_message["message_id"], text)
+    else:
+        send_message(chat_id, text)
+
+
+def format_orders_list(orders, title):
+    if not orders:
+        return f"{title}\n\nНічого не знайдено."
+
+    text = f"{title}\n\n"
+
+    for idx, order in enumerate(orders[-10:], start=1):
+        text += (
+            f"<b>{idx}. {order.get('Дата')}</b>\n"
+            f"{order.get('ПІБ')} | {order.get('Телефон')}\n"
+            f"{order.get('Товари')}\n"
+            f"Сума: <b>{order.get('Сума')} грн</b>\n"
+            f"Статус: <b>{order.get('Статус')}</b>\n\n"
+        )
+
+    if len(orders) > 10:
+        text += f"Показано останні 10 з {len(orders)} знайдених."
+
+    return text
+
+
+def handle_admin_state(chat_id, text):
+    state = USER_STATES.get(str(chat_id))
+
+    if not state:
+        return False
+
+    if not is_admin(chat_id):
+        return False
+
+    if state.get("step") == "admin_search":
+        query = text.strip().lower()
+        orders = get_orders_with_rows()
+
+        found = []
+        for order in orders:
+            fields = [
+                str(order.get("ПІБ", "")).lower(),
+                str(order.get("Телефон", "")).lower(),
+                str(order.get("Telegram ID", "")).lower()
+            ]
+
+            if any(query in field for field in fields):
+                found.append(order)
+
+        USER_STATES.pop(str(chat_id), None)
+
+        send_message(
+            chat_id,
+            format_orders_list(found, "🔍 <b>Результати пошуку</b>"),
+            main_menu(True)
+        )
+        return True
+
+    if state.get("step") == "admin_date_filter":
+        date_query = text.strip()
+        orders = get_orders_with_rows()
+
+        found = [
+            order for order in orders
+            if str(order.get("Дата", "")).startswith(date_query)
+        ]
+
+        USER_STATES.pop(str(chat_id), None)
+
+        send_message(
+            chat_id,
+            format_orders_list(found, f"📅 <b>Замовлення за {date_query}</b>"),
+            main_menu(True)
+        )
+        return True
+
+    return False
 
 
 # старі функції залишаємо як аліаси, щоб не ламати старі кнопки
@@ -1071,6 +1227,8 @@ def webhook():
             start(chat_id)
         elif text == "/myid":
             show_my_id(chat_id)
+        elif handle_admin_state(chat_id, text):
+            pass
         elif handle_order_state(chat_id, text, user):
             pass
         elif text == "⬅️ Назад":
@@ -1087,6 +1245,8 @@ def webhook():
             start_order(chat_id)
         elif text == "📦 Мої замовлення":
             show_my_orders(chat_id)
+        elif text == "📞 Зв’язатися з менеджером":
+            contact_manager(chat_id, user)
         elif text == "🚚 Доставка і оплата":
             show_delivery_payment(chat_id)
         elif text == "👑 Кабінет":
@@ -1163,6 +1323,22 @@ def webhook():
             row_index = parts[2]
             status = parts[3]
             set_order_status(chat_id, row_index, status, callback_message)
+
+        elif data_value.startswith("admin_status_"):
+            status = data_value.replace("admin_status_", "")
+            show_orders_by_status(chat_id, status, callback_message)
+
+        elif data_value.startswith("set_status_"):
+            parts = data_value.split("_", 3)
+            row_index = parts[2]
+            status = parts[3]
+            set_order_status(chat_id, row_index, status, callback_message)
+
+        elif data_value == "admin_search":
+            start_admin_search(chat_id, callback_message)
+
+        elif data_value == "admin_date_filter":
+            start_admin_date_filter(chat_id, callback_message)
 
         elif data_value == "admin_new_orders":
             show_admin_new_orders(chat_id, callback_message)
