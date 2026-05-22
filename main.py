@@ -795,24 +795,20 @@ def notify_admin(full_name, phone, address, products, total, need_contact, teleg
 
 
 def contact_manager(chat_id, user):
-    username = user.get("username", "")
     first_name = user.get("first_name", "")
 
     send_message(
         chat_id,
         "📞 <b>Зв’язатися з менеджером</b>\n\n"
-        "Ми передали Ваш запит менеджеру. Вам скоро напишуть 💛",
+        "Вашу заявку передано менеджеру. Вам скоро напишуть 💛",
         main_menu(is_admin(chat_id))
     )
 
     if ADMIN_CHAT_ID:
-        client_link = f"@{username}" if username else f"Telegram ID: {chat_id}"
-
         text = (
-            "📞 <b>Клієнт хоче зв’язатися з менеджером</b>\n\n"
-            f"<b>Ім’я:</b> {first_name}\n"
-            f"<b>Контакт:</b> {client_link}\n"
-            f"<b>Telegram ID:</b> {chat_id}"
+            "📞 <b>Нова заявка на зв’язок</b>\n\n"
+            f"Клієнт хоче, щоб менеджер з ним зв’язався.\n"
+            f"<b>Ім’я:</b> {first_name or '—'}"
         )
 
         send_message(ADMIN_CHAT_ID, text)
