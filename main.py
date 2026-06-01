@@ -204,6 +204,99 @@ def get_orders_with_rows():
     return result
 
 
+def get_pending_payment_order(chat_id):
+    orders = get_orders_with_rows()
+    pending_statuses = ["Очікується оплата", "Очікує оплати"]
+
+    for order in reversed(orders):
+        if str(order.get("Telegram ID")) == str(chat_id) and str(order.get("Статус", "")).strip() in pending_statuses:
+            return order
+
+    return None
+
+
+def append_payment_receipt(chat_id, full_name, order_row_index, file_id, file_type, caption=""):
+    headers = ["Дата", "Telegram ID", "ПІБ", "Рядок замовлення", "Тип файлу", "File ID", "Коментар", "Статус"]
+    ws = get_or_create_worksheet("Квитанції", headers)
+    ws.append_row([
+        datetime.now().strftime("%d.%m.%Y %H:%M"),
+        chat_id,
+        full_name,
+        order_row_index,
+        file_type,
+        file_id,
+        caption,
+        "Нова"
+    ], value_input_option="USER_ENTERED")
+
+
+def notify_admin_payment_receipt(chat_id, order, file_id, file_type, caption=""):
+    full_name = order.get("ПІБ", "") if order else ""
+    total = order.get("Сума", "") if order else ""
+    order_row = order.get("row_index", "") if order else ""
+
+    admin_caption = (
+        "🧾 <b>Нова квитанція про оплату</b>\n\n"
+        f"<b>ПІБ:</b> {full_name or '—'}\n"
+        f"<b>Telegram ID:</b> {chat_id}\n"
+        f"<b>Замовлення, рядок:</b> {order_row or '—'}\n"
+        f"<b>Сума замовлення:</b> {total or '—'} грн\n"
+        f"<b>Коментар клієнта:</b> {caption or '—'}"
+    )
+
+    for admin_id in get_admin_ids():
+        if file_type == "photo":
+            ok = send_photo(admin_id, file_id, admin_caption)
+            if not ok:
+                send_message(admin_id, admin_caption)
+        else:
+            ok = send_document(admin_id, file_id, admin_caption)
+            if not ok:
+                send_message(admin_id, admin_caption)
+
+
+def handle_payment_receipt(chat_id, message):
+    photo = message.get("photo")
+    document = message.get("document")
+
+    if not photo and not document:
+        return False
+
+    order = get_pending_payment_order(chat_id)
+    if not order:
+        return False
+
+    caption = message.get("caption", "")
+
+    if photo:
+        file_id = photo[-1].get("file_id")
+        file_type = "photo"
+    else:
+        file_id = document.get("file_id")
+        file_type = "document"
+
+    if not file_id:
+        return False
+
+    append_payment_receipt(
+        chat_id=chat_id,
+        full_name=order.get("ПІБ", ""),
+        order_row_index=order.get("row_index", ""),
+        file_id=file_id,
+        file_type=file_type,
+        caption=caption
+    )
+
+    notify_admin_payment_receipt(chat_id, order, file_id, file_type, caption)
+
+    send_message(
+        chat_id,
+        "✅ Дякуємо! Квитанцію отримано та передано менеджеру на перевірку 💛\n\n"
+        "Після перевірки ми оновимо статус Вашого замовлення."
+    )
+    return True
+
+
 # =========================
 # TELEGRAM HELPERS
 # =========================
@@ -1312,11 +1405,11 @@ def start_order(chat_id):
     cart = get_user_cart(chat_id)
 
     if not cart:
-        send_message(chat_id, "Кошик порожній, немає що замовляти 😔", main_menu(is_admin(chat_id)))
+        send_message(chat_id, "Ваш кошик порожній, немає що замовляти 😔", main_menu(is_admin(chat_id)))
         return
 
     USER_STATES[str(chat_id)] = {
-        "step": "waiting_delivery",
+        "step": "waiting_full_name",
         "full_name": "",
         "phone": "",
         "city": "",
@@ -1328,15 +1421,7 @@ def start_order(chat_id):
         "comment": ""
     }
 
-    keyboard = {
-        "inline_keyboard": [
-            [inline_button("🚚 Нова пошта", "delivery_Нова пошта")],
-            [inline_button("📦 Укрпошта", "delivery_Укрпошта")]
-        ]
-    }
-
-    send_message(chat_id, "Оберіть, будь ласка, спосіб доставки:", keyboard)
-
+    send_message(chat_id, "Введіть, будь ласка, Ваше ПІБ:")
 
 def handle_contact_state(chat_id, text, user):
     state = USER_STATES.get(str(chat_id))
@@ -1366,6 +1451,27 @@ def handle_order_state(chat_id, text, user):
         return False
 
     step = state.get("step")
+
+    if step == "waiting_full_name":
+        state["full_name"] = text.strip()
+        state["step"] = "waiting_phone"
+        USER_STATES[str(chat_id)] = state
+        send_message(chat_id, "Введіть, будь ласка, Ваш номер телефону:")
+        return True
+
+    if step == "waiting_phone":
+        state["phone"] = text.strip()
+        state["step"] = "waiting_delivery"
+        USER_STATES[str(chat_id)] = state
+
+        keyboard = {
+            "inline_keyboard": [
+                [inline_button("🚚 Нова пошта", "delivery_Нова пошта")],
+                [inline_button("📦 Укрпошта", "delivery_Укрпошта")]
+            ]
+        }
+        send_message(chat_id, "Оберіть, будь ласка, спосіб доставки:", keyboard)
+        return True
 
     if step == "waiting_city":
         state["city"] = text.strip()
@@ -1410,20 +1516,6 @@ def handle_order_state(chat_id, text, user):
 
     if step == "waiting_comment":
         state["comment"] = text.strip()
-        state["step"] = "waiting_full_name"
-        USER_STATES[str(chat_id)] = state
-        send_message(chat_id, "Введіть, будь ласка, Ваше ПІБ:")
-        return True
-
-    if step == "waiting_full_name":
-        state["full_name"] = text.strip()
-        state["step"] = "waiting_phone"
-        USER_STATES[str(chat_id)] = state
-        send_message(chat_id, "Введіть, будь ласка, Ваш номер телефону:")
-        return True
-
-    if step == "waiting_phone":
-        state["phone"] = text.strip()
         state["step"] = "waiting_free_delivery_decision"
         USER_STATES[str(chat_id)] = state
         ask_free_delivery_offer(chat_id)
@@ -1431,11 +1523,10 @@ def handle_order_state(chat_id, text, user):
 
     return False
 
-
 def ask_payment_method(chat_id, callback_message=None):
     keyboard = {
         "inline_keyboard": [
-            [inline_button("💳 Оплата на реквізити Іван", "payment_Оплата на реквізити Іван")],
+            [inline_button("💳 Оплата на IBAN / реквізити Іван", "payment_Оплата на IBAN / реквізити Іван")],
             [inline_button("📦 Накладений платіж", "payment_Накладений платіж")]
         ]
     }
@@ -1500,7 +1591,7 @@ def finish_order(chat_id, user, need_contact, callback_message=None):
         total,
         need_contact,
         comment_for_sheet,
-        "Нове"
+        "Очікується оплата" if payment_method == "Оплата на IBAN / реквізити Іван" else "Нове"
     ])
 
     clear_user_cart(chat_id)
@@ -1519,9 +1610,11 @@ def finish_order(chat_id, user, need_contact, callback_message=None):
         telegram_id=chat_id
     )
 
+    order_status = "Очікується оплата" if payment_method == "Оплата на IBAN / реквізити Іван" else "Нове"
+
     final_text = (
         "✅ <b>Дякуємо за замовлення!</b>\n\n"
-        "Ваше замовлення прийнято та передано в обробку.\n\n"
+        f"Ваше замовлення прийнято. Статус: <b>{order_status}</b>.\n\n"
         f"🛍 Сума товарів: <b>{subtotal} грн</b>\n"
     )
 
@@ -1534,18 +1627,20 @@ def finish_order(chat_id, user, need_contact, callback_message=None):
     final_text += f"💰 До сплати: <b>{total} грн</b>\n"
     final_text += f"{delivery_note_for_client(delivery_method, total)}\n\n"
 
-    if payment_method == "Оплата на реквізити Іван":
-        payment_details = get_setting_value("Реквізити для оплати")
+    if payment_method == "Оплата на IBAN / реквізити Іван":
+        payment_details = get_setting_value("IBAN") or get_setting_value("Реквізити для оплати")
 
         if payment_details:
             final_text += (
-                "💳 <b>Реквізити для оплати:</b>\n"
+                "💳 <b>IBAN / реквізити для оплати:</b>\n"
                 f"{payment_details}\n\n"
+                "Після оплати надішліть, будь ласка, квитанцію сюди в бот — фото або файл 🧾\n\n"
             )
         else:
             final_text += (
-                "💳 Ви обрали оплату на реквізити Іван.\n"
-                "Менеджер надішле реквізити для оплати 💛\n\n"
+                "💳 Ви обрали оплату на IBAN / реквізити Іван.\n"
+                "Менеджер надішле IBAN / реквізити для оплати 💛\n"
+                "Після оплати надішліть, будь ласка, квитанцію сюди в бот — фото або файл 🧾\n\n"
             )
 
     if payment_method == "Накладений платіж":
@@ -1564,6 +1659,9 @@ def finish_order(chat_id, user, need_contact, callback_message=None):
         discount_percent=NEXT_ORDER_DISCOUNT_PERCENT,
         active="Так"
     )
+
+    if payment_method == "Оплата на IBAN / реквізити Іван":
+        USER_STATES[str(chat_id)] = {"step": "waiting_payment_receipt"}
 
     keyboard = {
         "inline_keyboard": [
@@ -1709,6 +1807,7 @@ def get_status_stats():
 
     stats = {
         "Нове": {"count": 0, "sum": 0},
+        "Очікується оплата": {"count": 0, "sum": 0},
         "В обробці": {"count": 0, "sum": 0},
         "Відправлено": {"count": 0, "sum": 0},
         "Скасовано": {"count": 0, "sum": 0},
@@ -1744,6 +1843,7 @@ def show_admin_cabinet(chat_id, callback_message=None):
     text = (
         "👑 <b>Кабінет</b>\n\n"
         f"🆕 Нові: <b>{stats['Нове']['count']}</b> / {stats['Нове']['sum']} грн\n"
+        f"💳 Очікується оплата: <b>{stats['Очікується оплата']['count']}</b> / {stats['Очікується оплата']['sum']} грн\n"
         f"🟡 В обробці: <b>{stats['В обробці']['count']}</b> / {stats['В обробці']['sum']} грн\n"
         f"🚚 Відправлено: <b>{stats['Відправлено']['count']}</b> / {stats['Відправлено']['sum']} грн\n"
         f"❌ Скасовано: <b>{stats['Скасовано']['count']}</b> / {stats['Скасовано']['sum']} грн\n"
@@ -1753,6 +1853,7 @@ def show_admin_cabinet(chat_id, callback_message=None):
     keyboard = {
         "inline_keyboard": [
             [inline_button("🆕 Нові", "admin_status_Нове")],
+            [inline_button("💳 Очікується оплата", "admin_status_Очікується оплата")],
             [inline_button("🟡 В обробці", "admin_status_В обробці")],
             [inline_button("🚚 Відправлено", "admin_status_Відправлено")],
             [inline_button("❌ Скасовано", "admin_status_Скасовано")],
@@ -1775,6 +1876,8 @@ def show_admin_cabinet(chat_id, callback_message=None):
 def status_emoji(status):
     if status == "Нове":
         return "🆕"
+    if status == "Очікується оплата":
+        return "💳"
     if status == "В обробці":
         return "🟡"
     if status == "Відправлено":
@@ -1805,6 +1908,7 @@ def order_details_text(order, title="Замовлення"):
 def order_status_keyboard(row_index, extra_back="admin_back"):
     return {
         "inline_keyboard": [
+            [inline_button("💳 Очікується оплата", f"set_status_{row_index}_Очікується оплата")],
             [inline_button("🟡 В обробці", f"set_status_{row_index}_В обробці")],
             [inline_button("🚚 Відправлено", f"set_status_{row_index}_Відправлено")],
             [inline_button("❌ Скасовано", f"set_status_{row_index}_Скасовано")],
@@ -1839,6 +1943,7 @@ def show_orders_by_status(chat_id, status, callback_message=None):
 
     keyboard = {
         "inline_keyboard": [
+            [inline_button("💳 Очікується оплата", f"set_status_{order.get('row_index')}_Очікується оплата")],
             [inline_button("🟡 В обробці", f"set_status_{order.get('row_index')}_В обробці")],
             [inline_button("🚚 Відправлено", f"set_status_{order.get('row_index')}_Відправлено")],
             [inline_button("❌ Скасовано", f"set_status_{order.get('row_index')}_Скасовано")],
@@ -1883,6 +1988,7 @@ def notify_client_status_change(client_chat_id, status):
         return
 
     messages = {
+        "Очікується оплата": "💳 Ваше замовлення очікує оплату. Після оплати надішліть, будь ласка, квитанцію сюди в бот 🧾",
         "В обробці": "🟡 Ваше замовлення вже в обробці. Дякуємо за очікування 💛",
         "Відправлено": "🚚 Ваше замовлення відправлено. Дякуємо за замовлення 💛",
         "Скасовано": "❌ Ваше замовлення скасовано. Якщо це помилка — напишіть нам 💛",
@@ -1958,6 +2064,7 @@ def show_admin_orders_sum(chat_id, callback_message=None):
     text = (
         "💰 <b>Сума замовлень</b>\n\n"
         f"🆕 Нові: <b>{stats['Нове']['sum']} грн</b>\n"
+        f"💳 Очікується оплата: <b>{stats['Очікується оплата']['sum']} грн</b>\n"
         f"🟡 В обробці: <b>{stats['В обробці']['sum']} грн</b>\n"
         f"🚚 Відправлено: <b>{stats['Відправлено']['sum']} грн</b>\n"
         f"❌ Скасовано: <b>{stats['Скасовано']['sum']} грн</b>\n"
@@ -2278,6 +2385,9 @@ def webhook():
         text = message.get("text", "")
         user = message.get("from", {})
 
+        if handle_payment_receipt(chat_id, message):
+            return "ok"
+
         category = get_category_by_button_text(text)
 
         if text == "/start":
@@ -2460,10 +2570,11 @@ def webhook():
         elif data_value == "comment_skip":
             state = USER_STATES.get(str(chat_id), {})
             state["comment"] = ""
-            state["step"] = "waiting_full_name"
+            state["step"] = "waiting_free_delivery_decision"
             USER_STATES[str(chat_id)] = state
 
-            edit_message(chat_id, message_id, "Введіть, будь ласка, Ваше ПІБ:")
+            edit_message(chat_id, message_id, "Коментар пропущено ✅")
+            ask_free_delivery_offer(chat_id)
 
         elif data_value == "need_contact_yes":
             finish_order(chat_id, user, "Так", callback_message)
