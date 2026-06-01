@@ -778,8 +778,17 @@ def show_product_card(chat_id, products, index=0, mode="category", category_id="
     keyboard = build_product_keyboard(product_id, products, index, mode, category_id, 0)
 
     if photos:
-        ok = send_photo(chat_id, photos[0], text, keyboard)
+photo_caption = text[:1000]
 
+ok = send_photo(
+    chat_id,
+    photos[0],
+    photo_caption,
+    keyboard
+)
+
+if ok and len(text) > 1000:
+    send_message(chat_id, text[1000:])
         if not ok:
             doc_ok = send_document(chat_id, photos[0], text, keyboard)
 
