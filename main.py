@@ -1207,7 +1207,6 @@ def handle_order_state(chat_id, text, user):
             "inline_keyboard": [
                 [inline_button("🚚 Нова пошта", "delivery_Нова пошта")],
                 [inline_button("📦 Укрпошта", "delivery_Укрпошта")],
-                [inline_button("🏠 Самовивіз / інше", "delivery_Самовивіз / інше")]
             ]
         }
 
