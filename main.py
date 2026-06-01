@@ -698,8 +698,8 @@ def start(chat_id):
 
     text = (
         "Привіт 👋\n\n"
-        "Вітаю у нашій крамничці 🛍\n"
-        "Обери, що хочеш переглянути:"
+        "Вітаємо у нашій крамничці 🛍\n"
+        "Оберіть, будь ласка, що хочете переглянути:"
     )
     send_message(chat_id, text, main_menu(is_admin(chat_id)))
 
@@ -923,7 +923,7 @@ def show_subcategories(chat_id, category_id, callback_message=None):
     buttons.append([inline_button("⬅️ Назад до категорій", "back_categories")])
 
     keyboard = {"inline_keyboard": buttons}
-    text = "Оберіть підкатегорію 👇"
+    text = "Оберіть, будь ласка, підкатегорію 👇"
 
     if callback_message:
         edit_message(chat_id, callback_message["message_id"], text, keyboard)
@@ -1052,7 +1052,7 @@ def show_cart(chat_id, callback_message=None):
     items = find_user_cart_rows(chat_id)
 
     if not items:
-        text = "Твій кошик поки порожній 🛒"
+        text = "Ваш кошик поки порожній 🛒"
         keyboard = {"inline_keyboard": [[inline_button("🔄 Оновити кошик", "open_cart")]]}
 
         if callback_message:
@@ -1062,7 +1062,7 @@ def show_cart(chat_id, callback_message=None):
         return
 
     total = 0
-    text = "🛒 <b>Твій кошик:</b>\n\n"
+    text = "🛒 <b>Ваш кошик:</b>\n\n"
     buttons = []
 
     for item in items:
@@ -1147,17 +1147,26 @@ def start_order(chat_id):
         return
 
     USER_STATES[str(chat_id)] = {
-        "step": "waiting_full_name",
+        "step": "waiting_delivery",
         "full_name": "",
         "phone": "",
+        "city": "",
+        "delivery_point": "",
         "address": "",
-        "need_contact": "",
+        "need_contact": "Ні",
         "delivery_method": "",
         "payment_method": "",
         "comment": ""
     }
 
-    send_message(chat_id, "Введіть, будь ласка, Ваше ПІБ:")
+    keyboard = {
+        "inline_keyboard": [
+            [inline_button("🚚 Нова пошта", "delivery_Нова пошта")],
+            [inline_button("📦 Укрпошта", "delivery_Укрпошта")]
+        ]
+    }
+
+    send_message(chat_id, "Оберіть, будь ласка, спосіб доставки:", keyboard)
 
 
 def handle_contact_state(chat_id, text, user):
@@ -1187,47 +1196,87 @@ def handle_order_state(chat_id, text, user):
     if not state:
         return False
 
-    if state["step"] == "waiting_full_name":
+    step = state.get("step")
+
+    if step == "waiting_city":
+        state["city"] = text.strip()
+        delivery_method = state.get("delivery_method", "")
+
+        if delivery_method == "Нова пошта":
+            state["step"] = "waiting_np_branch"
+            send_message(chat_id, "Введіть, будь ласка, номер або адресу відділення Нової пошти:")
+        elif delivery_method == "Укрпошта":
+            state["step"] = "waiting_ukrposhta_index"
+            send_message(chat_id, "Введіть, будь ласка, індекс Укрпошти:")
+        else:
+            state["step"] = "waiting_delivery"
+            keyboard = {
+                "inline_keyboard": [
+                    [inline_button("🚚 Нова пошта", "delivery_Нова пошта")],
+                    [inline_button("📦 Укрпошта", "delivery_Укрпошта")]
+                ]
+            }
+            send_message(chat_id, "Оберіть, будь ласка, спосіб доставки:", keyboard)
+
+        USER_STATES[str(chat_id)] = state
+        return True
+
+    if step == "waiting_np_branch":
+        state["delivery_point"] = text.strip()
+        city = state.get("city", "")
+        state["address"] = f"Місто: {city}; Відділення Нової пошти: {state['delivery_point']}"
+        state["step"] = "waiting_payment"
+        USER_STATES[str(chat_id)] = state
+        ask_payment_method(chat_id)
+        return True
+
+    if step == "waiting_ukrposhta_index":
+        state["delivery_point"] = text.strip()
+        city = state.get("city", "")
+        state["address"] = f"Місто: {city}; Індекс Укрпошти: {state['delivery_point']}"
+        state["step"] = "waiting_payment"
+        USER_STATES[str(chat_id)] = state
+        ask_payment_method(chat_id)
+        return True
+
+    if step == "waiting_comment":
+        state["comment"] = text.strip()
+        state["step"] = "waiting_full_name"
+        USER_STATES[str(chat_id)] = state
+        send_message(chat_id, "Введіть, будь ласка, Ваше ПІБ:")
+        return True
+
+    if step == "waiting_full_name":
         state["full_name"] = text.strip()
         state["step"] = "waiting_phone"
+        USER_STATES[str(chat_id)] = state
         send_message(chat_id, "Введіть, будь ласка, Ваш номер телефону:")
         return True
 
-    if state["step"] == "waiting_phone":
+    if step == "waiting_phone":
         state["phone"] = text.strip()
-        state["step"] = "waiting_address"
-        send_message(chat_id, "Введіть, будь ласка, адресу доставки:")
-        return True
-
-    if state["step"] == "waiting_address":
-        state["address"] = text.strip()
-        state["step"] = "waiting_delivery"
-
-        keyboard = {
-            "inline_keyboard": [
-                [inline_button("🚚 Нова пошта", "delivery_Нова пошта")],
-                [inline_button("📦 Укрпошта", "delivery_Укрпошта")],
-            ]
-        }
-
-        send_message(chat_id, "Оберіть спосіб доставки:", keyboard)
-        return True
-
-    if state["step"] == "waiting_comment":
-        state["comment"] = text.strip()
-        state["step"] = "waiting_need_contact"
-
-        keyboard = {
-            "inline_keyboard": [
-                [inline_button("Так, зв’яжіться зі мною", "need_contact_yes")],
-                [inline_button("Ні, не потрібно", "need_contact_no")]
-            ]
-        }
-
-        send_message(chat_id, "Чи потрібно зв’язатись з Вами для уточнення деталей?", keyboard)
+        USER_STATES[str(chat_id)] = state
+        finish_order(chat_id, user, "Ні")
         return True
 
     return False
+
+
+def ask_payment_method(chat_id, callback_message=None):
+    keyboard = {
+        "inline_keyboard": [
+            [inline_button("💳 Оплата на реквізити Іван", "payment_Оплата на реквізити Іван")],
+            [inline_button("📦 Накладений платіж", "payment_Накладений платіж")]
+        ]
+    }
+
+    text = "Оберіть, будь ласка, спосіб оплати:"
+
+    if callback_message:
+        edit_message(chat_id, callback_message["message_id"], text, keyboard)
+    else:
+        send_message(chat_id, text, keyboard)
+
 
 def finish_order(chat_id, user, need_contact, callback_message=None):
     cart = get_user_cart(chat_id)
@@ -1292,7 +1341,7 @@ def finish_order(chat_id, user, need_contact, callback_message=None):
         "✅ Дякуємо! Замовлення прийнято, ми передали його в обробку 💛\n\n"
     )
 
-    if payment_method == "Оплата на карту":
+    if payment_method == "Оплата на реквізити Іван":
         payment_details = get_setting_value("Реквізити для оплати")
 
         if payment_details:
@@ -1303,7 +1352,7 @@ def finish_order(chat_id, user, need_contact, callback_message=None):
             )
         else:
             final_text += (
-                "💳 Ви обрали оплату на карту.\n"
+                "💳 Ви обрали оплату на реквізити Іван.\n"
                 "Менеджер надішле реквізити для оплати 💛\n\n"
             )
 
@@ -1328,7 +1377,7 @@ def notify_admin(full_name, phone, address, delivery_method, payment_method, com
         "🔔 <b>Нове замовлення!</b>\n\n"
         f"<b>ПІБ:</b> {full_name}\n"
         f"<b>Телефон:</b> {phone}\n"
-        f"<b>Адреса:</b> {address}\n"
+        f"<b>Дані доставки:</b> {address}\n"
         f"<b>Доставка:</b> {delivery_method}\n"
         f"<b>Оплата:</b> {payment_method}\n"
         f"<b>Коментар:</b> {comment or '—'}\n"
@@ -1371,7 +1420,7 @@ def show_my_orders(chat_id):
     if not my_orders:
         send_message(
             chat_id,
-            "📦 У вас поки немає замовлень.",
+            "📦 У Вас поки немає замовлень.",
             main_menu(is_admin(chat_id))
         )
         return
@@ -1539,7 +1588,7 @@ def order_details_text(order, title="Замовлення"):
         f"<b>Дата:</b> {order.get('Дата')}\n"
         f"<b>ПІБ:</b> {order.get('ПІБ')}\n"
         f"<b>Телефон:</b> {order.get('Телефон')}\n"
-        f"<b>Адреса:</b> {order.get('Адреса доставки')}\n"
+        f"<b>Дані доставки:</b> {order.get('Адреса доставки')}\n"
         f"<b>Доставка:</b> {order.get('Спосіб доставки') or '—'}\n"
         f"<b>Оплата:</b> {order.get('Спосіб оплати') or '—'}\n"
         f"<b>Коментар:</b> {order.get('Коментар') or '—'}\n"
@@ -2036,7 +2085,7 @@ def webhook():
         elif text == "👑 Кабінет":
             show_admin_cabinet(chat_id)
         else:
-            send_message(chat_id, "Обери дію з меню 👇", main_menu(is_admin(chat_id)))
+            send_message(chat_id, "Оберіть, будь ласка, дію з меню 👇", main_menu(is_admin(chat_id)))
 
     if "callback_query" in data:
         callback = data["callback_query"]
@@ -2133,18 +2182,10 @@ def webhook():
         elif data_value.startswith("delivery_"):
             state = USER_STATES.get(str(chat_id), {})
             state["delivery_method"] = data_value.replace("delivery_", "")
-            state["step"] = "waiting_payment"
+            state["step"] = "waiting_city"
             USER_STATES[str(chat_id)] = state
 
-            keyboard = {
-                "inline_keyboard": [
-                    [inline_button("💳 Оплата на карту", "payment_Оплата на карту")],
-                    [inline_button("📦 Накладений платіж", "payment_Накладений платіж")],
-                    [inline_button("💵 Оплата при отриманні", "payment_Оплата при отриманні")]
-                ]
-            }
-
-            edit_message(chat_id, message_id, "Оберіть спосіб оплати:", keyboard)
+            edit_message(chat_id, message_id, "Введіть, будь ласка, місто доставки:")
 
         elif data_value.startswith("payment_"):
             state = USER_STATES.get(str(chat_id), {})
@@ -2162,24 +2203,17 @@ def webhook():
                 chat_id,
                 message_id,
                 "Додайте коментар до замовлення, якщо потрібно.\n"
-                "Наприклад: зручний час доставки, побажання, уточнення.",
+                "Наприклад: відтінок, колір, побажання щодо товару.",
                 keyboard
             )
 
         elif data_value == "comment_skip":
             state = USER_STATES.get(str(chat_id), {})
             state["comment"] = ""
-            state["step"] = "waiting_need_contact"
+            state["step"] = "waiting_full_name"
             USER_STATES[str(chat_id)] = state
 
-            keyboard = {
-                "inline_keyboard": [
-                    [inline_button("Так, зв’яжіться зі мною", "need_contact_yes")],
-                    [inline_button("Ні, не потрібно", "need_contact_no")]
-                ]
-            }
-
-            edit_message(chat_id, message_id, "Чи потрібно зв’язатись з Вами для уточнення деталей?", keyboard)
+            edit_message(chat_id, message_id, "Введіть, будь ласка, Ваше ПІБ:")
 
         elif data_value == "need_contact_yes":
             finish_order(chat_id, user, "Так", callback_message)
