@@ -522,6 +522,152 @@ def get_admin_ids(include_roles=None):
 
 
 # =========================
+# CLIENTS / DISCOUNTS
+# =========================
+
+FREE_DELIVERY_THRESHOLD = 1000
+NEXT_ORDER_DISCOUNT_PERCENT = 10
+
+
+def get_clients_worksheet():
+    headers = [
+        "Telegram ID",
+        "ПІБ",
+        "Телефон",
+        "Знижка %",
+        "Знижка активна",
+        "Дата останнього замовлення"
+    ]
+    return get_or_create_worksheet("Клієнти", headers)
+
+
+def get_client_row(chat_id):
+    try:
+        ws = get_clients_worksheet()
+        rows = ws.get_all_values()
+
+        for i, row in enumerate(rows[1:], start=2):
+            if len(row) > 0 and str(row[0]).strip() == str(chat_id).strip():
+                return ws, i, row
+
+        return ws, None, None
+    except Exception as e:
+        print("get_client_row error:", e)
+        return None, None, None
+
+
+def get_client_discount_percent(chat_id):
+    ws, row_index, row = get_client_row(chat_id)
+
+    if not row:
+        return 0
+
+    active = str(row[4] if len(row) > 4 else "").strip().lower()
+    if active not in ["так", "yes", "true", "1", "активна"]:
+        return 0
+
+    try:
+        return float(row[3] if len(row) > 3 else 0)
+    except:
+        return 0
+
+
+def upsert_client_discount(chat_id, full_name="", phone="", discount_percent=NEXT_ORDER_DISCOUNT_PERCENT, active="Так"):
+    try:
+        ws, row_index, row = get_client_row(chat_id)
+        date_now = datetime.now().strftime("%d.%m.%Y %H:%M")
+
+        if row_index:
+            ws.update_cell(row_index, 2, full_name or (row[1] if len(row) > 1 else ""))
+            ws.update_cell(row_index, 3, phone or (row[2] if len(row) > 2 else ""))
+            ws.update_cell(row_index, 4, discount_percent)
+            ws.update_cell(row_index, 5, active)
+            ws.update_cell(row_index, 6, date_now)
+        else:
+            ws.append_row([
+                chat_id,
+                full_name,
+                phone,
+                discount_percent,
+                active,
+                date_now
+            ], value_input_option="USER_ENTERED")
+    except Exception as e:
+        print("upsert_client_discount error:", e)
+
+
+def calculate_cart_totals(chat_id):
+    cart = get_user_cart(chat_id)
+    subtotal = 0
+
+    for item in cart:
+        try:
+            subtotal += float(item.get("Сума") or 0)
+        except:
+            pass
+
+    discount_percent = get_client_discount_percent(chat_id)
+    discount_amount = round(subtotal * discount_percent / 100, 2) if discount_percent else 0
+    total = round(subtotal - discount_amount, 2)
+
+    return {
+        "subtotal": subtotal,
+        "discount_percent": discount_percent,
+        "discount_amount": discount_amount,
+        "total": total
+    }
+
+
+def delivery_note_for_client(delivery_method, total):
+    if total >= FREE_DELIVERY_THRESHOLD:
+        return "🚚 Доставка для Вас безкоштовна, тому що сума замовлення від 1000 грн."
+
+    if delivery_method == "Нова пошта":
+        return "🚚 Доставка оплачується за тарифами Нової пошти."
+
+    if delivery_method == "Укрпошта":
+        return "📦 Доставка оплачується за тарифами Укрпошти."
+
+    return "🚚 Доставка оплачується згідно з тарифами служби доставки."
+
+
+def ask_free_delivery_offer(chat_id):
+    totals = calculate_cart_totals(chat_id)
+    total = totals["total"]
+
+    if total >= FREE_DELIVERY_THRESHOLD:
+        finish_order(chat_id, {}, "Ні")
+        return
+
+    left = round(FREE_DELIVERY_THRESHOLD - total, 2)
+    text = (
+        "🚚 <b>Безкоштовна доставка діє від 1000 грн.</b>\n\n"
+        f"Зараз сума Вашого замовлення: <b>{total} грн</b>.\n"
+        f"До безкоштовної доставки залишилось: <b>{left} грн</b>.\n\n"
+        "Бажаєте ще додати товари до замовлення?"
+    )
+
+    keyboard = {
+        "inline_keyboard": [
+            [inline_button("🛍 Так, додати товари", "add_more_before_order")],
+            [inline_button("✅ Ні, оформити замовлення", "confirm_order_now")]
+        ]
+    }
+
+    send_message(chat_id, text, keyboard)
+
+
+def continue_order_after_adding(chat_id):
+    state = USER_STATES.get(str(chat_id), {})
+
+    if state.get("step") != "adding_more_before_order":
+        start_order(chat_id)
+        return
+
+    ask_free_delivery_offer(chat_id)
+
+
+# =========================
 # DATA HELPERS
 # =========================
 
@@ -1061,7 +1207,7 @@ def show_cart(chat_id, callback_message=None):
             send_message(chat_id, text, keyboard)
         return
 
-    total = 0
+    subtotal = 0
     text = "🛒 <b>Ваш кошик:</b>\n\n"
     buttons = []
 
@@ -1072,7 +1218,7 @@ def show_cart(chat_id, callback_message=None):
         summa = float(item["sum"] or price * qty)
         row_index = item["row_index"]
 
-        total += summa
+        subtotal += summa
         text += f"• {name} — {qty} шт. × {price} грн = <b>{summa} грн</b>\n"
 
         buttons.append([
@@ -1082,9 +1228,33 @@ def show_cart(chat_id, callback_message=None):
             inline_button("❌", f"delete_cart_row_{row_index}")
         ])
 
-    text += f"\n💰 Разом: <b>{total} грн</b>"
+    totals = calculate_cart_totals(chat_id)
+    discount_percent = totals["discount_percent"]
+    discount_amount = totals["discount_amount"]
+    total = totals["total"]
 
-    buttons.append([inline_button("✅ Оформити замовлення", "order_now")])
+    text += f"\n💰 Сума товарів: <b>{subtotal} грн</b>"
+
+    if discount_percent:
+        text += (
+            f"\n🎁 Ваша знижка на це замовлення: <b>-{int(discount_percent)}%</b>"
+            f"\n💸 Сума знижки: <b>{discount_amount} грн</b>"
+        )
+
+    text += f"\n✅ До сплати за товари: <b>{total} грн</b>"
+
+    if total < FREE_DELIVERY_THRESHOLD:
+        left = round(FREE_DELIVERY_THRESHOLD - total, 2)
+        text += f"\n\n🚚 Безкоштовна доставка діє від <b>1000 грн</b>. Залишилось додати на <b>{left} грн</b>."
+    else:
+        text += "\n\n🚚 Вам доступна безкоштовна доставка."
+
+    state = USER_STATES.get(str(chat_id), {})
+    if state.get("step") == "adding_more_before_order":
+        buttons.append([inline_button("✅ Продовжити оформлення", "continue_checkout")])
+    else:
+        buttons.append([inline_button("✅ Оформити замовлення", "order_now")])
+
     buttons.append([inline_button("🗑 Очистити кошик", "clear_cart")])
 
     keyboard = {"inline_keyboard": buttons}
@@ -1093,7 +1263,6 @@ def show_cart(chat_id, callback_message=None):
         edit_message(chat_id, callback_message["message_id"], text, keyboard)
     else:
         send_message(chat_id, text, keyboard)
-
 
 def change_cart_qty(chat_id, row_index, delta, callback_message=None):
     rows = get_values("Кошик")
@@ -1255,8 +1424,9 @@ def handle_order_state(chat_id, text, user):
 
     if step == "waiting_phone":
         state["phone"] = text.strip()
+        state["step"] = "waiting_free_delivery_decision"
         USER_STATES[str(chat_id)] = state
-        finish_order(chat_id, user, "Ні")
+        ask_free_delivery_offer(chat_id)
         return True
 
     return False
@@ -1287,14 +1457,17 @@ def finish_order(chat_id, user, need_contact, callback_message=None):
         return
 
     state = USER_STATES.get(str(chat_id), {})
-    total = 0
+    totals = calculate_cart_totals(chat_id)
+    subtotal = totals["subtotal"]
+    discount_percent = totals["discount_percent"]
+    discount_amount = totals["discount_amount"]
+    total = totals["total"]
+
     products_text = []
 
     for item in cart:
         name = item.get("Назва товару")
         qty = int(item.get("Кількість") or 1)
-        summa = float(item.get("Сума") or 0)
-        total += summa
         products_text.append(f"{name} x{qty}")
 
     order_date = datetime.now().strftime("%d.%m.%Y %H:%M")
@@ -1305,6 +1478,15 @@ def finish_order(chat_id, user, need_contact, callback_message=None):
     payment_method = state.get("payment_method", "")
     comment = state.get("comment", "")
     products_joined = ", ".join(products_text)
+
+    if discount_percent:
+        comment_for_sheet = (
+            f"{comment}\nЗнижка застосована: -{int(discount_percent)}% ({discount_amount} грн)"
+            if comment else
+            f"Знижка застосована: -{int(discount_percent)}% ({discount_amount} грн)"
+        )
+    else:
+        comment_for_sheet = comment
 
     append_row("Замовлення", [
         order_date,
@@ -1317,7 +1499,7 @@ def finish_order(chat_id, user, need_contact, callback_message=None):
         products_joined,
         total,
         need_contact,
-        comment,
+        comment_for_sheet,
         "Нове"
     ])
 
@@ -1330,7 +1512,7 @@ def finish_order(chat_id, user, need_contact, callback_message=None):
         address=address,
         delivery_method=delivery_method,
         payment_method=payment_method,
-        comment=comment,
+        comment=comment_for_sheet,
         products=products_joined,
         total=total,
         need_contact=need_contact,
@@ -1338,8 +1520,19 @@ def finish_order(chat_id, user, need_contact, callback_message=None):
     )
 
     final_text = (
-        "✅ Дякуємо! Замовлення прийнято, ми передали його в обробку 💛\n\n"
+        "✅ <b>Дякуємо за замовлення!</b>\n\n"
+        "Ваше замовлення прийнято та передано в обробку.\n\n"
+        f"🛍 Сума товарів: <b>{subtotal} грн</b>\n"
     )
+
+    if discount_percent:
+        final_text += (
+            f"🎁 Знижка: <b>-{int(discount_percent)}%</b>\n"
+            f"💸 Сума знижки: <b>{discount_amount} грн</b>\n"
+        )
+
+    final_text += f"💰 До сплати: <b>{total} грн</b>\n"
+    final_text += f"{delivery_note_for_client(delivery_method, total)}\n\n"
 
     if payment_method == "Оплата на реквізити Іван":
         payment_details = get_setting_value("Реквізити для оплати")
@@ -1348,7 +1541,6 @@ def finish_order(chat_id, user, need_contact, callback_message=None):
             final_text += (
                 "💳 <b>Реквізити для оплати:</b>\n"
                 f"{payment_details}\n\n"
-                f"Сума до оплати: <b>{total} грн</b>\n\n"
             )
         else:
             final_text += (
@@ -1356,10 +1548,22 @@ def finish_order(chat_id, user, need_contact, callback_message=None):
                 "Менеджер надішле реквізити для оплати 💛\n\n"
             )
 
-    if need_contact == "Так":
-        final_text += "Менеджер скоро зв’яжеться з Вами для уточнення деталей.\n\n"
+    if payment_method == "Накладений платіж":
+        final_text += "📦 Ви обрали накладений платіж. Оплата буде при отриманні.\n\n"
 
-    final_text += "Поки ми його обробляємо, можете переглянути акційні товари 🔥"
+    final_text += (
+        "🎁 На наступну покупку для Вас діє додаткова знижка "
+        f"<b>-{NEXT_ORDER_DISCOUNT_PERCENT}%</b> на весь асортимент товарів.\n"
+        "Вона автоматично відобразиться у Вашому кошику при наступному замовленні 💛"
+    )
+
+    upsert_client_discount(
+        chat_id,
+        full_name=full_name,
+        phone=phone,
+        discount_percent=NEXT_ORDER_DISCOUNT_PERCENT,
+        active="Так"
+    )
 
     keyboard = {
         "inline_keyboard": [
@@ -1650,13 +1854,37 @@ def show_orders_by_status(chat_id, status, callback_message=None):
         send_message(chat_id, text, keyboard)
 
 
+def notify_client_order_sent(order):
+    client_chat_id = order.get("Telegram ID") if order else ""
+    if not client_chat_id:
+        return
+
+    try:
+        total = float(order.get("Сума") or 0)
+    except:
+        total = 0
+
+    delivery_method = order.get("Спосіб доставки") or ""
+
+    text = (
+        "🚚 <b>Ваше замовлення відправлено!</b>\n\n"
+        "Дякуємо за замовлення 💛\n"
+        f"💰 До сплати: <b>{total} грн</b>\n"
+        f"{delivery_note_for_client(delivery_method, total)}\n\n"
+        "🎁 На наступну покупку для Вас діє додаткова знижка "
+        f"<b>-{NEXT_ORDER_DISCOUNT_PERCENT}%</b> на весь асортимент товарів."
+    )
+
+    send_message(client_chat_id, text)
+
+
 def notify_client_status_change(client_chat_id, status):
     if not client_chat_id:
         return
 
     messages = {
         "В обробці": "🟡 Ваше замовлення вже в обробці. Дякуємо за очікування 💛",
-        "Відправлено": "🚚 Ваше замовлення відправлено. Очікуйте доставку 💛",
+        "Відправлено": "🚚 Ваше замовлення відправлено. Дякуємо за замовлення 💛",
         "Скасовано": "❌ Ваше замовлення скасовано. Якщо це помилка — напишіть нам 💛",
         "Опрацьовано": "✅ Ваше замовлення опрацьовано. Дякуємо, що обрали нас 💛",
         "Нове": "🆕 Ваше замовлення прийнято 💛"
@@ -1689,7 +1917,12 @@ def set_order_status(chat_id, row_index, status, callback_message=None):
         target_row = rows[int(row_index) - 1] if len(rows) >= int(row_index) else []
         status_col = 12 if len(target_row) >= 12 else 10
         update_cell("Замовлення", int(row_index), status_col, status)
-        notify_client_status_change(client_chat_id, status)
+
+        if status == "Відправлено" and target_order:
+            target_order["Статус"] = status
+            notify_client_order_sent(target_order)
+        else:
+            notify_client_status_change(client_chat_id, status)
 
         text = (
             f"{status_emoji(status)} <b>Статус змінено</b>\n\n"
@@ -2169,6 +2402,23 @@ def webhook():
 
         elif data_value == "order_now":
             start_order(chat_id)
+
+        elif data_value == "add_more_before_order":
+            state = USER_STATES.get(str(chat_id), {})
+            state["step"] = "adding_more_before_order"
+            USER_STATES[str(chat_id)] = state
+            edit_message(
+                chat_id,
+                message_id,
+                "Супер 💛 Можете додати ще товари до замовлення. Коли будете готові — відкрийте кошик і натисніть <b>Продовжити оформлення</b>."
+            )
+            show_catalog_menu(chat_id)
+
+        elif data_value == "confirm_order_now":
+            finish_order(chat_id, user, "Ні", callback_message)
+
+        elif data_value == "continue_checkout":
+            continue_order_after_adding(chat_id)
 
         elif data_value == "clear_cart":
             clear_user_cart(chat_id)
