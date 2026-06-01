@@ -449,8 +449,76 @@ def back_to_main_inline():
     }
 
 
+def get_admins():
+    """
+    Адміністратори беруться з листа Google Sheets: "Адміністратори".
+    Колонки: Telegram ID | ПІБ | Роль
+    Ролі, які мають доступ до кабінету: owner, manager, operator.
+
+    ADMIN_CHAT_ID з Render залишений як запасний варіант,
+    щоб власник не втратив доступ, якщо лист ще не створений.
+    """
+    admins = []
+
+    try:
+        headers = ["Telegram ID", "ПІБ", "Роль"]
+        ws = get_or_create_worksheet("Адміністратори", headers)
+        rows = ws.get_all_records()
+
+        for row in rows:
+            telegram_id = str(row.get("Telegram ID", "")).strip()
+            full_name = str(row.get("ПІБ", "")).strip()
+            role = str(row.get("Роль", "manager")).strip().lower()
+
+            if telegram_id:
+                admins.append({
+                    "telegram_id": telegram_id,
+                    "full_name": full_name,
+                    "role": role or "manager"
+                })
+
+    except Exception as e:
+        print("get_admins error:", e)
+
+    # Запасний адмін із Render Environment Variable
+    if str(ADMIN_CHAT_ID).strip():
+        fallback_id = str(ADMIN_CHAT_ID).strip()
+        if not any(a.get("telegram_id") == fallback_id for a in admins):
+            admins.append({
+                "telegram_id": fallback_id,
+                "full_name": "",
+                "role": "owner"
+            })
+
+    return admins
+
+
+def get_user_role(chat_id):
+    for admin in get_admins():
+        if str(admin.get("telegram_id")).strip() == str(chat_id).strip():
+            return str(admin.get("role", "manager")).strip().lower()
+
+    return "user"
+
+
 def is_admin(chat_id):
-    return str(chat_id) == str(ADMIN_CHAT_ID) and str(ADMIN_CHAT_ID).strip() != ""
+    return get_user_role(chat_id) in ["owner", "manager", "operator"]
+
+
+def get_admin_ids(include_roles=None):
+    if include_roles is None:
+        include_roles = ["owner", "manager", "operator"]
+
+    ids = []
+
+    for admin in get_admins():
+        role = str(admin.get("role", "")).strip().lower()
+        telegram_id = str(admin.get("telegram_id", "")).strip()
+
+        if telegram_id and role in include_roles and telegram_id not in ids:
+            ids.append(telegram_id)
+
+    return ids
 
 
 # =========================
@@ -1206,9 +1274,6 @@ def finish_order(chat_id, user, need_contact, callback_message=None):
         send_message(chat_id, final_text, keyboard)
 
 def notify_admin(full_name, phone, address, delivery_method, payment_method, comment, products, total, need_contact, telegram_id):
-    if not ADMIN_CHAT_ID:
-        return
-
     text = (
         "🔔 <b>Нове замовлення!</b>\n\n"
         f"<b>ПІБ:</b> {full_name}\n"
@@ -1219,10 +1284,12 @@ def notify_admin(full_name, phone, address, delivery_method, payment_method, com
         f"<b>Коментар:</b> {comment or '—'}\n"
         f"<b>Товари:</b> {products}\n"
         f"<b>Сума:</b> {total} грн\n"
-        f"<b>Потрібно зв’язатись:</b> {need_contact}"
+        f"<b>Потрібно зв’язатись:</b> {need_contact}\n"
+        f"<b>Telegram ID клієнта:</b> {telegram_id}"
     )
 
-    send_message(ADMIN_CHAT_ID, text)
+    for admin_id in get_admin_ids():
+        send_message(admin_id, text)
 
 
 def get_setting_value(param_name):
@@ -1303,14 +1370,15 @@ def finish_contact_request(chat_id, user, state):
         main_menu(is_admin(chat_id))
     )
 
-    if ADMIN_CHAT_ID:
-        admin_text = (
-            "📞 <b>Нова заявка на зв’язок</b>\n\n"
-            f"<b>ПІБ:</b> {full_name}\n"
-            f"<b>Телефон:</b> {phone}\n"
-            f"<b>Telegram ID:</b> {chat_id}"
-        )
-        send_message(ADMIN_CHAT_ID, admin_text)
+    admin_text = (
+        "📞 <b>Нова заявка на зв’язок</b>\n\n"
+        f"<b>ПІБ:</b> {full_name}\n"
+        f"<b>Телефон:</b> {phone}\n"
+        f"<b>Telegram ID:</b> {chat_id}"
+    )
+
+    for admin_id in get_admin_ids():
+        send_message(admin_id, admin_text)
 
 def show_delivery_payment(chat_id):
     settings = get_records("Налаштування")
