@@ -1242,6 +1242,76 @@ def get_setting_value(param_name):
     return ""
 
 
+
+def show_my_orders(chat_id):
+    orders = get_orders_with_rows()
+
+    my_orders = [
+        order for order in orders
+        if str(order.get("Telegram ID")) == str(chat_id)
+    ]
+
+    if not my_orders:
+        send_message(
+            chat_id,
+            "📦 У вас поки немає замовлень.",
+            main_menu(is_admin(chat_id))
+        )
+        return
+
+    text = "📦 <b>Мої замовлення</b>\n\n"
+
+    for idx, order in enumerate(my_orders[-10:], start=1):
+        text += (
+            f"<b>{idx}. Замовлення від {safe_text(order.get('Дата'))}</b>\n"
+            f"🛍 Товари: {safe_text(order.get('Товари'))}\n"
+            f"💰 Сума: <b>{safe_text(order.get('Сума'), '0')} грн</b>\n"
+            f"🚚 Доставка: {safe_text(order.get('Спосіб доставки'))}\n"
+            f"💳 Оплата: {safe_text(order.get('Спосіб оплати'))}\n"
+            f"📌 Статус: <b>{safe_text(order.get('Статус'), 'Нове')}</b>\n\n"
+        )
+
+    send_message(chat_id, text, main_menu(is_admin(chat_id)))
+
+
+def contact_manager(chat_id, user):
+    USER_STATES[str(chat_id)] = {
+        "step": "contact_waiting_full_name",
+        "contact_full_name": "",
+        "contact_phone": ""
+    }
+
+    send_message(chat_id, "Введіть, будь ласка, Ваше ПІБ:")
+
+
+def finish_contact_request(chat_id, user, state):
+    request_date = datetime.now().strftime("%d.%m.%Y %H:%M")
+    full_name = state.get("contact_full_name", "")
+    phone = state.get("contact_phone", "")
+
+    append_contact_request([
+        request_date,
+        chat_id,
+        full_name,
+        phone,
+        "Нова"
+    ])
+
+    send_message(
+        chat_id,
+        "✅ Дякуємо! Заявку передано менеджеру. Ми скоро зв’яжемося з Вами 💛",
+        main_menu(is_admin(chat_id))
+    )
+
+    if ADMIN_CHAT_ID:
+        admin_text = (
+            "📞 <b>Нова заявка на зв’язок</b>\n\n"
+            f"<b>ПІБ:</b> {full_name}\n"
+            f"<b>Телефон:</b> {phone}\n"
+            f"<b>Telegram ID:</b> {chat_id}"
+        )
+        send_message(ADMIN_CHAT_ID, admin_text)
+
 def show_delivery_payment(chat_id):
     settings = get_records("Налаштування")
 
