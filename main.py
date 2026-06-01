@@ -729,7 +729,7 @@ def ask_free_delivery_offer(chat_id):
     total = totals["total"]
 
     if total >= FREE_DELIVERY_THRESHOLD:
-        finish_order(chat_id, {}, "Ні")
+        ask_need_contact(chat_id)
         return
 
     left = round(FREE_DELIVERY_THRESHOLD - total, 2)
@@ -743,12 +743,11 @@ def ask_free_delivery_offer(chat_id):
     keyboard = {
         "inline_keyboard": [
             [inline_button("🛍 Так, додати товари", "add_more_before_order")],
-            [inline_button("✅ Ні, оформити замовлення", "confirm_order_now")]
+            [inline_button("✅ Ні, продовжити оформлення", "confirm_order_now")]
         ]
     }
 
     send_message(chat_id, text, keyboard)
-
 
 def continue_order_after_adding(chat_id):
     state = USER_STATES.get(str(chat_id), {})
@@ -937,13 +936,19 @@ def start(chat_id):
 
     text = (
         "Привіт 👋\n\n"
-        "Вітаємо у нашій крамничці 🛍💛\n\n"
-        "Ми постійно оновлюємо асортимент, додаємо новинки та найкращі пропозиції для Вас ✨\n\n"
-        "Обов'язково заглядайте до каталогу та розділу акцій — там регулярно з'являються нові товари та вигідні знижки 🔥\n\n"
-        "Бажаємо приємних покупок та гарного настрою 🌸\n\n"
+        "Вітаємо у нашій крамничці 🛍\n"
         "Оберіть, будь ласка, що хочете переглянути:"
     )
     send_message(chat_id, text, main_menu(is_admin(chat_id)))
+
+
+def show_main_menu(chat_id):
+    USER_STATES.pop(str(chat_id), None)
+    send_message(
+        chat_id,
+        "🏠 <b>Головне меню</b>\n\nОберіть, будь ласка, що хочете переглянути:",
+        main_menu(is_admin(chat_id))
+    )
 
 
 def show_my_id(chat_id):
@@ -1228,7 +1233,17 @@ def show_sales(chat_id):
         send_message(chat_id, "Поки немає активних акцій 😔", main_menu(is_admin(chat_id)))
         return
 
-    show_product_card(chat_id, sale_products, 0, "sale")
+    send_message(chat_id, f"🔥 Знайдено акційних товарів: <b>{len(sale_products)}</b>")
+
+    for idx, product in enumerate(sale_products):
+        show_product_card(
+            chat_id=chat_id,
+            products=sale_products,
+            index=idx,
+            mode="sale",
+            category_id="",
+            photo_index=0
+        )
 
 
 def add_to_cart(chat_id, product_id, callback_message=None):
@@ -1542,6 +1557,25 @@ def ask_payment_method(chat_id, callback_message=None):
         send_message(chat_id, text, keyboard)
 
 
+def ask_need_contact(chat_id, callback_message=None):
+    state = USER_STATES.get(str(chat_id), {})
+    state["step"] = "waiting_need_contact"
+    USER_STATES[str(chat_id)] = state
+
+    text = "Чи бажаєте, щоб з Вами зв’язались для уточнення деталей замовлення?"
+    keyboard = {
+        "inline_keyboard": [
+            [inline_button("✅ Так, зв’яжіться зі мною", "need_contact_yes")],
+            [inline_button("❌ Ні, не потрібно", "need_contact_no")]
+        ]
+    }
+
+    if callback_message:
+        edit_message(chat_id, callback_message["message_id"], text, keyboard)
+    else:
+        send_message(chat_id, text, keyboard)
+
+
 def finish_order(chat_id, user, need_contact, callback_message=None):
     cart = get_user_cart(chat_id)
 
@@ -1627,7 +1661,7 @@ def finish_order(chat_id, user, need_contact, callback_message=None):
             f"💸 Сума знижки: <b>{discount_amount} грн</b>\n"
         )
 
-    final_text += f"💰 До сплати: <b>{total} грн</b>\n"
+    final_text += f"💰 Вартість Вашого замовлення за товар: <b>{total} грн</b>\n"
     final_text += f"{delivery_note_for_client(delivery_method, total)}\n\n"
 
     if payment_method == "Оплата за реквізитами IBAN":
@@ -1819,30 +1853,8 @@ def get_status_stats():
     for order in orders:
         status = str(order.get("Статус")).strip()
 
-        if status not in stats:
-            status = "Нове"
-
-        try:
-            value = float(order.get("Сума") or 0)
-        except:
-            value = 0
-
-        stats[status]["count"] += 1
-        stats[status]["sum"] += value
-
-    return stats
-
-
-    stats = {
-        "Нове": {"count": 0, "sum": 0},
-        "Очікується оплата": {"count": 0, "sum": 0},
-        "В обробці": {"count": 0, "sum": 0},
-        "Відправлено": {"count": 0, "sum": 0},
-        "Скасовано": {"count": 0, "sum": 0},
-    }
-
-    for order in orders:
-        status = str(order.get("Статус")).strip()
+        if status == "Опрацьовано":
+            status = "В обробці"
 
         if status not in stats:
             status = "Нове"
@@ -1856,7 +1868,6 @@ def get_status_stats():
         stats[status]["sum"] += value
 
     return stats
-
 
 def show_admin_cabinet(chat_id, callback_message=None):
     if not is_admin(chat_id):
@@ -1864,6 +1875,7 @@ def show_admin_cabinet(chat_id, callback_message=None):
         return
 
     USER_STATES.pop(str(chat_id), None)
+
     stats = get_status_stats()
 
     text = (
@@ -1896,7 +1908,6 @@ def show_admin_cabinet(chat_id, callback_message=None):
     else:
         send_message(chat_id, text, keyboard)
 
-
 def status_emoji(status):
     if status == "Нове":
         return "🆕"
@@ -1909,7 +1920,6 @@ def status_emoji(status):
     if status == "Скасовано":
         return "❌"
     return "📦"
-
 
 def order_details_text(order, title="Замовлення"):
     return (
@@ -1938,18 +1948,19 @@ def order_status_keyboard(row_index, extra_back="admin_back"):
         ]
     }
 
-
 def show_orders_by_status(chat_id, status, callback_message=None):
     if not is_admin(chat_id):
         return
 
     USER_STATES.pop(str(chat_id), None)
+
     orders = get_orders_with_rows()
     filtered = [o for o in orders if str(o.get("Статус")).strip() == status]
 
     if not filtered:
         text = f"{status_emoji(status)} Замовлень зі статусом <b>{status}</b> немає."
         keyboard = {"inline_keyboard": [[inline_button("⬅️ Назад у кабінет", "admin_back")]]}
+
         if callback_message:
             edit_message(chat_id, callback_message["message_id"], text, keyboard)
         else:
@@ -1969,7 +1980,6 @@ def show_orders_by_status(chat_id, status, callback_message=None):
         keyboard = order_status_keyboard(order.get("row_index"), f"admin_status_{status}")
         send_message(chat_id, text, keyboard)
 
-
 def notify_client_order_sent(order):
     client_chat_id = order.get("Telegram ID") if order else ""
     if not client_chat_id:
@@ -1983,13 +1993,13 @@ def notify_client_order_sent(order):
     text = (
         "🚚 <b>Ваше замовлення відправлено!</b>\n\n"
         "Дякуємо за замовлення 💛\n"
-        f"🛍 Вартість Вашого замовлення за товар: <b>{total} грн</b>.\n"
+        f"💰 Вартість Вашого замовлення за товар: <b>{total} грн</b>\n"
         "🚚 Також враховуйте вартість доставки — вона нараховується за тарифами перевізника.\n\n"
         "🎁 На наступну покупку для Вас діє додаткова знижка "
         f"<b>-{NEXT_ORDER_DISCOUNT_PERCENT}%</b> на весь асортимент товарів."
     )
-    send_message(client_chat_id, text)
 
+    send_message(client_chat_id, text)
 
 def notify_client_status_change(client_chat_id, status):
     if not client_chat_id:
@@ -2009,7 +2019,6 @@ def notify_client_status_change(client_chat_id, status):
         send_message(client_chat_id, text)
     except Exception as e:
         print("notify_client_status_change error:", e)
-
 
 def set_order_status(chat_id, row_index, status, callback_message=None):
     if not is_admin(chat_id):
@@ -2064,6 +2073,7 @@ def show_admin_orders_sum(chat_id, callback_message=None):
         return
 
     USER_STATES.pop(str(chat_id), None)
+
     stats = get_status_stats()
     total_all = sum(v["sum"] for v in stats.values())
 
@@ -2078,11 +2088,11 @@ def show_admin_orders_sum(chat_id, callback_message=None):
     )
 
     keyboard = {"inline_keyboard": [[inline_button("⬅️ Назад у кабінет", "admin_back")]]}
+
     if callback_message:
         edit_message(chat_id, callback_message["message_id"], text, keyboard)
     else:
         send_message(chat_id, text, keyboard)
-
 
 def start_admin_search(chat_id, callback_message=None):
     if not is_admin(chat_id):
@@ -2262,8 +2272,8 @@ def show_contact_requests(chat_id, callback_message=None):
 
     keyboard = {
         "inline_keyboard": [
-            [inline_button("🆕 Показати всі нові заявки", "contact_requests_new")],
-            [inline_button("✅ Показати всі опрацьовані заявки", "contact_requests_processed")],
+            [inline_button("🆕 Нові заявки", "contact_requests_new")],
+            [inline_button("✅ Опрацьовані заявки", "contact_requests_processed")],
             [inline_button("⬅️ Назад у кабінет", "admin_back")]
         ]
     }
@@ -2290,6 +2300,7 @@ def show_contact_requests_by_status(chat_id, status, callback_message=None):
     if not filtered:
         text = "Заявок у цьому розділі немає."
         keyboard = {"inline_keyboard": [[inline_button("⬅️ Назад до заявок", "contact_requests")]]}
+
         if callback_message:
             edit_message(chat_id, callback_message["message_id"], text, keyboard)
         else:
@@ -2298,6 +2309,7 @@ def show_contact_requests_by_status(chat_id, status, callback_message=None):
 
     header = f"{title}\n\nУсього в розділі: <b>{len(filtered)}</b>"
     header_keyboard = {"inline_keyboard": [[inline_button("⬅️ Назад до заявок", "contact_requests")]]}
+
     if callback_message:
         edit_message(chat_id, callback_message["message_id"], header, header_keyboard)
     else:
@@ -2305,18 +2317,18 @@ def show_contact_requests_by_status(chat_id, status, callback_message=None):
 
     for idx, item in enumerate(filtered, start=1):
         text = (
-            f"📞 <b>Заявка {idx} з {len(filtered)}</b>\n\n"
+            f"<b>{idx}. Заявка на зв’язок</b>\n\n"
             f"<b>Дата:</b> {item.get('Дата')}\n"
             f"<b>ПІБ:</b> {item.get('ПІБ')}\n"
             f"<b>Телефон:</b> {item.get('Телефон')}\n"
             f"<b>Статус:</b> {item.get('Статус') or 'Нова'}"
         )
+
         buttons = []
         if status == "Нова":
             buttons.append([inline_button("✅ Опрацьовано", f"contact_done_{item.get('row_index')}")])
         buttons.append([inline_button("⬅️ Назад до заявок", "contact_requests")])
         send_message(chat_id, text, {"inline_keyboard": buttons})
-
 
 def mark_contact_request_done(chat_id, row_index, callback_message=None):
     if not is_admin(chat_id):
@@ -2356,10 +2368,8 @@ def show_admin_processed_orders(chat_id, callback_message=None):
     show_orders_by_status(chat_id, "В обробці", callback_message)
 
 
-
 def mark_order_processed(chat_id, row_index, callback_message=None):
     set_order_status(chat_id, row_index, "В обробці", callback_message)
-
 
 
 # =========================
@@ -2402,8 +2412,7 @@ def webhook():
                 USER_STATES.pop(str(chat_id), None)
                 show_catalog_menu(chat_id)
             else:
-                USER_STATES.pop(str(chat_id), None)
-                start(chat_id)
+                show_main_menu(chat_id)
         elif text == "📦 Каталог":
             show_catalog_menu(chat_id)
         elif category:
@@ -2521,7 +2530,7 @@ def webhook():
             show_catalog_menu(chat_id)
 
         elif data_value == "confirm_order_now":
-            finish_order(chat_id, user, "Ні", callback_message)
+            ask_need_contact(chat_id, callback_message)
 
         elif data_value == "continue_checkout":
             continue_order_after_adding(chat_id)
