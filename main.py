@@ -755,6 +755,49 @@ def show_more_product_photos(chat_id, product_index):
 
 
 
+def product_short_caption(product, index=None, total=None):
+    name = safe_text(product.get("Назва товару"), "Товар без назви")
+    caption = ""
+
+    if index is not None and total is not None:
+        caption += f"📦 Товар {index + 1} з {total}\n"
+
+    caption += f"<b>{name}</b>"
+    return caption[:1000]
+
+
+def send_product_text(chat_id, text, keyboard=None):
+    """
+    Telegram дозволяє довгий текст окремим повідомленням, але не дозволяє
+    дуже довгий підпис під фото. Тому опис товару відправляємо окремо.
+    """
+    max_len = 3900
+
+    if len(text) <= max_len:
+        send_message(chat_id, text, keyboard)
+        return
+
+    parts = []
+    current = ""
+
+    for paragraph in text.split("\n"):
+        candidate = current + ("\n" if current else "") + paragraph
+
+        if len(candidate) > max_len:
+            if current:
+                parts.append(current)
+            current = paragraph
+        else:
+            current = candidate
+
+    if current:
+        parts.append(current)
+
+    for idx, part in enumerate(parts):
+        part_keyboard = keyboard if idx == len(parts) - 1 else None
+        send_message(chat_id, part, part_keyboard)
+
+
 def show_product_card(chat_id, products, index=0, mode="category", category_id="", photo_index=0):
     if not products:
         send_message(chat_id, "Товарів поки немає 😔", main_menu(is_admin(chat_id)))
@@ -778,24 +821,20 @@ def show_product_card(chat_id, products, index=0, mode="category", category_id="
     keyboard = build_product_keyboard(product_id, products, index, mode, category_id, 0)
 
     if photos:
-photo_caption = text[:1000]
+        # ВАЖЛИВО: не ставимо весь опис у caption, бо Telegram має ліміт ~1024 символи.
+        # Фото надсилаємо з коротким підписом, а повний опис + кнопки окремим повідомленням.
+        short_caption = product_short_caption(product, index, total)
+        ok = send_photo(chat_id, photos[0], short_caption)
 
-ok = send_photo(
-    chat_id,
-    photos[0],
-    photo_caption,
-    keyboard
-)
-
-if ok and len(text) > 1000:
-    send_message(chat_id, text[1000:])
         if not ok:
-            doc_ok = send_document(chat_id, photos[0], text, keyboard)
-
+            doc_ok = send_document(chat_id, photos[0], short_caption)
             if not doc_ok:
-                send_message(chat_id, text, keyboard)
+                print("product photo failed, sending text only")
+
+        send_product_text(chat_id, text, keyboard)
     else:
-        send_message(chat_id, text, keyboard)
+        send_product_text(chat_id, text, keyboard)
+
 
 def update_product_card(chat_id, message_id, products, index=0, mode="category", category_id="", photo_index=0, callback_message=None):
     if not products:
@@ -827,9 +866,12 @@ def update_product_card(chat_id, message_id, products, index=0, mode="category",
     keyboard = build_product_keyboard(product_id, products, index, mode, category_id, photo_index)
 
     if photos:
-        edit_media_photo(chat_id, message_id, photos[photo_index], text, keyboard)
+        # Для редагування теж не використовуємо довгий caption.
+        short_caption = product_short_caption(product, index, total)
+        edit_media_photo(chat_id, message_id, photos[photo_index], short_caption)
+        send_product_text(chat_id, text, keyboard)
     else:
-        edit_message(chat_id, message_id, text, keyboard)
+        send_product_text(chat_id, text, keyboard)
 
 def show_subcategories_reply(chat_id, category_id):
     subcategories = get_active_subcategories(category_id)
@@ -2212,4 +2254,3 @@ def webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
-
