@@ -312,10 +312,56 @@ def send_message(chat_id, text, keyboard=None):
         payload["reply_markup"] = json.dumps(keyboard, ensure_ascii=False)
 
     try:
-        requests.post(f"{BASE_URL}/sendMessage", json=payload, timeout=15)
+        response = requests.post(f"{BASE_URL}/sendMessage", json=payload, timeout=15)
+
+        if response.ok:
+            data = response.json()
+            return data.get("result", {}).get("message_id")
+
+        print("send_message telegram error:", response.text)
+        return None
+
     except Exception as e:
         print("send_message error:", e)
+        return None
 
+
+def delete_message(chat_id, message_id):
+    if not message_id:
+        return
+
+    try:
+        requests.post(
+            f"{BASE_URL}/deleteMessage",
+            json={"chat_id": chat_id, "message_id": message_id},
+            timeout=10
+        )
+    except Exception as e:
+        print("delete_message error:", e)
+
+
+def send_chat_action(chat_id, action="typing"):
+    try:
+        requests.post(
+            f"{BASE_URL}/sendChatAction",
+            json={"chat_id": chat_id, "action": action},
+            timeout=10
+        )
+    except Exception as e:
+        print("send_chat_action error:", e)
+
+
+def send_loading(chat_id, text="⏳ Обробляємо Ваш запит..."):
+    send_chat_action(chat_id, "typing")
+    return send_message(chat_id, text)
+
+
+def with_loading(chat_id, loading_text, func, *args, **kwargs):
+    loading_message_id = send_loading(chat_id, loading_text)
+    try:
+        return func(*args, **kwargs)
+    finally:
+        delete_message(chat_id, loading_message_id)
 
 
 def send_photo(chat_id, photo_url, caption, keyboard=None):
@@ -936,7 +982,10 @@ def start(chat_id):
 
     text = (
         "Привіт 👋\n\n"
-        "Вітаємо у нашій крамничці 🛍\n"
+        "Вітаємо у нашій крамничці 🛍💛\n\n"
+        "Ми постійно оновлюємо асортимент, додаємо новинки та найкращі пропозиції для Вас ✨\n\n"
+        "Обов'язково заглядайте до каталогу та розділу акцій — там регулярно з'являються нові товари та вигідні знижки 🔥\n\n"
+        "Бажаємо приємних покупок та гарного настрою 🌸\n\n"
         "Оберіть, будь ласка, що хочете переглянути:"
     )
     send_message(chat_id, text, main_menu(is_admin(chat_id)))
@@ -2397,7 +2446,7 @@ def webhook():
         category = get_category_by_button_text(text)
 
         if text == "/start":
-            start(chat_id)
+            with_loading(chat_id, "🌸 Раді бачити Вас у нашій крамничці!\n\n⏳ Завантажуємо меню для Вас...", start, chat_id)
         elif text == "/myid":
             show_my_id(chat_id)
         elif handle_contact_state(chat_id, text, user):
@@ -2410,28 +2459,28 @@ def webhook():
             state = USER_STATES.get(str(chat_id), {})
             if state.get("step") == "choosing_subcategory":
                 USER_STATES.pop(str(chat_id), None)
-                show_catalog_menu(chat_id)
+                with_loading(chat_id, "🛍️ Завантажуємо каталог для Вас...", show_catalog_menu, chat_id)
             else:
                 show_main_menu(chat_id)
         elif text == "📦 Каталог":
-            show_catalog_menu(chat_id)
+            with_loading(chat_id, "🛍️ Зачекайте, будь ласка...\n\nПідбираємо для Вас товари ✨", show_catalog_menu, chat_id)
         elif category:
-            show_subcategories_reply(chat_id, category.get("ID категорії"))
+            with_loading(chat_id, "📂 Завантажуємо підкатегорії...", show_subcategories_reply, chat_id, category.get("ID категорії"))
         elif get_subcategory_by_button_text(text, USER_STATES.get(str(chat_id), {}).get("category_id")):
             subcategory = get_subcategory_by_button_text(text, USER_STATES.get(str(chat_id), {}).get("category_id"))
-            show_products_by_subcategory(chat_id, subcategory.get("ID підкатегорії"))
+            with_loading(chat_id, "📦 Завантажуємо товари...", show_products_by_subcategory, chat_id, subcategory.get("ID підкатегорії"))
         elif text == "🔥 Акції":
-            show_sales(chat_id)
+            with_loading(chat_id, "🔥 Шукаємо найвигідніші пропозиції для Вас...\n\nЗачекайте декілька секунд ⏳", show_sales, chat_id)
         elif text == "🛒 Кошик":
-            show_cart(chat_id)
+            with_loading(chat_id, "🛒 Формуємо Ваш кошик...\n\nЗачекайте, будь ласка ⏳", show_cart, chat_id)
         elif text == "📦 Мої замовлення":
-            show_my_orders(chat_id)
+            with_loading(chat_id, "📦 Завантажуємо інформацію про Ваші замовлення...\n\nЗачекайте, будь ласка ⏳", show_my_orders, chat_id)
         elif text == "📞 Зв’язатися з менеджером":
             contact_manager(chat_id, user)
         elif text == "🚚 Доставка і оплата":
-            show_delivery_payment(chat_id)
+            with_loading(chat_id, "🚚 Завантажуємо інформацію про доставку та оплату...", show_delivery_payment, chat_id)
         elif text == "👑 Кабінет":
-            show_admin_cabinet(chat_id)
+            with_loading(chat_id, "👑 Завантажуємо кабінет...\n\nОтримуємо актуальні дані ⏳", show_admin_cabinet, chat_id)
         else:
             send_message(chat_id, "Оберіть, будь ласка, дію з меню 👇", main_menu(is_admin(chat_id)))
 
@@ -2458,7 +2507,7 @@ def webhook():
             mode = state.get("mode", "category")
             category_id = state.get("category_id", "") or state.get("subcategory_id", "")
 
-            update_product_card(chat_id, message_id, products, product_index, mode, category_id, photo_index, callback_message)
+            with_loading(chat_id, "📸 Завантажуємо фото товару...", update_product_card, chat_id, message_id, products, product_index, mode, category_id, photo_index, callback_message)
 
         elif data_value == "photo_counter":
             answer_callback(callback_id)
@@ -2471,41 +2520,41 @@ def webhook():
             products = state.get("products", [])
             mode = state.get("mode", "category")
             category_id = state.get("category_id", "")
-            update_product_card(chat_id, message_id, products, page, mode, category_id, 0, callback_message)
+            with_loading(chat_id, "📦 Завантажуємо товар...", update_product_card, chat_id, message_id, products, page, mode, category_id, 0, callback_message)
 
         elif data_value.startswith("sale_page_"):
             page = int(data_value.replace("sale_page_", ""))
             state = USER_STATES.get(str(chat_id), {})
             products = state.get("products", get_sale_products())
-            update_product_card(chat_id, message_id, products, page, "sale", "", 0, callback_message)
+            with_loading(chat_id, "🔥 Завантажуємо акційну пропозицію...", update_product_card, chat_id, message_id, products, page, "sale", "", 0, callback_message)
 
         elif data_value.startswith("more_photos_"):
             product_index = data_value.replace("more_photos_", "")
-            show_more_product_photos(chat_id, product_index)
+            with_loading(chat_id, "📸 Завантажуємо додаткові фото...", show_more_product_photos, chat_id, product_index)
 
         elif data_value == "product_unavailable":
             answer_callback(callback_id)
 
         elif data_value.startswith("add_one_"):
             product_id = data_value.replace("add_one_", "")
-            add_to_cart(chat_id, product_id, callback_message)
+            with_loading(chat_id, "🛒 Додаємо товар у кошик...", add_to_cart, chat_id, product_id, callback_message)
 
         elif data_value.startswith("cart_plus_"):
             row_index = data_value.replace("cart_plus_", "")
-            change_cart_qty(chat_id, row_index, 1, callback_message)
+            with_loading(chat_id, "🛒 Оновлюємо кошик...", change_cart_qty, chat_id, row_index, 1, callback_message)
 
         elif data_value.startswith("cart_minus_"):
             row_index = data_value.replace("cart_minus_", "")
-            change_cart_qty(chat_id, row_index, -1, callback_message)
+            with_loading(chat_id, "🛒 Оновлюємо кошик...", change_cart_qty, chat_id, row_index, -1, callback_message)
 
         elif data_value.startswith("cart_qty_"):
-            show_cart(chat_id, callback_message)
+            with_loading(chat_id, "🛒 Формуємо Ваш кошик...", show_cart, chat_id, callback_message)
 
         elif data_value == "open_cart":
-            show_cart(chat_id, callback_message)
+            with_loading(chat_id, "🛒 Формуємо Ваш кошик...", show_cart, chat_id, callback_message)
 
         elif data_value == "open_sales":
-            show_sales(chat_id)
+            with_loading(chat_id, "🔥 Завантажуємо акційні пропозиції...", show_sales, chat_id)
 
         elif data_value == "back_main":
             edit_message(
@@ -2516,7 +2565,7 @@ def webhook():
             )
 
         elif data_value == "order_now":
-            start_order(chat_id)
+            with_loading(chat_id, "📝 Розпочинаємо оформлення замовлення...", start_order, chat_id)
 
         elif data_value == "add_more_before_order":
             state = USER_STATES.get(str(chat_id), {})
@@ -2527,13 +2576,13 @@ def webhook():
                 message_id,
                 "Супер 💛 Можете додати ще товари до замовлення. Коли будете готові — відкрийте кошик і натисніть <b>Продовжити оформлення</b>."
             )
-            show_catalog_menu(chat_id)
+            with_loading(chat_id, "🛍️ Відкриваємо каталог, щоб Ви могли додати ще товари...", show_catalog_menu, chat_id)
 
         elif data_value == "confirm_order_now":
-            ask_need_contact(chat_id, callback_message)
+            with_loading(chat_id, "✅ Продовжуємо оформлення...", ask_need_contact, chat_id, callback_message)
 
         elif data_value == "continue_checkout":
-            continue_order_after_adding(chat_id)
+            with_loading(chat_id, "✅ Продовжуємо оформлення замовлення...", continue_order_after_adding, chat_id)
 
         elif data_value == "clear_cart":
             clear_user_cart(chat_id)
@@ -2542,7 +2591,7 @@ def webhook():
 
         elif data_value.startswith("delete_cart_row_"):
             row_index = data_value.replace("delete_cart_row_", "")
-            delete_cart_item(chat_id, row_index, callback_message)
+            with_loading(chat_id, "🛒 Оновлюємо кошик...", delete_cart_item, chat_id, row_index, callback_message)
 
         elif data_value.startswith("delivery_"):
             state = USER_STATES.get(str(chat_id), {})
@@ -2582,61 +2631,61 @@ def webhook():
             ask_free_delivery_offer(chat_id)
 
         elif data_value == "need_contact_yes":
-            finish_order(chat_id, user, "Так", callback_message)
+            with_loading(chat_id, "📦 Оформлюємо Ваше замовлення...", finish_order, chat_id, user, "Так", callback_message)
 
         elif data_value == "need_contact_no":
-            finish_order(chat_id, user, "Ні", callback_message)
+            with_loading(chat_id, "📦 Оформлюємо Ваше замовлення...", finish_order, chat_id, user, "Ні", callback_message)
 
         elif data_value.startswith("admin_status_"):
             status = data_value.replace("admin_status_", "")
-            show_orders_by_status(chat_id, status, callback_message)
+            with_loading(chat_id, "👑 Завантажуємо замовлення за статусом...", show_orders_by_status, chat_id, status, callback_message)
 
         elif data_value.startswith("set_status_"):
             parts = data_value.split("_", 3)
             row_index = parts[2]
             status = parts[3]
-            set_order_status(chat_id, row_index, status, callback_message)
+            with_loading(chat_id, "🔄 Оновлюємо статус замовлення...", set_order_status, chat_id, row_index, status, callback_message)
 
         elif data_value == "admin_search":
-            start_admin_search(chat_id, callback_message)
+            with_loading(chat_id, "🔍 Відкриваємо пошук...", start_admin_search, chat_id, callback_message)
 
         elif data_value == "admin_date_filter":
-            start_admin_date_filter(chat_id, callback_message)
+            with_loading(chat_id, "📅 Відкриваємо фільтр за датою...", start_admin_date_filter, chat_id, callback_message)
 
         elif data_value == "admin_new_orders":
-            show_admin_new_orders(chat_id, callback_message)
+            with_loading(chat_id, "🆕 Завантажуємо нові замовлення...", show_admin_new_orders, chat_id, callback_message)
 
         elif data_value == "admin_processed_orders":
-            show_admin_processed_orders(chat_id, callback_message)
+            with_loading(chat_id, "✅ Завантажуємо замовлення...", show_admin_processed_orders, chat_id, callback_message)
 
         elif data_value.startswith("mark_processed_"):
             row_index = data_value.replace("mark_processed_", "")
-            mark_order_processed(chat_id, row_index, callback_message)
+            with_loading(chat_id, "🔄 Оновлюємо статус...", mark_order_processed, chat_id, row_index, callback_message)
 
         elif data_value == "summary_today":
-            show_summary(chat_id, "today", callback_message)
+            with_loading(chat_id, "📊 Рахуємо підсумок за сьогодні...", show_summary, chat_id, "today", callback_message)
 
         elif data_value == "summary_month":
-            show_summary(chat_id, "month", callback_message)
+            with_loading(chat_id, "📊 Рахуємо підсумок за місяць...", show_summary, chat_id, "month", callback_message)
 
         elif data_value == "contact_requests":
-            show_contact_requests(chat_id, callback_message)
+            with_loading(chat_id, "📞 Завантажуємо заявки на зв’язок...", show_contact_requests, chat_id, callback_message)
 
         elif data_value == "contact_requests_new":
-            show_contact_requests_by_status(chat_id, "Нова", callback_message)
+            with_loading(chat_id, "📞 Завантажуємо нові заявки...", show_contact_requests_by_status, chat_id, "Нова", callback_message)
 
         elif data_value == "contact_requests_processed":
-            show_contact_requests_by_status(chat_id, "Опрацьовано", callback_message)
+            with_loading(chat_id, "📞 Завантажуємо опрацьовані заявки...", show_contact_requests_by_status, chat_id, "Опрацьовано", callback_message)
 
         elif data_value.startswith("contact_done_"):
             row_index = data_value.replace("contact_done_", "")
-            mark_contact_request_done(chat_id, row_index, callback_message)
+            with_loading(chat_id, "✅ Оновлюємо статус заявки...", mark_contact_request_done, chat_id, row_index, callback_message)
 
         elif data_value == "admin_orders_sum":
-            show_admin_orders_sum(chat_id, callback_message)
+            with_loading(chat_id, "💰 Рахуємо суму замовлень...", show_admin_orders_sum, chat_id, callback_message)
 
         elif data_value == "admin_back":
-            show_admin_cabinet(chat_id, callback_message)
+            with_loading(chat_id, "👑 Оновлюємо кабінет...", show_admin_cabinet, chat_id, callback_message)
 
     return "ok"
 
