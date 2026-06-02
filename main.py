@@ -661,6 +661,160 @@ def get_admin_ids(include_roles=None):
 
 
 # =========================
+# USERS / CLIENT MONITORING
+# =========================
+
+def get_users_worksheet():
+    headers = [
+        "Telegram ID",
+        "Username",
+        "Імʼя",
+        "Прізвище",
+        "Дата першого входу",
+        "Дата останньої активності",
+        "Кількість входів"
+    ]
+    return get_or_create_worksheet("Користувачі", headers)
+
+
+def register_user_activity(chat_id, user=None):
+    """
+    Фіксуємо кожного користувача, який взаємодіє з ботом.
+    Це дає можливість бачити у кабінеті кількість користувачів,
+    нових за сьогодні / місяць та активність.
+    """
+    try:
+        user = user or {}
+        ws = get_users_worksheet()
+        rows = ws.get_all_values()
+
+        now = datetime.now().strftime("%d.%m.%Y %H:%M")
+        telegram_id = str(chat_id).strip()
+        username = str(user.get("username", "") or "").strip()
+        first_name = str(user.get("first_name", "") or "").strip()
+        last_name = str(user.get("last_name", "") or "").strip()
+
+        for i, row in enumerate(rows[1:], start=2):
+            if len(row) > 0 and str(row[0]).strip() == telegram_id:
+                try:
+                    visits = int(float(row[6])) if len(row) > 6 and str(row[6]).strip() else 0
+                except:
+                    visits = 0
+
+                if username:
+                    ws.update_cell(i, 2, username)
+                if first_name:
+                    ws.update_cell(i, 3, first_name)
+                if last_name:
+                    ws.update_cell(i, 4, last_name)
+
+                ws.update_cell(i, 6, now)
+                ws.update_cell(i, 7, visits + 1)
+                return
+
+        ws.append_row([
+            telegram_id,
+            username,
+            first_name,
+            last_name,
+            now,
+            now,
+            1
+        ], value_input_option="USER_ENTERED")
+
+    except Exception as e:
+        print("register_user_activity error:", e)
+
+
+def parse_bot_datetime(value):
+    value = str(value or "").strip()
+
+    for fmt in ["%d.%m.%Y %H:%M", "%d.%m.%Y"]:
+        try:
+            return datetime.strptime(value, fmt)
+        except:
+            pass
+
+    return None
+
+
+def get_clients_monitoring_stats():
+    try:
+        users_rows = get_users_worksheet().get_all_values()[1:]
+    except Exception as e:
+        print("get users stats error:", e)
+        users_rows = []
+
+    orders = get_orders_with_rows()
+    now = datetime.now()
+    today_prefix = now.strftime("%d.%m.%Y")
+    month_part = now.strftime(".%m.%Y")
+
+    total_users = 0
+    new_today = 0
+    new_month = 0
+
+    for row in users_rows:
+        if not row or not str(row[0]).strip():
+            continue
+
+        total_users += 1
+        first_seen = row[4] if len(row) > 4 else ""
+
+        if str(first_seen).startswith(today_prefix):
+            new_today += 1
+
+        if month_part in str(first_seen):
+            new_month += 1
+
+    order_count = len(orders)
+
+    orders_by_user = {}
+    for order in orders:
+        telegram_id = str(order.get("Telegram ID", "")).strip()
+        if not telegram_id:
+            continue
+        orders_by_user[telegram_id] = orders_by_user.get(telegram_id, 0) + 1
+
+    repeat_clients = sum(1 for count in orders_by_user.values() if count >= 2)
+
+    return {
+        "total_users": total_users,
+        "new_today": new_today,
+        "new_month": new_month,
+        "order_count": order_count,
+        "repeat_clients": repeat_clients
+    }
+
+
+def clients_stats_text():
+    stats = get_clients_monitoring_stats()
+
+    return (
+        "👥 <b>Клієнти</b>\n\n"
+        f"Всього користувачів: <b>{stats['total_users']}</b>\n"
+        f"Нових сьогодні: <b>{stats['new_today']}</b>\n"
+        f"Нових за місяць: <b>{stats['new_month']}</b>\n"
+        f"Замовлень: <b>{stats['order_count']}</b>\n"
+        f"Повторних клієнтів: <b>{stats['repeat_clients']}</b>"
+    )
+
+
+def show_clients_stats(chat_id, callback_message=None):
+    if not is_admin(chat_id):
+        send_message(chat_id, "Цей розділ доступний тільки адміністратору.", main_menu(False))
+        return
+
+    text = clients_stats_text()
+    keyboard = {"inline_keyboard": [[inline_button("⬅️ Назад у кабінет", "admin_back")]]}
+
+    if callback_message:
+        edit_message(chat_id, callback_message["message_id"], text, keyboard)
+    else:
+        send_message(chat_id, text, keyboard)
+
+
+# =========================
 # CLIENTS / DISCOUNTS
 # =========================
 
@@ -1926,6 +2080,7 @@ def show_admin_cabinet(chat_id, callback_message=None):
     USER_STATES.pop(str(chat_id), None)
 
     stats = get_status_stats()
+    clients_block = clients_stats_text()
 
     text = (
         "👑 <b>Кабінет</b>\n\n"
@@ -1933,7 +2088,8 @@ def show_admin_cabinet(chat_id, callback_message=None):
         f"💳 Очікується оплата: <b>{stats['Очікується оплата']['count']}</b> / {stats['Очікується оплата']['sum']} грн\n"
         f"🟡 В обробці: <b>{stats['В обробці']['count']}</b> / {stats['В обробці']['sum']} грн\n"
         f"🚚 Відправлено: <b>{stats['Відправлено']['count']}</b> / {stats['Відправлено']['sum']} грн\n"
-        f"❌ Скасовано: <b>{stats['Скасовано']['count']}</b> / {stats['Скасовано']['sum']} грн"
+        f"❌ Скасовано: <b>{stats['Скасовано']['count']}</b> / {stats['Скасовано']['sum']} грн\n\n"
+        f"{clients_block}"
     )
 
     keyboard = {
@@ -1944,6 +2100,7 @@ def show_admin_cabinet(chat_id, callback_message=None):
             [inline_button("🚚 Відправлено", "admin_status_Відправлено")],
             [inline_button("❌ Скасовано", "admin_status_Скасовано")],
             [inline_button("📞 Заявки на зв’язок", "contact_requests")],
+            [inline_button("👥 Клієнти", "clients_stats")],
             [inline_button("📊 Підсумок за сьогодні", "summary_today")],
             [inline_button("📊 Підсумок за місяць", "summary_month")],
             [inline_button("🔍 Пошук", "admin_search")],
@@ -2439,6 +2596,7 @@ def webhook():
         chat_id = message["chat"]["id"]
         text = message.get("text", "")
         user = message.get("from", {})
+        register_user_activity(chat_id, user)
 
         if handle_payment_receipt(chat_id, message):
             return "ok"
@@ -2492,6 +2650,7 @@ def webhook():
         message_id = callback_message["message_id"]
         data_value = callback["data"]
         user = callback.get("from", {})
+        register_user_activity(chat_id, user)
 
         if callback_id:
             answer_callback(callback_id)
@@ -2683,6 +2842,9 @@ def webhook():
 
         elif data_value == "admin_orders_sum":
             with_loading(chat_id, "💰 Рахуємо суму замовлень...", show_admin_orders_sum, chat_id, callback_message)
+
+        elif data_value == "clients_stats":
+            with_loading(chat_id, "👥 Завантажуємо статистику клієнтів...", show_clients_stats, chat_id, callback_message)
 
         elif data_value == "admin_back":
             with_loading(chat_id, "👑 Оновлюємо кабінет...", show_admin_cabinet, chat_id, callback_message)
