@@ -20,6 +20,81 @@ USER_STATES = {}
 
 
 # =========================
+# SIMPLE CACHE FOR SPEED
+# =========================
+
+CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "300"))
+PRODUCTS_PAGE_SIZE = int(os.environ.get("PRODUCTS_PAGE_SIZE", "3"))
+
+CACHE = {
+    "records": {},
+    "values": {}
+}
+
+
+def cache_get(bucket, key):
+    item = CACHE.get(bucket, {}).get(key)
+    if not item:
+        return None
+
+    created_at = item.get("created_at")
+    if not created_at:
+        return None
+
+    age = (datetime.now() - created_at).total_seconds()
+    if age > CACHE_TTL_SECONDS:
+        try:
+            del CACHE[bucket][key]
+        except Exception:
+            pass
+        return None
+
+    return item.get("data")
+
+
+def cache_set(bucket, key, data):
+    CACHE.setdefault(bucket, {})[key] = {
+        "created_at": datetime.now(),
+        "data": data
+    }
+    return data
+
+
+def clear_cache(sheet_name=None):
+    """
+    Очищаємо кеш після змін у таблиці.
+    Якщо sheet_name не передано — чистимо все.
+    """
+    try:
+        if not sheet_name:
+            CACHE["records"].clear()
+            CACHE["values"].clear()
+            return
+
+        CACHE["records"].pop(sheet_name, None)
+        CACHE["values"].pop(sheet_name, None)
+    except Exception as e:
+        print("clear_cache error:", e)
+
+
+def get_cached_records(sheet_name):
+    cached = cache_get("records", sheet_name)
+    if cached is not None:
+        return cached
+
+    return cache_set("records", sheet_name, get_records(sheet_name))
+
+
+def get_cached_values(sheet_name):
+    cached = cache_get("values", sheet_name)
+    if cached is not None:
+        return cached
+
+    return cache_set("values", sheet_name, get_values(sheet_name))
+
+
+
+# =========================
 # GOOGLE SHEETS
 # =========================
 
@@ -93,18 +168,21 @@ def append_row(sheet_name, row):
     sh = get_sheet()
     worksheet = sh.worksheet(sheet_name)
     worksheet.append_row(row, value_input_option="USER_ENTERED")
+    clear_cache(sheet_name)
 
 
 def update_cell(sheet_name, row, col, value):
     sh = get_sheet()
     worksheet = sh.worksheet(sheet_name)
     worksheet.update_cell(row, col, value)
+    clear_cache(sheet_name)
 
 
 def delete_row(sheet_name, row_index):
     sh = get_sheet()
     worksheet = sh.worksheet(sheet_name)
     worksheet.delete_rows(row_index)
+    clear_cache(sheet_name)
 
 
 def clear_user_cart(telegram_id):
@@ -772,7 +850,7 @@ def subcategories_menu(category_id):
 
 def get_subcategory_by_button_text(text, category_id=None):
     clean_text = str(text).replace("📂", "").strip()
-    subcategories = get_records("Підкатегорії")
+    subcategories = get_cached_records("Підкатегорії")
 
     for subcategory in subcategories:
         active = str(subcategory.get("Активна", "")).strip().lower()
@@ -1185,7 +1263,7 @@ def continue_order_after_adding(chat_id):
 # =========================
 
 def get_active_categories():
-    categories = get_records("Категорії")
+    categories = get_cached_records("Категорії")
     return [
         c for c in categories
         if str(c.get("Активна")).strip().lower() in ["так", "yes", "true", "1"]
@@ -1194,7 +1272,7 @@ def get_active_categories():
 
 
 def get_active_subcategories(category_id):
-    subcategories = get_records("Підкатегорії")
+    subcategories = get_cached_records("Підкатегорії")
     result = []
 
     for item in subcategories:
@@ -1208,7 +1286,7 @@ def get_active_subcategories(category_id):
 
 
 def get_products_by_subcategory(subcategory_id):
-    products = get_records("Товари")
+    products = get_cached_records("Товари")
     result = []
 
     for product in products:
@@ -1232,7 +1310,7 @@ def get_category_by_button_text(text):
 
 
 def get_active_products_by_category(category_id):
-    products = get_records("Товари")
+    products = get_cached_records("Товари")
     return [
         p for p in products
         if str(p.get("ID категорії")) == str(category_id)
@@ -1241,7 +1319,7 @@ def get_active_products_by_category(category_id):
 
 
 def get_sale_products():
-    products = get_records("Товари")
+    products = get_cached_records("Товари")
     return [
         p for p in products
         if str(p.get("Акція")).strip() != ""
@@ -1507,6 +1585,79 @@ def show_product_card(chat_id, products, index=0, mode="category", category_id="
         send_product_text(chat_id, text, keyboard)
 
 
+
+def build_products_page_keyboard(page, total_pages):
+    buttons = []
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(inline_button("⬅️ Назад", f"products_page_{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(inline_button("Далі ➡️", f"products_page_{page + 1}"))
+
+    if nav_row:
+        buttons.append(nav_row)
+
+    buttons.append([inline_button("🛒 Перейти в кошик", "open_cart")])
+    return {"inline_keyboard": buttons}
+
+
+def show_products_page(chat_id, products, page=0, mode="category", category_id="", callback_message=None):
+    if not products:
+        text = "Товарів поки немає 😔"
+        keyboard = back_to_main_inline()
+        if callback_message:
+            edit_message(chat_id, callback_message["message_id"], text, keyboard)
+        else:
+            send_message(chat_id, text, main_menu(is_admin(chat_id)))
+        return
+
+    total = len(products)
+    page_size = max(1, PRODUCTS_PAGE_SIZE)
+    total_pages = (total + page_size - 1) // page_size
+    page = max(0, min(int(page), total_pages - 1))
+
+    start_index = page * page_size
+    end_index = min(start_index + page_size, total)
+
+    USER_STATES[str(chat_id)] = {
+        "step": "viewing_products",
+        "products": products,
+        "index": start_index,
+        "mode": mode,
+        "category_id": category_id,
+        "page": page
+    }
+
+    header = (
+        f"📦 Знайдено товарів: <b>{total}</b>\n"
+        f"Показуємо: <b>{start_index + 1}–{end_index}</b> з <b>{total}</b>\n"
+        f"Сторінка: <b>{page + 1}</b> з <b>{total_pages}</b>"
+    )
+
+    if callback_message:
+        edit_message(chat_id, callback_message["message_id"], header, build_products_page_keyboard(page, total_pages))
+    else:
+        send_message(chat_id, header, build_products_page_keyboard(page, total_pages))
+
+    for idx in range(start_index, end_index):
+        show_product_card(
+            chat_id=chat_id,
+            products=products,
+            index=idx,
+            mode=mode,
+            category_id=category_id,
+            photo_index=0
+        )
+
+    # Додаємо кнопки навігації ще раз після товарів, щоб користувачу не треба було скролити вгору.
+    send_message(
+        chat_id,
+        f"📄 Сторінка <b>{page + 1}</b> з <b>{total_pages}</b>",
+        build_products_page_keyboard(page, total_pages)
+    )
+
+
 def update_product_card(chat_id, message_id, products, index=0, mode="category", category_id="", photo_index=0, callback_message=None):
     if not products:
         edit_message(
@@ -1620,25 +1771,14 @@ def show_products_by_subcategory(chat_id, subcategory_id, callback_message=None)
             send_message(chat_id, text, keyboard)
         return
 
-    USER_STATES[str(chat_id)] = {
-        "step": "viewing_products",
-        "products": products,
-        "index": 0,
-        "mode": "subcategory",
-        "subcategory_id": subcategory_id
-    }
-
-    send_message(chat_id, f"📦 Знайдено товарів: <b>{len(products)}</b>")
-
-    for idx, product in enumerate(products):
-        show_product_card(
-            chat_id=chat_id,
-            products=products,
-            index=idx,
-            mode="subcategory",
-            category_id=str(subcategory_id),
-            photo_index=0
-        )
+    show_products_page(
+        chat_id=chat_id,
+        products=products,
+        page=0,
+        mode="subcategory",
+        category_id=str(subcategory_id),
+        callback_message=callback_message
+    )
 
 def show_products_by_category(chat_id, category_id):
     products = get_active_products_by_category(category_id)
@@ -1647,7 +1787,7 @@ def show_products_by_category(chat_id, category_id):
         send_message(chat_id, "У цій категорії поки немає товарів 😔", categories_menu())
         return
 
-    show_product_card(chat_id, products, 0, "category", category_id)
+    show_products_page(chat_id, products, 0, "category", str(category_id))
 
 
 def show_sales(chat_id):
@@ -1657,21 +1797,16 @@ def show_sales(chat_id):
         send_message(chat_id, "Поки немає активних акцій 😔", main_menu(is_admin(chat_id)))
         return
 
-    send_message(chat_id, f"🔥 Знайдено акційних товарів: <b>{len(sale_products)}</b>")
-
-    for idx, product in enumerate(sale_products):
-        show_product_card(
-            chat_id=chat_id,
-            products=sale_products,
-            index=idx,
-            mode="sale",
-            category_id="",
-            photo_index=0
-        )
-
+    show_products_page(
+        chat_id=chat_id,
+        products=sale_products,
+        page=0,
+        mode="sale",
+        category_id=""
+    )
 
 def add_to_cart(chat_id, product_id, callback_message=None):
-    products = get_records("Товари")
+    products = get_cached_records("Товари")
     product = None
 
     for p in products:
@@ -2159,7 +2294,7 @@ def notify_admin(full_name, phone, address, delivery_method, payment_method, com
 
 def get_setting_value(param_name):
     try:
-        settings = get_records("Налаштування")
+        settings = get_cached_records("Налаштування")
 
         for row in settings:
             param = str(row.get("Параметр", "")).strip().lower()
@@ -2246,7 +2381,7 @@ def finish_contact_request(chat_id, user, state):
         send_message(admin_id, admin_text)
 
 def show_delivery_payment(chat_id):
-    settings = get_records("Налаштування")
+    settings = get_cached_records("Налаштування")
 
     if not settings:
         send_message(chat_id, "Інформацію про доставку й оплату ще не додано.", main_menu(is_admin(chat_id)))
@@ -2895,6 +3030,24 @@ def webhook():
         elif data_value == "photo_counter":
             answer_callback(callback_id)
 
+
+        elif data_value.startswith("products_page_"):
+            page = int(data_value.replace("products_page_", ""))
+            state = USER_STATES.get(str(chat_id), {})
+            products = state.get("products", [])
+            mode = state.get("mode", "category")
+            category_id = state.get("category_id", "") or state.get("subcategory_id", "")
+            with_loading(
+                chat_id,
+                "📦 Завантажуємо наступну сторінку товарів...",
+                show_products_page,
+                chat_id,
+                products,
+                page,
+                mode,
+                category_id,
+                callback_message
+            )
 
         elif data_value.startswith("catpage_"):
             parts = data_value.split("_")
