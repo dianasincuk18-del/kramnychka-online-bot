@@ -1125,8 +1125,6 @@ REFERRAL_BONUS_AMOUNT = int(os.environ.get("REFERRAL_BONUS_AMOUNT", "50"))
 REFERRAL_MIN_ORDER_SUM = float(os.environ.get("REFERRAL_MIN_ORDER_SUM", "500"))
 BONUS_MAX_USE_PERCENT = float(os.environ.get("BONUS_MAX_USE_PERCENT", "20"))
 BONUS_VALID_DAYS = int(os.environ.get("BONUS_VALID_DAYS", "60"))
-OWN_PURCHASE_BONUS_PERCENT = float(os.environ.get("OWN_PURCHASE_BONUS_PERCENT", "5"))
-BONUS_ACCRUAL_STATUS = "Завершено"
 
 
 def get_bonus_worksheet():
@@ -1314,7 +1312,6 @@ def show_bonus_cabinet(chat_id, callback_message=None):
         f"<b>{int(REFERRAL_MIN_ORDER_SUM)} грн</b> Ви отримаєте "
         f"<b>{REFERRAL_BONUS_AMOUNT} бонусів</b>.\n\n"
         f"Бонусами можна оплатити до <b>{int(BONUS_MAX_USE_PERCENT)}%</b> суми замовлення.\n"
-        f"За власні завершені покупки нараховується <b>{int(OWN_PURCHASE_BONUS_PERCENT)}%</b> бонусами.\n"
         f"Термін дії бонусів: <b>{BONUS_VALID_DAYS} днів</b>."
     )
 
@@ -1452,72 +1449,60 @@ def process_referral_bonus_for_order(order):
 
 
 
-def bonus_transaction_exists(chat_id, transaction_type, order_row_index, negative=False):
+def bonus_already_added_for_order(order_row_index, transaction_type="Бонус за покупку"):
     try:
         rows = get_bonus_worksheet().get_all_values()
         for row in rows[1:]:
-            if len(row) < 9:
-                continue
-            row_chat_id = str(row[1]).strip()
-            row_type = str(row[2]).strip()
-            row_order = str(row[8]).strip()
-            if row_chat_id != str(chat_id).strip() or row_type != transaction_type or row_order != str(order_row_index).strip():
-                continue
-            try:
-                amount = float(row[3] or 0)
-            except:
-                amount = 0
-            if negative and amount < 0:
-                return True
-            if not negative and amount > 0:
+            row_type = str(row[2] if len(row) > 2 else "").strip()
+            row_order = str(row[8] if len(row) > 8 else "").strip()
+            row_status = str(row[6] if len(row) > 6 else "").strip().lower()
+            if row_type == transaction_type and row_order == str(order_row_index).strip() and row_status == "активний":
                 return True
     except Exception as e:
-        print("bonus_transaction_exists error:", e)
+        print("bonus_already_added_for_order error:", e)
     return False
 
 
 def process_purchase_bonus_for_order(order):
     """
-    Нараховує клієнту 5% бонусами тільки після статусу "Завершено".
-    Повторно за те саме замовлення не нараховує.
+    Нараховує клієнту 5% бонусами після статусу "Завершено".
+    Повторно за те саме замовлення бонус не нараховується.
     """
     try:
         if not order:
             return False
 
-        client_id = str(order.get("Telegram ID", "")).strip()
-        order_row_index = order.get("row_index", "")
+        chat_id = str(order.get("Telegram ID", "")).strip()
+        order_row_index = str(order.get("row_index", "")).strip()
         total = safe_float(order.get("Сума"))
 
-        if not client_id or total <= 0:
+        if not chat_id or not order_row_index or total <= 0:
             return False
 
-        if bonus_transaction_exists(client_id, "Бонус за покупку", order_row_index):
+        if bonus_already_added_for_order(order_row_index, "Бонус за покупку"):
             return False
 
-        bonus_amount = round(total * OWN_PURCHASE_BONUS_PERCENT / 100, 2)
+        bonus_amount = round(total * PURCHASE_BONUS_PERCENT / 100, 2)
         if bonus_amount <= 0:
             return False
 
         add_bonus_transaction(
-            chat_id=client_id,
+            chat_id=chat_id,
             amount=bonus_amount,
             transaction_type="Бонус за покупку",
-            comment=f"{int(OWN_PURCHASE_BONUS_PERCENT)}% за завершене замовлення",
+            comment=f"{int(PURCHASE_BONUS_PERCENT)}% від завершеного замовлення",
             order_row_index=order_row_index,
             status="Активний",
             expires_at=bonus_expiry_date()
         )
 
         send_message(
-            client_id,
+            chat_id,
             "🎉 <b>Дякуємо за покупку!</b>\n\n"
             "Ваше замовлення успішно завершене 💛\n\n"
             f"🎁 На Ваш бонусний рахунок нараховано <b>{bonus_amount} бонусів</b>.\n"
-            f"Бонуси діють протягом <b>{BONUS_VALID_DAYS} днів</b>.\n\n"
-            "Використати їх можна у наступному замовленні."
+            f"Бонуси діють протягом <b>{BONUS_VALID_DAYS} днів</b>."
         )
-
         return True
 
     except Exception as e:
@@ -1526,48 +1511,47 @@ def process_purchase_bonus_for_order(order):
 
 
 def cancel_purchase_bonus_for_order(order):
-    """Скасовує бонус за власну покупку, якщо замовлення скасовано після завершення."""
+    """
+    Якщо замовлення після нарахування бонусів скасовано/повернено — списуємо бонус за покупку назад.
+    """
     try:
         if not order:
-            return False
+            return
 
-        client_id = str(order.get("Telegram ID", "")).strip()
-        order_row_index = order.get("row_index", "")
+        chat_id = str(order.get("Telegram ID", "")).strip()
+        order_row_index = str(order.get("row_index", "")).strip()
+        if not chat_id or not order_row_index:
+            return
 
-        if not client_id or not order_row_index:
-            return False
+        rows = get_bonus_worksheet().get_all_values()
+        for row in rows[1:]:
+            row_type = str(row[2] if len(row) > 2 else "").strip()
+            row_order = str(row[8] if len(row) > 8 else "").strip()
+            row_status = str(row[6] if len(row) > 6 else "").strip().lower()
+            try:
+                amount = float(row[3] if len(row) > 3 else 0)
+            except:
+                amount = 0
 
-        if not bonus_transaction_exists(client_id, "Бонус за покупку", order_row_index):
-            return False
-
-        if bonus_transaction_exists(client_id, "Скасування бонусу за покупку", order_row_index, negative=True):
-            return False
-
-        total = safe_float(order.get("Сума"))
-        bonus_amount = round(total * OWN_PURCHASE_BONUS_PERCENT / 100, 2)
-
-        if bonus_amount <= 0:
-            return False
-
-        add_bonus_transaction(
-            chat_id=client_id,
-            amount=-bonus_amount,
-            transaction_type="Скасування бонусу за покупку",
-            comment="Замовлення скасовано / повернено",
-            order_row_index=order_row_index,
-            status="Списано",
-            expires_at=""
-        )
-
-        send_message(
-            client_id,
-            "ℹ️ Бонуси за це замовлення були скасовані, тому що замовлення скасовано або повернено."
-        )
-        return True
+            if row_type == "Бонус за покупку" and row_order == order_row_index and row_status == "активний" and amount > 0:
+                add_bonus_transaction(
+                    chat_id=chat_id,
+                    amount=-amount,
+                    transaction_type="Скасування бонусу за покупку",
+                    comment=f"Скасування/повернення замовлення {order_row_index}",
+                    order_row_index=order_row_index,
+                    status="Списано",
+                    expires_at=""
+                )
+                send_message(
+                    chat_id,
+                    "ℹ️ Бонуси за це замовлення були скасовані, "
+                    "оскільки замовлення скасоване або повернене."
+                )
+                return
 
     except Exception as e:
         print("cancel_purchase_bonus_for_order error:", e)
-        return False
 
 def cancel_referral_bonus_for_order(order):
     """
@@ -1663,7 +1647,8 @@ def process_bonus_reminders():
 # =========================
 
 FREE_DELIVERY_THRESHOLD = 1000
-NEXT_ORDER_DISCOUNT_PERCENT = 0  # стара знижка -10% вимкнена, тепер працює бонусна система
+NEXT_ORDER_DISCOUNT_PERCENT = 0  # Вимкнено: замість -10% працює бонусна система
+PURCHASE_BONUS_PERCENT = float(os.environ.get("PURCHASE_BONUS_PERCENT", "5"))
 
 
 def get_clients_worksheet():
@@ -1694,12 +1679,19 @@ def get_client_row(chat_id):
 
 
 def get_client_discount_percent(chat_id):
-    """
-    Стара автоматична знижка -10% вимкнена.
-    Замість неї працює бонусна система: 5% бонусами після статусу "Завершено"
-    + реферальні бонуси.
-    """
-    return 0
+    ws, row_index, row = get_client_row(chat_id)
+
+    if not row:
+        return 0
+
+    active = str(row[4] if len(row) > 4 else "").strip().lower()
+    if active not in ["так", "yes", "true", "1", "активна"]:
+        return 0
+
+    try:
+        return float(row[3] if len(row) > 3 else 0)
+    except:
+        return 0
 
 
 def upsert_client_discount(chat_id, full_name="", phone="", discount_percent=NEXT_ORDER_DISCOUNT_PERCENT, active="Так"):
@@ -2828,18 +2820,9 @@ def finish_order(chat_id, user, need_contact, callback_message=None):
         final_text += "📦 Ви обрали накладений платіж. Оплата буде при отриманні.\n\n"
 
     final_text += (
-        f"🎁 Після завершення замовлення Вам буде нараховано <b>{int(OWN_PURCHASE_BONUS_PERCENT)}%</b> бонусами.\n"
-        f"1 бонус = 1 грн. Бонусами можна оплатити до <b>{int(BONUS_MAX_USE_PERCENT)}%</b> наступного замовлення 💛"
-    )
-
-    # Стара знижка -10% на наступне замовлення вимкнена.
-    # Тепер після статусу "Завершено" нараховуються бонуси.
-    upsert_client_discount(
-        chat_id,
-        full_name=full_name,
-        phone=phone,
-        discount_percent=0,
-        active="Ні"
+        "🎁 Після успішного завершення замовлення Вам буде нараховано "
+        f"<b>{int(PURCHASE_BONUS_PERCENT)}%</b> бонусами від суми покупки.\n"
+        f"Бонуси діятимуть <b>{BONUS_VALID_DAYS} днів</b> 💛"
     )
 
     if payment_method == "Оплата за реквізитами IBAN":
@@ -3149,7 +3132,7 @@ def notify_client_order_sent(order):
         "Дякуємо за замовлення 💛\n"
         f"💰 Вартість Вашого замовлення за товар: <b>{total} грн</b>\n"
         "🚚 Також враховуйте вартість доставки — вона нараховується за тарифами перевізника.\n\n"
-        "🎁 Бонуси будуть нараховані після завершення замовлення."
+        "Після отримання замовлення менеджер завершить його, і бонуси будуть нараховані автоматично 🎁"
     )
 
     send_message(client_chat_id, text)
@@ -3199,10 +3182,10 @@ def set_order_status(chat_id, row_index, status, callback_message=None):
             notify_client_order_sent(target_order)
         elif status == "Завершено" and target_order:
             target_order["Статус"] = status
-            notify_client_status_change(client_chat_id, status)
             process_purchase_bonus_for_order(target_order)
             process_referral_bonus_for_order(target_order)
-        elif status == "Скасовано" and target_order:
+            notify_client_status_change(client_chat_id, status)
+        elif status in ["Скасовано", "Повернення"] and target_order:
             target_order["Статус"] = status
             cancel_purchase_bonus_for_order(target_order)
             cancel_referral_bonus_for_order(target_order)
@@ -3247,6 +3230,7 @@ def show_admin_orders_sum(chat_id, callback_message=None):
         f"💳 Очікується оплата: <b>{stats['Очікується оплата']['sum']} грн</b>\n"
         f"🟡 В обробці: <b>{stats['В обробці']['sum']} грн</b>\n"
         f"🚚 Відправлено: <b>{stats['Відправлено']['sum']} грн</b>\n"
+        f"✅ Завершено: <b>{stats['Завершено']['sum']} грн</b>\n"
         f"❌ Скасовано: <b>{stats['Скасовано']['sum']} грн</b>\n\n"
         f"📦 Усі разом: <b>{total_all} грн</b>"
     )
