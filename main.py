@@ -1882,6 +1882,393 @@ def continue_order_after_adding(chat_id):
     ask_free_delivery_offer(chat_id)
 
 
+
+# =========================
+# MARKETING / BROADCASTS
+# =========================
+
+MARKETING_BROADCAST_LIMIT_PER_RUN = int(os.environ.get("MARKETING_BROADCAST_LIMIT_PER_RUN", "1"))
+INACTIVE_CLIENT_DAYS = int(os.environ.get("INACTIVE_CLIENT_DAYS", "30"))
+SALE_BROADCAST_LIMIT_PER_RUN = int(os.environ.get("SALE_BROADCAST_LIMIT_PER_RUN", "1"))
+
+
+def ensure_headers(ws, headers):
+    """
+    Акуратно додає відсутні заголовки у перший рядок,
+    не ламаючи вже існуючі колонки.
+    """
+    try:
+        values = ws.get_all_values()
+        if not values:
+            ws.append_row(headers, value_input_option="USER_ENTERED")
+            return
+
+        current = values[0]
+        changed = False
+
+        for header in headers:
+            if header not in current:
+                current.append(header)
+                changed = True
+
+        if changed:
+            ws.update("1:1", [current], value_input_option="USER_ENTERED")
+    except Exception as e:
+        print("ensure_headers error:", e)
+
+
+def get_cell_by_header(row, headers, header_name, default=""):
+    try:
+        idx = headers.index(header_name)
+        return row[idx] if len(row) > idx else default
+    except ValueError:
+        return default
+
+
+def update_cell_by_header(ws, row_index, headers, header_name, value):
+    try:
+        col = headers.index(header_name) + 1
+        ws.update_cell(row_index, col, value)
+    except Exception as e:
+        print("update_cell_by_header error:", e)
+
+
+def parse_sheet_date(value):
+    value = str(value or "").strip()
+    if not value:
+        return None
+
+    for fmt in ["%d.%m.%Y", "%d.%m.%Y %H:%M", "%Y-%m-%d", "%Y-%m-%d %H:%M"]:
+        try:
+            return datetime.strptime(value, fmt).date()
+        except:
+            pass
+
+    return None
+
+
+def get_marketing_worksheet():
+    headers = [
+        "ID розсилки",
+        "Дата",
+        "Тип",
+        "ID товару",
+        "Заголовок",
+        "Текст",
+        "Текст кнопки",
+        "Активна",
+        "Надіслано",
+        "Дата надсилання"
+    ]
+    return get_or_create_worksheet("Розсилки", headers)
+
+
+def get_sale_broadcasts_worksheet():
+    headers = [
+        "Дата",
+        "ID товару",
+        "Назва товару",
+        "Статус"
+    ]
+    return get_or_create_worksheet("Надіслані акції", headers)
+
+
+def get_broadcast_client_ids():
+    """
+    Беремо всіх користувачів, які хоча б раз взаємодіяли з ботом.
+    Адмінів не виключаємо, щоб власник теж бачив тестові розсилки.
+    """
+    ids = []
+    try:
+        rows = get_users_worksheet().get_all_values()[1:]
+        for row in rows:
+            telegram_id = str(row[0] if len(row) > 0 else "").strip()
+            if telegram_id and telegram_id not in ids:
+                ids.append(telegram_id)
+    except Exception as e:
+        print("get_broadcast_client_ids error:", e)
+
+    return ids
+
+
+def get_product_by_id(product_id):
+    products = get_cached_records("Товари")
+    for product in products:
+        if str(product.get("ID товару", "")).strip() == str(product_id).strip():
+            return product
+    return None
+
+
+def product_marketing_keyboard(product_id=None, button_text="🛍 Переглянути товар"):
+    buttons = []
+
+    if product_id:
+        buttons.append([inline_button(button_text or "🛍 Переглянути товар", f"promo_product_{product_id}")])
+
+    buttons.append([inline_button("🔥 Переглянути акції", "open_sales")])
+    buttons.append([inline_button("📦 Відкрити каталог", "open_catalog")])
+
+    return {"inline_keyboard": buttons}
+
+
+def marketing_message_text(row_type, title, body, product=None):
+    row_type = str(row_type or "").strip()
+    title = str(title or "").strip()
+    body = str(body or "").strip()
+
+    if not title:
+        if row_type.lower() == "акція":
+            title = "🔥 Нова акція у крамничці"
+        elif row_type.lower() == "товар дня":
+            title = "✨ Товар дня"
+        else:
+            title = "💛 Новинка у нашій крамничці"
+
+    text = f"<b>{title}</b>\n\n"
+
+    if body:
+        text += f"{body}\n\n"
+
+    if product:
+        name = safe_text(product.get("Назва товару"), "Товар")
+        price = str(product.get("Ціна", "") or "").strip()
+        sale_price = str(product.get("Акційна ціна", "") or "").strip()
+        old_price = str(product.get("Стара ціна", "") or "").strip()
+        sale = str(product.get("Акція", "") or "").strip()
+
+        text += f"🛍 <b>{name}</b>\n"
+
+        if old_price and sale_price:
+            text += f"💸 Стара ціна: <s>{old_price} грн</s>\n"
+            text += f"🔥 Акційна ціна: <b>{sale_price} грн</b>\n"
+        elif sale_price:
+            text += f"🔥 Акційна ціна: <b>{sale_price} грн</b>\n"
+        elif price:
+            text += f"💰 Ціна: <b>{price} грн</b>\n"
+
+        if sale:
+            text += f"🎁 Акція: <b>{sale}</b>\n"
+
+    text += "\nЗаходьте переглянути актуальні пропозиції 💛"
+    return text
+
+
+def send_marketing_to_all(text, keyboard=None, photo_url=None):
+    sent = 0
+    failed = 0
+
+    for client_id in get_broadcast_client_ids():
+        try:
+            ok = False
+            if photo_url:
+                ok = send_photo(client_id, photo_url, text, keyboard)
+            if not ok:
+                ok = bool(send_message(client_id, text, keyboard))
+
+            if ok:
+                sent += 1
+            else:
+                failed += 1
+        except Exception as e:
+            print("send_marketing_to_all user error:", client_id, e)
+            failed += 1
+
+    return sent, failed
+
+
+def process_marketing_broadcasts():
+    """
+    Запускається через /marketing-broadcasts.
+    Надсилає заплановані рядки з листа "Розсилки".
+    За один запуск бере обмежену кількість розсилок, щоб не було спаму.
+    """
+    ws = get_marketing_worksheet()
+    rows = ws.get_all_values()
+    if not rows:
+        return 0
+
+    headers = rows[0]
+    today = datetime.now().date()
+    sent_campaigns = 0
+
+    for row_index, row in enumerate(rows[1:], start=2):
+        if sent_campaigns >= MARKETING_BROADCAST_LIMIT_PER_RUN:
+            break
+
+        active = str(get_cell_by_header(row, headers, "Активна", "")).strip().lower()
+        sent_flag = str(get_cell_by_header(row, headers, "Надіслано", "")).strip().lower()
+        date_raw = get_cell_by_header(row, headers, "Дата", "")
+        scheduled_date = parse_sheet_date(date_raw)
+
+        if active not in ["так", "yes", "1", "true", "активна"]:
+            continue
+        if sent_flag in ["так", "yes", "1", "true", "надіслано"]:
+            continue
+        if scheduled_date and scheduled_date > today:
+            continue
+
+        row_type = get_cell_by_header(row, headers, "Тип", "")
+        product_id = get_cell_by_header(row, headers, "ID товару", "")
+        title = get_cell_by_header(row, headers, "Заголовок", "")
+        body = get_cell_by_header(row, headers, "Текст", "")
+        button_text = get_cell_by_header(row, headers, "Текст кнопки", "🛍 Переглянути товар")
+
+        product = get_product_by_id(product_id) if product_id else None
+        photos = get_product_photos(product) if product else []
+        photo_url = photos[0] if photos else None
+
+        text = marketing_message_text(row_type, title, body, product)
+        keyboard = product_marketing_keyboard(product_id if product else None, button_text)
+        sent, failed = send_marketing_to_all(text, keyboard, photo_url)
+
+        update_cell_by_header(ws, row_index, headers, "Надіслано", "Так")
+        update_cell_by_header(ws, row_index, headers, "Дата надсилання", now_str())
+        sent_campaigns += 1
+
+        print(f"marketing campaign sent row={row_index}, sent={sent}, failed={failed}")
+
+    return sent_campaigns
+
+
+def sale_product_already_broadcasted(product_id):
+    try:
+        rows = get_sale_broadcasts_worksheet().get_all_values()[1:]
+        for row in rows:
+            if str(row[1] if len(row) > 1 else "").strip() == str(product_id).strip():
+                return True
+    except Exception as e:
+        print("sale_product_already_broadcasted error:", e)
+    return False
+
+
+def mark_sale_product_broadcasted(product):
+    try:
+        product_id = str(product.get("ID товару", "")).strip()
+        name = str(product.get("Назва товару", "")).strip()
+        ws = get_sale_broadcasts_worksheet()
+        ws.append_row([now_str(), product_id, name, "Надіслано"], value_input_option="USER_ENTERED")
+    except Exception as e:
+        print("mark_sale_product_broadcasted error:", e)
+
+
+def process_sale_broadcasts():
+    """
+    Запускається через /sale-broadcasts.
+    Якщо в таблиці з'явився новий активний акційний товар,
+    бот один раз повідомить про нього клієнтам.
+    """
+    sale_products = get_sale_products()
+    sent_count = 0
+
+    for product in sale_products:
+        if sent_count >= SALE_BROADCAST_LIMIT_PER_RUN:
+            break
+
+        product_id = str(product.get("ID товару", "")).strip()
+        if not product_id or sale_product_already_broadcasted(product_id):
+            continue
+
+        photos = get_product_photos(product)
+        photo_url = photos[0] if photos else None
+        text = marketing_message_text(
+            "Акція",
+            "🔥 Нова акційна пропозиція",
+            "Ми додали вигідну пропозицію для Вас.",
+            product
+        )
+        keyboard = product_marketing_keyboard(product_id, "🔥 Переглянути товар")
+        send_marketing_to_all(text, keyboard, photo_url)
+        mark_sale_product_broadcasted(product)
+        sent_count += 1
+
+    return sent_count
+
+
+def inactive_client_text():
+    return (
+        "💛 <b>Ми давно Вас не бачили</b>\n\n"
+        "У нашій крамничці вже зʼявилися новинки, акції та цікаві пропозиції.\n\n"
+        "Завітайте до каталогу — можливо, саме зараз знайдеться щось для Вас ✨"
+    )
+
+
+def process_inactive_clients_reminders():
+    """
+    Запускається через /inactive-clients.
+    Нагадує клієнтам, які не взаємодіяли з ботом INACTIVE_CLIENT_DAYS днів.
+    Повторне нагадування — не частіше ніж раз на INACTIVE_CLIENT_DAYS днів.
+    """
+    headers_needed = [
+        "Telegram ID",
+        "Username",
+        "Імʼя",
+        "Прізвище",
+        "Дата першого входу",
+        "Дата останньої активності",
+        "Кількість входів",
+        "Останнє нагадування неактивним"
+    ]
+
+    ws = get_users_worksheet()
+    ensure_headers(ws, headers_needed)
+    rows = ws.get_all_values()
+    if not rows:
+        return 0
+
+    headers = rows[0]
+    now_dt = datetime.now()
+    sent = 0
+
+    for row_index, row in enumerate(rows[1:], start=2):
+        telegram_id = str(get_cell_by_header(row, headers, "Telegram ID", "")).strip()
+        last_active_raw = get_cell_by_header(row, headers, "Дата останньої активності", "")
+        last_reminder_raw = get_cell_by_header(row, headers, "Останнє нагадування неактивним", "")
+
+        if not telegram_id:
+            continue
+
+        last_active = parse_bot_datetime(last_active_raw)
+        if not last_active:
+            continue
+
+        days_inactive = (now_dt - last_active).days
+        if days_inactive < INACTIVE_CLIENT_DAYS:
+            continue
+
+        last_reminder = parse_bot_datetime(last_reminder_raw)
+        if last_reminder and (now_dt - last_reminder).days < INACTIVE_CLIENT_DAYS:
+            continue
+
+        keyboard = {
+            "inline_keyboard": [
+                [inline_button("📦 Переглянути каталог", "open_catalog")],
+                [inline_button("🔥 Переглянути акції", "open_sales")]
+            ]
+        }
+
+        ok = send_message(telegram_id, inactive_client_text(), keyboard)
+        if ok:
+            update_cell_by_header(ws, row_index, headers, "Останнє нагадування неактивним", now_str())
+            sent += 1
+
+    return sent
+
+
+def show_product_by_id(chat_id, product_id, callback_message=None):
+    product = get_product_by_id(product_id)
+    if not product:
+        send_message(chat_id, "На жаль, товар уже не знайдено або він недоступний 😔", main_menu(is_admin(chat_id)))
+        return
+
+    show_product_card(
+        chat_id=chat_id,
+        products=[product],
+        index=0,
+        mode="promo",
+        category_id="",
+        photo_index=0
+    )
+
 # =========================
 # DATA HELPERS
 # =========================
@@ -3867,6 +4254,13 @@ def webhook():
         elif data_value.startswith("cart_qty_"):
             with_loading(chat_id, "🛒 Формуємо Ваш кошик...", show_cart, chat_id, callback_message)
 
+        elif data_value.startswith("promo_product_"):
+            product_id = data_value.replace("promo_product_", "")
+            with_loading(chat_id, "🛍 Завантажуємо товар...", show_product_by_id, chat_id, product_id, callback_message)
+
+        elif data_value == "open_catalog":
+            with_loading(chat_id, "📦 Відкриваємо каталог...", show_catalog_menu, chat_id)
+
         elif data_value == "open_cart":
             with_loading(chat_id, "🛒 Формуємо Ваш кошик...", show_cart, chat_id, callback_message)
 
@@ -4057,6 +4451,51 @@ def cart_reminders_endpoint():
     except Exception as e:
         print("cart_reminders_endpoint error:", e)
         return "Cart reminders error", 500
+
+
+@app.route("/marketing-broadcasts", methods=["GET", "POST"])
+def marketing_broadcasts_endpoint():
+    token = request.args.get("token", "")
+
+    if CRON_SECRET and token != CRON_SECRET:
+        return "Forbidden", 403
+
+    try:
+        sent_count = process_marketing_broadcasts()
+        return f"Marketing broadcasts sent: {sent_count}"
+    except Exception as e:
+        print("marketing_broadcasts_endpoint error:", e)
+        return "Marketing broadcasts error", 500
+
+
+@app.route("/sale-broadcasts", methods=["GET", "POST"])
+def sale_broadcasts_endpoint():
+    token = request.args.get("token", "")
+
+    if CRON_SECRET and token != CRON_SECRET:
+        return "Forbidden", 403
+
+    try:
+        sent_count = process_sale_broadcasts()
+        return f"Sale broadcasts sent: {sent_count}"
+    except Exception as e:
+        print("sale_broadcasts_endpoint error:", e)
+        return "Sale broadcasts error", 500
+
+
+@app.route("/inactive-clients", methods=["GET", "POST"])
+def inactive_clients_endpoint():
+    token = request.args.get("token", "")
+
+    if CRON_SECRET and token != CRON_SECRET:
+        return "Forbidden", 403
+
+    try:
+        sent_count = process_inactive_clients_reminders()
+        return f"Inactive clients reminders sent: {sent_count}"
+    except Exception as e:
+        print("inactive_clients_endpoint error:", e)
+        return "Inactive clients reminders error", 500
 
 
 if __name__ == "__main__":
