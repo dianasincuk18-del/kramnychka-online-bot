@@ -1365,6 +1365,7 @@ def show_bonus_cabinet(chat_id, callback_message=None):
 def show_referral_program(chat_id, callback_message=None):
     balance = get_available_bonus_balance(chat_id)
     referral_link = get_referral_link(chat_id)
+    referral_stats = get_referral_stats_for_user(chat_id)
 
     text = (
         "👥 <b>Реферальна програма</b>\n\n"
@@ -1388,7 +1389,11 @@ def show_referral_program(chat_id, callback_message=None):
         "• один номер телефону може брати участь у програмі лише один раз\n"
         "• якщо замовлення скасоване або повернене, бонуси анулюються\n"
         "• запрошувати самого себе через інший акаунт заборонено\n\n"
-        f"🎁 Ваші доступні бонуси: <b>{balance}</b>\n\n"
+        f"🎁 Ваші доступні бонуси: <b>{balance}</b>\n"
+        f"👥 Запрошено друзів: <b>{referral_stats['invited_total']}</b>\n"
+        f"✅ Успішних рефералів: <b>{referral_stats['successful']}</b>\n"
+        f"⏳ Очікують першого замовлення: <b>{referral_stats['waiting']}</b>\n"
+        f"💛 Нараховано за рефералку: <b>{referral_stats['bonus_total']}</b> бонусів\n\n"
         "🔗 <b>Ваше реферальне посилання:</b>\n"
         f"{referral_link}"
     )
@@ -1405,6 +1410,167 @@ def show_referral_program(chat_id, callback_message=None):
     else:
         send_message(chat_id, text, keyboard)
 
+
+
+
+def get_referral_stats_for_user(chat_id):
+    """
+    Статистика рефералки для конкретного клієнта.
+    Рахує, скільки людей перейшло за його посиланням,
+    скільки вже дали бонус і скільки бонусів нараховано.
+    """
+    stats = {
+        "invited_total": 0,
+        "waiting": 0,
+        "successful": 0,
+        "cancelled": 0,
+        "bonus_total": 0
+    }
+
+    try:
+        rows = get_referrals_worksheet().get_all_values()[1:]
+        for row in rows:
+            referrer_id = str(row[1] if len(row) > 1 else "").strip()
+            status = str(row[6] if len(row) > 6 else "").strip().lower()
+            bonus_added = str(row[7] if len(row) > 7 else "").strip().lower()
+
+            if referrer_id != str(chat_id).strip():
+                continue
+
+            stats["invited_total"] += 1
+
+            if bonus_added in ["так", "yes", "1", "true"] or status in ["бонус нараховано", "успішно"]:
+                stats["successful"] += 1
+            elif status in ["скасовано", "повернення", "телефон вже використаний", "не перше замовлення"]:
+                stats["cancelled"] += 1
+            else:
+                stats["waiting"] += 1
+
+        bonus_rows = get_bonus_worksheet().get_all_values()[1:]
+        for row in bonus_rows:
+            telegram_id = str(row[1] if len(row) > 1 else "").strip()
+            transaction_type = str(row[2] if len(row) > 2 else "").strip().lower()
+            if telegram_id != str(chat_id).strip():
+                continue
+            if "рефераль" not in transaction_type:
+                continue
+            try:
+                stats["bonus_total"] += float(row[3] if len(row) > 3 else 0)
+            except:
+                pass
+
+        stats["bonus_total"] = round(stats["bonus_total"], 2)
+
+    except Exception as e:
+        print("get_referral_stats_for_user error:", e)
+
+    return stats
+
+
+def get_admin_referral_stats():
+    """
+    Загальна статистика реферальної програми для кабінету адміністратора.
+    """
+    stats = {
+        "invited_total": 0,
+        "waiting": 0,
+        "successful": 0,
+        "cancelled": 0,
+        "referrers_count": 0,
+        "bonus_total": 0,
+        "top_referrers": []
+    }
+
+    referrers = {}
+    successful_by_referrer = {}
+
+    try:
+        rows = get_referrals_worksheet().get_all_values()[1:]
+
+        for row in rows:
+            referrer_id = str(row[1] if len(row) > 1 else "").strip()
+            status = str(row[6] if len(row) > 6 else "").strip().lower()
+            bonus_added = str(row[7] if len(row) > 7 else "").strip().lower()
+
+            if not referrer_id:
+                continue
+
+            stats["invited_total"] += 1
+            referrers[referrer_id] = referrers.get(referrer_id, 0) + 1
+
+            if bonus_added in ["так", "yes", "1", "true"] or status in ["бонус нараховано", "успішно"]:
+                stats["successful"] += 1
+                successful_by_referrer[referrer_id] = successful_by_referrer.get(referrer_id, 0) + 1
+            elif status in ["скасовано", "повернення", "телефон вже використаний", "не перше замовлення"]:
+                stats["cancelled"] += 1
+            else:
+                stats["waiting"] += 1
+
+        stats["referrers_count"] = len(referrers)
+
+        bonus_rows = get_bonus_worksheet().get_all_values()[1:]
+        for row in bonus_rows:
+            transaction_type = str(row[2] if len(row) > 2 else "").strip().lower()
+            if "рефераль" not in transaction_type:
+                continue
+            try:
+                stats["bonus_total"] += float(row[3] if len(row) > 3 else 0)
+            except:
+                pass
+
+        stats["bonus_total"] = round(stats["bonus_total"], 2)
+
+        top = sorted(referrers.items(), key=lambda item: item[1], reverse=True)[:5]
+        stats["top_referrers"] = [
+            {
+                "telegram_id": referrer_id,
+                "invited": invited_count,
+                "successful": successful_by_referrer.get(referrer_id, 0)
+            }
+            for referrer_id, invited_count in top
+        ]
+
+    except Exception as e:
+        print("get_admin_referral_stats error:", e)
+
+    return stats
+
+
+def admin_referral_stats_text():
+    stats = get_admin_referral_stats()
+
+    text = (
+        "👥 <b>Реферальна програма</b>\n\n"
+        f"Запрошень усього: <b>{stats['invited_total']}</b>\n"
+        f"Активних запрошувачів: <b>{stats['referrers_count']}</b>\n"
+        f"Очікують першого замовлення: <b>{stats['waiting']}</b>\n"
+        f"Успішних рефералів: <b>{stats['successful']}</b>\n"
+        f"Скасовано / не зараховано: <b>{stats['cancelled']}</b>\n"
+        f"Нараховано реферальних бонусів: <b>{stats['bonus_total']}</b>\n"
+    )
+
+    if stats.get("top_referrers"):
+        text += "\n🏆 <b>Топ запрошувачів:</b>\n"
+        for idx, item in enumerate(stats["top_referrers"], start=1):
+            text += (
+                f"{idx}. <code>{item['telegram_id']}</code> — "
+                f"{item['invited']} запрош., {item['successful']} успішн.\n"
+            )
+
+    return text
+
+
+def show_admin_referral_stats(chat_id, callback_message=None):
+    if not is_admin(chat_id):
+        return
+
+    text = admin_referral_stats_text()
+    keyboard = {"inline_keyboard": [[inline_button("⬅️ Назад у кабінет", "admin_back")]]}
+
+    if callback_message:
+        edit_message(chat_id, callback_message["message_id"], text, keyboard)
+    else:
+        send_message(chat_id, text, keyboard)
 
 def find_referral_for_client(chat_id):
     try:
@@ -2127,6 +2293,10 @@ def process_marketing_broadcasts():
 
         print(f"marketing campaign sent row={row_index}, sent={sent}, failed={failed}")
 
+    if sent_campaigns == 0:
+        # Якщо ручних розсилок на сьогодні немає — автоматично надсилаємо "товар дня".
+        sent_campaigns += process_auto_product_day_broadcast()
+
     return sent_campaigns
 
 
@@ -2253,6 +2423,117 @@ def process_inactive_clients_reminders():
 
     return sent
 
+
+
+
+def get_auto_product_broadcasts_worksheet():
+    headers = [
+        "Дата",
+        "ID товару",
+        "Назва товару",
+        "Статус"
+    ]
+    return get_or_create_worksheet("Надіслані товари дня", headers)
+
+
+def auto_product_broadcast_sent_today():
+    today = datetime.now().strftime("%d.%m.%Y")
+    try:
+        rows = get_auto_product_broadcasts_worksheet().get_all_values()[1:]
+        for row in rows:
+            sent_date = str(row[0] if len(row) > 0 else "").strip()
+            status = str(row[3] if len(row) > 3 else "").strip().lower()
+            if sent_date.startswith(today) and status in ["надіслано", "так", "sent"]:
+                return True
+    except Exception as e:
+        print("auto_product_broadcast_sent_today error:", e)
+    return False
+
+
+def get_auto_broadcasted_product_ids():
+    ids = set()
+    try:
+        rows = get_auto_product_broadcasts_worksheet().get_all_values()[1:]
+        for row in rows:
+            product_id = str(row[1] if len(row) > 1 else "").strip()
+            status = str(row[3] if len(row) > 3 else "").strip().lower()
+            if product_id and status in ["надіслано", "так", "sent"]:
+                ids.add(product_id)
+    except Exception as e:
+        print("get_auto_broadcasted_product_ids error:", e)
+    return ids
+
+
+def mark_auto_product_broadcasted(product):
+    try:
+        product_id = str(product.get("ID товару", "")).strip()
+        name = str(product.get("Назва товару", "")).strip()
+        ws = get_auto_product_broadcasts_worksheet()
+        ws.append_row([
+            now_str(),
+            product_id,
+            name,
+            "Надіслано"
+        ], value_input_option="USER_ENTERED")
+    except Exception as e:
+        print("mark_auto_product_broadcasted error:", e)
+
+
+def get_next_auto_product_for_broadcast():
+    products = get_cached_records("Товари")
+    sent_ids = get_auto_broadcasted_product_ids()
+
+    active_products = []
+    for product in products:
+        product_id = str(product.get("ID товару", "")).strip()
+        active = str(product.get("Активний", "")).strip().lower()
+        if product_id and active in ["так", "yes", "1", "true", "активний"]:
+            active_products.append(product)
+
+    for product in active_products:
+        product_id = str(product.get("ID товару", "")).strip()
+        if product_id not in sent_ids:
+            return product
+
+    # Якщо вже всі товари були у розсилці — починаємо нове коло з першого активного товару.
+    if active_products:
+        return active_products[0]
+
+    return None
+
+
+def process_auto_product_day_broadcast():
+    """
+    Автоматична розсилка "товар дня".
+    UptimeRobot може запускати її часто, але код відправить не більше 1 товару на день.
+    Товари йдуть по черзі з листа "Товари".
+    """
+    if auto_product_broadcast_sent_today():
+        return 0
+
+    product = get_next_auto_product_for_broadcast()
+    if not product:
+        return 0
+
+    product_id = str(product.get("ID товару", "")).strip()
+    photos = get_product_photos(product)
+    photo_url = photos[0] if photos else None
+
+    text = marketing_message_text(
+        "Товар дня",
+        "✨ Товар дня у нашій крамничці",
+        "Сьогодні хочемо звернути Вашу увагу на цей товар:",
+        product
+    )
+    keyboard = product_marketing_keyboard(product_id, "🛍 Переглянути товар")
+    sent, failed = send_marketing_to_all(text, keyboard, photo_url)
+
+    if sent > 0:
+        mark_auto_product_broadcasted(product)
+        print(f"auto product broadcast sent product={product_id}, sent={sent}, failed={failed}")
+        return 1
+
+    return 0
 
 def show_product_by_id(chat_id, product_id, callback_message=None):
     product = get_product_by_id(product_id)
@@ -3576,6 +3857,7 @@ def show_admin_cabinet(chat_id, callback_message=None):
 
     stats = get_status_stats()
     clients_block = clients_stats_text()
+    referral_stats = get_admin_referral_stats()
 
     text = (
         "👑 <b>Кабінет</b>\n\n"
@@ -3585,7 +3867,12 @@ def show_admin_cabinet(chat_id, callback_message=None):
         f"🚚 Відправлено: <b>{stats['Відправлено']['count']}</b> / {stats['Відправлено']['sum']} грн\n"
         f"✅ Завершено: <b>{stats['Завершено']['count']}</b> / {stats['Завершено']['sum']} грн\n"
         f"❌ Скасовано: <b>{stats['Скасовано']['count']}</b> / {stats['Скасовано']['sum']} грн\n\n"
-        f"{clients_block}"
+        f"{clients_block}\n\n"
+        "👥 <b>Реферальна програма</b>\n"
+        f"Запрошень: <b>{referral_stats['invited_total']}</b>\n"
+        f"Успішних рефералів: <b>{referral_stats['successful']}</b>\n"
+        f"Очікують першого замовлення: <b>{referral_stats['waiting']}</b>\n"
+        f"Реферальних бонусів нараховано: <b>{referral_stats['bonus_total']}</b>"
     )
 
     keyboard = {
@@ -3598,6 +3885,7 @@ def show_admin_cabinet(chat_id, callback_message=None):
             [inline_button("❌ Скасовано", "admin_status_Скасовано")],
             [inline_button("📞 Заявки на зв’язок", "contact_requests")],
             [inline_button("👥 Клієнти", "clients_stats")],
+            [inline_button("👥 Рефералка", "admin_referrals")],
             [inline_button("📊 Підсумок за сьогодні", "summary_today")],
             [inline_button("📊 Підсумок за місяць", "summary_month")],
             [inline_button("🔍 Пошук", "admin_search")],
@@ -4416,6 +4704,9 @@ def webhook():
         elif data_value == "clients_stats":
             with_loading(chat_id, "👥 Завантажуємо статистику клієнтів...", show_clients_stats, chat_id, callback_message)
 
+        elif data_value == "admin_referrals":
+            with_loading(chat_id, "👥 Рахуємо реферальну статистику...", show_admin_referral_stats, chat_id, callback_message)
+
         elif data_value == "admin_back":
             with_loading(chat_id, "👑 Оновлюємо кабінет...", show_admin_cabinet, chat_id, callback_message)
 
@@ -4496,6 +4787,22 @@ def inactive_clients_endpoint():
     except Exception as e:
         print("inactive_clients_endpoint error:", e)
         return "Inactive clients reminders error", 500
+
+
+@app.route("/auto-product-broadcasts", methods=["GET", "POST"])
+def auto_product_broadcasts_endpoint():
+    token = request.args.get("token", "")
+
+    if CRON_SECRET and token != CRON_SECRET:
+        return "Forbidden", 403
+
+    try:
+        sent_count = process_auto_product_day_broadcast()
+        return f"Auto product broadcasts sent: {sent_count}"
+    except Exception as e:
+        print("auto_product_broadcasts_endpoint error:", e)
+        return "Auto product broadcasts error", 500
+
 
 
 if __name__ == "__main__":
