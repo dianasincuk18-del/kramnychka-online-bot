@@ -362,7 +362,7 @@ def get_cart_rows_grouped_by_user():
             continue
 
         try:
-            item_sum = float(row[5] if len(row) > 5 and row[5] else 0)
+            item_sum = safe_float(row[5] if len(row) > 5 and row[5] else 0)
         except:
             item_sum = 0
 
@@ -914,9 +914,16 @@ def safe_text(value, default="—"):
 
 def safe_float(value, default=0):
     try:
+        if value is None or value == "":
+            return float(default or 0)
+
+        value = str(value).strip()
+        value = value.replace(" ", "").replace("грн", "").replace("UAH", "")
+        value = value.replace(",", ".")
+
         return float(value or default)
     except:
-        return default
+        return float(default or 0)
 
 
 def back_to_main_inline():
@@ -1036,7 +1043,7 @@ def register_user_activity(chat_id, user=None):
         for i, row in enumerate(rows[1:], start=2):
             if len(row) > 0 and str(row[0]).strip() == telegram_id:
                 try:
-                    visits = int(float(row[6])) if len(row) > 6 and str(row[6]).strip() else 0
+                    visits = int(safe_float(row[6])) if len(row) > 6 and str(row[6]).strip() else 0
                 except:
                     visits = 0
 
@@ -1232,7 +1239,7 @@ def get_available_bonus_balance(chat_id):
             continue
 
         try:
-            amount = float(row[3] if len(row) > 3 else 0)
+            amount = safe_float(row[3] if len(row) > 3 else 0)
         except:
             amount = 0
 
@@ -1455,7 +1462,7 @@ def get_referral_stats_for_user(chat_id):
             if "рефераль" not in transaction_type:
                 continue
             try:
-                stats["bonus_total"] += float(row[3] if len(row) > 3 else 0)
+                stats["bonus_total"] += safe_float(row[3] if len(row) > 3 else 0)
             except:
                 pass
 
@@ -1514,7 +1521,7 @@ def get_admin_referral_stats():
             if "рефераль" not in transaction_type:
                 continue
             try:
-                stats["bonus_total"] += float(row[3] if len(row) > 3 else 0)
+                stats["bonus_total"] += safe_float(row[3] if len(row) > 3 else 0)
             except:
                 pass
 
@@ -1778,7 +1785,7 @@ def cancel_purchase_bonus_for_order(order):
             row_order = str(row[8] if len(row) > 8 else "").strip()
             row_status = str(row[6] if len(row) > 6 else "").strip().lower()
             try:
-                amount = float(row[3] if len(row) > 3 else 0)
+                amount = safe_float(row[3] if len(row) > 3 else 0)
             except:
                 amount = 0
 
@@ -1938,7 +1945,7 @@ def get_client_discount_percent(chat_id):
         return 0
 
     try:
-        return float(row[3] if len(row) > 3 else 0)
+        return safe_float(row[3] if len(row) > 3 else 0)
     except:
         return 0
 
@@ -3359,8 +3366,8 @@ def change_cart_qty(chat_id, row_index, delta, callback_message=None):
         return
 
     try:
-        price = float(row[3] or 0)
-        qty = int(float(row[4] or 1))
+        price = safe_float(row[3] or 0)
+        qty = int(safe_float(row[4] or 1))
     except:
         price = 0
         qty = 1
