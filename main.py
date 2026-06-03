@@ -789,8 +789,8 @@ def main_menu(is_admin=False):
     keyboard = [
         [{"text": "📦 Каталог"}, {"text": "🔥 Акції"}],
         [{"text": "🛒 Кошик"}, {"text": "📦 Мої замовлення"}],
-        [{"text": "🎁 Мої бонуси"}, {"text": "📞 Зв’язатися з менеджером"}],
-        [{"text": "🚚 Доставка і оплата"}]
+        [{"text": "🎁 Мої бонуси"}, {"text": "👥 Реферальна програма"}],
+        [{"text": "📞 Зв’язатися з менеджером"}, {"text": "🚚 Доставка і оплата"}]
     ]
 
     if is_admin:
@@ -1316,6 +1316,50 @@ def show_bonus_cabinet(chat_id, callback_message=None):
     )
 
     keyboard = {"inline_keyboard": [[inline_button("🛒 Перейти до кошика", "open_cart")]]}
+
+    if callback_message:
+        edit_message(chat_id, callback_message["message_id"], text, keyboard)
+    else:
+        send_message(chat_id, text, keyboard)
+
+
+def show_referral_program(chat_id, callback_message=None):
+    balance = get_available_bonus_balance(chat_id)
+    referral_link = get_referral_link(chat_id)
+
+    text = (
+        "👥 <b>Реферальна програма</b>\n\n"
+        "Запрошуйте друзів у нашу крамничку та отримуйте бонуси за їхні покупки 💛\n\n"
+        "🎁 <b>Що отримуєте Ви?</b>\n"
+        "За кожного нового клієнта, який перейшов за Вашим посиланням, оформив перше замовлення "
+        "та отримав його зі статусом <b>Завершено</b>, Вам нараховується "
+        f"<b>{REFERRAL_BONUS_AMOUNT} бонусів</b>.\n\n"
+        "💎 <b>Бонусна програма</b>\n"
+        f"Після кожного завершеного замовлення Вам автоматично нараховується <b>{int(PURCHASE_BONUS_PERCENT)}%</b> "
+        "від суми замовлення бонусами.\n"
+        "Наприклад: замовлення на 1000 грн → 50 бонусів.\n\n"
+        "💰 <b>Як використовувати бонуси?</b>\n"
+        "• 1 бонус = 1 грн\n"
+        f"• бонусами можна оплатити до <b>{int(BONUS_MAX_USE_PERCENT)}%</b> суми замовлення\n"
+        f"• бонуси діють <b>{BONUS_VALID_DAYS} днів</b> з моменту нарахування\n\n"
+        "⚠️ <b>Умови програми</b>\n"
+        "• бонуси нараховуються тільки після статусу <b>Завершено</b>\n"
+        f"• мінімальна сума першого замовлення друга для реферального бонусу — <b>{int(REFERRAL_MIN_ORDER_SUM)} грн</b>\n"
+        "• бонус за друга нараховується лише за його перше успішне замовлення\n"
+        "• один номер телефону може брати участь у програмі лише один раз\n"
+        "• якщо замовлення скасоване або повернене, бонуси анулюються\n"
+        "• запрошувати самого себе через інший акаунт заборонено\n\n"
+        f"🎁 Ваші доступні бонуси: <b>{balance}</b>\n\n"
+        "🔗 <b>Ваше реферальне посилання:</b>\n"
+        f"{referral_link}"
+    )
+
+    keyboard = {
+        "inline_keyboard": [
+            [inline_button("🎁 Мої бонуси", "open_bonus_cabinet")],
+            [inline_button("🛒 Перейти до кошика", "open_cart")]
+        ]
+    }
 
     if callback_message:
         edit_message(chat_id, callback_message["message_id"], text, keyboard)
@@ -3580,6 +3624,8 @@ def webhook():
             with_loading(chat_id, "📦 Завантажуємо інформацію про Ваші замовлення...\n\nЗачекайте, будь ласка ⏳", show_my_orders, chat_id)
         elif text == "🎁 Мої бонуси":
             with_loading(chat_id, "🎁 Завантажуємо Ваші бонуси...", show_bonus_cabinet, chat_id)
+        elif text == "👥 Реферальна програма":
+            with_loading(chat_id, "👥 Завантажуємо умови реферальної програми...", show_referral_program, chat_id)
         elif text == "📞 Зв’язатися з менеджером":
             contact_manager(chat_id, user)
         elif text == "🚚 Доставка і оплата":
@@ -3691,6 +3737,9 @@ def webhook():
 
         elif data_value == "open_bonus_cabinet":
             with_loading(chat_id, "🎁 Завантажуємо Ваші бонуси...", show_bonus_cabinet, chat_id, callback_message)
+
+        elif data_value == "open_referral_program":
+            with_loading(chat_id, "👥 Завантажуємо умови реферальної програми...", show_referral_program, chat_id, callback_message)
 
         elif data_value == "open_sales":
             with_loading(chat_id, "🔥 Завантажуємо акційні пропозиції...", show_sales, chat_id)
