@@ -12,6 +12,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 SHEET_ID = os.environ.get("SHEET_ID")
 GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS_JSON")
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
+CRON_SECRET = os.environ.get("CRON_SECRET", "")
 
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -161,6 +162,226 @@ def find_cart_row_by_product(telegram_id, product_id):
 
     return None
 
+
+
+# =========================
+# ABANDONED CART REMINDERS
+# =========================
+
+CART_BASE_HEADERS = [
+    "Telegram ID",
+    "ID товару",
+    "Назва товару",
+    "Ціна",
+    "Кількість",
+    "Сума",
+    "Дата додавання/оновлення",
+    "Нагадування 1",
+    "Нагадування 2",
+    "Нагадування 3"
+]
+
+
+def get_cart_worksheet():
+    """
+    Лист "Кошик" тепер має додаткові колонки для нагадувань.
+    Якщо старі колонки вже були — код акуратно додасть відсутні в кінець.
+    """
+    sh = get_sheet()
+
+    try:
+        ws = sh.worksheet("Кошик")
+    except Exception:
+        ws = sh.add_worksheet(title="Кошик", rows=1000, cols=len(CART_BASE_HEADERS))
+        ws.append_row(CART_BASE_HEADERS, value_input_option="USER_ENTERED")
+        return ws
+
+    values = ws.get_all_values()
+    if not values:
+        ws.append_row(CART_BASE_HEADERS, value_input_option="USER_ENTERED")
+        return ws
+
+    headers = values[0]
+    changed = False
+
+    for idx, header in enumerate(CART_BASE_HEADERS, start=1):
+        if len(headers) < idx or not str(headers[idx - 1]).strip():
+            ws.update_cell(1, idx, header)
+            changed = True
+
+    if changed:
+        print("Кошик headers updated for reminders")
+
+    return ws
+
+
+def now_str():
+    return datetime.now().strftime("%d.%m.%Y %H:%M")
+
+
+def update_cart_reminder_columns(row_index, updated_at=None, reminder1=None, reminder2=None, reminder3=None):
+    try:
+        ws = get_cart_worksheet()
+
+        if updated_at is not None:
+            ws.update_cell(row_index, 7, updated_at)
+        if reminder1 is not None:
+            ws.update_cell(row_index, 8, reminder1)
+        if reminder2 is not None:
+            ws.update_cell(row_index, 9, reminder2)
+        if reminder3 is not None:
+            ws.update_cell(row_index, 10, reminder3)
+
+    except Exception as e:
+        print("update_cart_reminder_columns error:", e)
+
+
+def cart_reminder_keyboard():
+    return {
+        "inline_keyboard": [
+            [inline_button("🛒 Перейти до кошика", "open_cart")]
+        ]
+    }
+
+
+def cart_reminder_text(reminder_number, total=0, discount_percent=0):
+    if reminder_number == 1:
+        return (
+            "🛍 <b>Ви додали товари до кошика, але ще не оформили замовлення.</b>\n\n"
+            "Можливо, ми можемо Вам допомогти?\n\n"
+            "Ваш кошик все ще збережений 💛"
+        )
+
+    if reminder_number == 2:
+        return (
+            "⏰ <b>Нагадуємо про Ваш кошик</b>\n\n"
+            "Обрані товари все ще очікують на Вас 🛍\n\n"
+            "Якщо бажаєте оформити замовлення — поверніться до кошика та завершіть покупку 💛"
+        )
+
+    extra = ""
+    if discount_percent:
+        extra = f"\n\n🎁 Для Вас також активна знижка <b>-{int(discount_percent)}%</b> на замовлення."
+
+    return (
+        "🎁 <b>Ми помітили, що у Вас залишилися товари в кошику.</b>\n\n"
+        "Можливо, саме час завершити замовлення? ✨"
+        f"{extra}\n\n"
+        "🛒 Перейдіть до кошика та оформіть покупку у зручний для Вас час."
+    )
+
+
+def get_cart_rows_grouped_by_user():
+    ws = get_cart_worksheet()
+    rows = ws.get_all_values()
+    grouped = {}
+
+    for row_index, row in enumerate(rows[1:], start=2):
+        telegram_id = str(row[0] if len(row) > 0 else "").strip()
+        product_id = str(row[1] if len(row) > 1 else "").strip()
+
+        if not telegram_id or not product_id:
+            continue
+
+        try:
+            item_sum = float(row[5] if len(row) > 5 and row[5] else 0)
+        except:
+            item_sum = 0
+
+        updated_at = row[6] if len(row) > 6 else ""
+        reminder1 = row[7] if len(row) > 7 else ""
+        reminder2 = row[8] if len(row) > 8 else ""
+        reminder3 = row[9] if len(row) > 9 else ""
+
+        if telegram_id not in grouped:
+            grouped[telegram_id] = {
+                "rows": [],
+                "total": 0,
+                "updated_dates": [],
+                "reminder1_sent": True,
+                "reminder2_sent": True,
+                "reminder3_sent": True
+            }
+
+        grouped[telegram_id]["rows"].append(row_index)
+        grouped[telegram_id]["total"] += item_sum
+
+        parsed = parse_bot_datetime(updated_at)
+        if parsed:
+            grouped[telegram_id]["updated_dates"].append(parsed)
+        else:
+            # Старі рядки без дати не спамимо одразу — ставимо поточну дату.
+            update_cart_reminder_columns(row_index, updated_at=now_str(), reminder1="", reminder2="", reminder3="")
+            grouped[telegram_id]["updated_dates"].append(datetime.now())
+
+        if not str(reminder1).strip():
+            grouped[telegram_id]["reminder1_sent"] = False
+        if not str(reminder2).strip():
+            grouped[telegram_id]["reminder2_sent"] = False
+        if not str(reminder3).strip():
+            grouped[telegram_id]["reminder3_sent"] = False
+
+    return grouped
+
+
+def process_cart_reminders():
+    """
+    Запускається через окремий URL /cart-reminders.
+    Надсилає максимум одне нагадування одному клієнту за один запуск,
+    щоб не засипати повідомленнями, якщо бот довго не перевіряв кошики.
+    """
+    grouped = get_cart_rows_grouped_by_user()
+    now = datetime.now()
+    sent_count = 0
+
+    for telegram_id, data in grouped.items():
+        dates = data.get("updated_dates") or []
+        if not dates:
+            continue
+
+        # Якщо клієнт додавав товар кілька разів — рахуємо від останнього оновлення кошика.
+        last_update = max(dates)
+        hours_passed = (now - last_update).total_seconds() / 3600
+
+        reminder_number = None
+        reminder_col = None
+
+        if hours_passed >= 1 and not data.get("reminder1_sent"):
+            reminder_number = 1
+            reminder_col = 8
+        elif hours_passed >= 24 and not data.get("reminder2_sent"):
+            reminder_number = 2
+            reminder_col = 9
+        elif hours_passed >= 72 and not data.get("reminder3_sent"):
+            reminder_number = 3
+            reminder_col = 10
+
+        if not reminder_number:
+            continue
+
+        try:
+            discount_percent = get_client_discount_percent(telegram_id)
+        except:
+            discount_percent = 0
+
+        text = cart_reminder_text(
+            reminder_number=reminder_number,
+            total=data.get("total", 0),
+            discount_percent=discount_percent
+        )
+
+        send_message(telegram_id, text, cart_reminder_keyboard())
+
+        sent_at = now_str()
+        for row_index in data.get("rows", []):
+            try:
+                get_cart_worksheet().update_cell(row_index, reminder_col, sent_at)
+            except Exception as e:
+                print("cart reminder mark error:", e)
+
+        sent_count += 1
+
+    return sent_count
 
 def get_orders_with_rows():
     rows = get_values("Замовлення")
@@ -1481,10 +1702,12 @@ def add_to_cart(chat_id, product_id, callback_message=None):
 
         update_cell("Кошик", row_index, 5, new_qty)
         update_cell("Кошик", row_index, 6, new_sum)
+        update_cart_reminder_columns(row_index, updated_at=now_str(), reminder1="", reminder2="", reminder3="")
     else:
         new_qty = 1
         new_sum = price
-        append_row("Кошик", [chat_id, product_id, name, price, new_qty, new_sum])
+        get_cart_worksheet()
+        append_row("Кошик", [chat_id, product_id, name, price, new_qty, new_sum, now_str(), "", "", ""])
 
     text = (
         f"✅ Товар <b>{name}</b> додано в кошик.\n\n"
@@ -1610,6 +1833,7 @@ def change_cart_qty(chat_id, row_index, delta, callback_message=None):
 
     update_cell("Кошик", row_index, 5, new_qty)
     update_cell("Кошик", row_index, 6, new_sum)
+    update_cart_reminder_columns(row_index, updated_at=now_str(), reminder1="", reminder2="", reminder3="")
 
     show_cart(chat_id, callback_message)
 
@@ -2850,6 +3074,22 @@ def webhook():
             with_loading(chat_id, "👑 Оновлюємо кабінет...", show_admin_cabinet, chat_id, callback_message)
 
     return "ok"
+
+
+
+@app.route("/cart-reminders", methods=["GET", "POST"])
+def cart_reminders_endpoint():
+    token = request.args.get("token", "")
+
+    if CRON_SECRET and token != CRON_SECRET:
+        return "Forbidden", 403
+
+    try:
+        sent_count = process_cart_reminders()
+        return f"Cart reminders sent: {sent_count}"
+    except Exception as e:
+        print("cart_reminders_endpoint error:", e)
+        return "Cart reminders error", 500
 
 
 if __name__ == "__main__":
