@@ -849,6 +849,29 @@ def subcategories_menu(category_id):
     }
 
 
+def subsections_menu(subcategory_id):
+    subsections = get_active_subsections(subcategory_id)
+    keyboard = []
+
+    row = []
+    for subsection in subsections:
+        row.append({"text": f"▫️ {subsection.get('Назва підрозділу')}"})
+
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+
+    if row:
+        keyboard.append(row)
+
+    keyboard.append([{"text": "⬅️ Назад"}])
+
+    return {
+        "keyboard": keyboard,
+        "resize_keyboard": True
+    }
+
+
 def get_subcategory_by_button_text(text, category_id=None):
     clean_text = str(text).replace("📂", "").strip()
     subcategories = get_cached_records("Підкатегорії")
@@ -861,6 +884,22 @@ def get_subcategory_by_button_text(text, category_id=None):
         if active in ["так", "yes", "1", "true", "активна"] and name == clean_text:
             if category_id is None or str(category_id) == item_category_id:
                 return subcategory
+
+    return None
+
+
+def get_subsection_by_button_text(text, subcategory_id=None):
+    clean_text = str(text).replace("▫️", "").strip()
+    subsections = get_cached_records("Підрозділи")
+
+    for subsection in subsections:
+        active = str(subsection.get("Активна", subsection.get("Активний", ""))).strip().lower()
+        name = str(subsection.get("Назва підрозділу", "")).strip()
+        item_subcategory_id = str(subsection.get("ID підкатегорії", "")).strip()
+
+        if active in ["так", "yes", "1", "true", "активна", "активний"] and name == clean_text:
+            if subcategory_id is None or str(subcategory_id) == item_subcategory_id:
+                return subsection
 
     return None
 
@@ -1870,15 +1909,61 @@ def get_active_subcategories(category_id):
     return result
 
 
+def get_active_subsections(subcategory_id):
+    """
+    3-й рівень каталогу: Категорія → Підкатегорія → Підрозділ → Товари.
+    Дані беруться з листа "Підрозділи".
+    """
+    try:
+        subsections = get_cached_records("Підрозділи")
+    except Exception as e:
+        print("get_active_subsections error:", e)
+        return []
+
+    result = []
+
+    for item in subsections:
+        active = str(item.get("Активна", item.get("Активний", ""))).strip().lower()
+        item_subcategory_id = str(item.get("ID підкатегорії", "")).strip()
+
+        if item_subcategory_id == str(subcategory_id) and active in ["так", "yes", "1", "true", "активна", "активний"]:
+            result.append(item)
+
+    return result
+
+
 def get_products_by_subcategory(subcategory_id):
+    """
+    Запасний варіант для старої структури, якщо у підкатегорії немає підрозділів.
+    Якщо у товарі вже заповнено "ID підрозділу", він показуватиметься через підрозділ.
+    """
     products = get_cached_records("Товари")
     result = []
 
     for product in products:
         active = str(product.get("Активний", "")).strip().lower()
         product_subcategory_id = str(product.get("ID підкатегорії", "")).strip()
+        product_subsection_id = str(product.get("ID підрозділу", "") or "").strip()
 
-        if product_subcategory_id == str(subcategory_id) and active in ["так", "yes", "1", "true", "активний"]:
+        if (
+            product_subcategory_id == str(subcategory_id)
+            and not product_subsection_id
+            and active in ["так", "yes", "1", "true", "активний"]
+        ):
+            result.append(product)
+
+    return result
+
+
+def get_products_by_subsection(subsection_id):
+    products = get_cached_records("Товари")
+    result = []
+
+    for product in products:
+        active = str(product.get("Активний", "")).strip().lower()
+        product_subsection_id = str(product.get("ID підрозділу", "") or "").strip()
+
+        if product_subsection_id == str(subsection_id) and active in ["так", "yes", "1", "true", "активний"]:
             result.append(product)
 
     return result
@@ -2286,7 +2371,7 @@ def show_subcategories_reply(chat_id, category_id):
     if not subcategories:
         send_message(
             chat_id,
-            "У цій категорії поки немає підкатегорій 😔",
+            "У цій категорії поки немає розділів 😔",
             categories_menu()
         )
         return
@@ -2298,8 +2383,32 @@ def show_subcategories_reply(chat_id, category_id):
 
     send_message(
         chat_id,
-        "📂 <b>Підкатегорії</b>\n\nОберіть підкатегорію нижче 👇",
+        "📂 <b>Розділи</b>\n\nОберіть розділ нижче 👇",
         subcategories_menu(category_id)
+    )
+
+
+def show_subsections_reply(chat_id, subcategory_id):
+    state = USER_STATES.get(str(chat_id), {})
+    category_id = state.get("category_id", "")
+    subsections = get_active_subsections(subcategory_id)
+
+    # Якщо підрозділів немає — залишаємо стару логіку і показуємо товари з цього розділу.
+    # Так старі розділи без третього рівня не ламаються.
+    if not subsections:
+        with_loading(chat_id, "📦 Завантажуємо товари...", show_products_by_subcategory, chat_id, subcategory_id)
+        return
+
+    USER_STATES[str(chat_id)] = {
+        "step": "choosing_subsection",
+        "category_id": category_id,
+        "subcategory_id": subcategory_id
+    }
+
+    send_message(
+        chat_id,
+        "▫️ <b>Підрозділи</b>\n\nОберіть підрозділ нижче 👇",
+        subsections_menu(subcategory_id)
     )
 
 
@@ -2330,7 +2439,7 @@ def show_subcategories(chat_id, category_id, callback_message=None):
     buttons.append([inline_button("⬅️ Назад до категорій", "back_categories")])
 
     keyboard = {"inline_keyboard": buttons}
-    text = "Оберіть, будь ласка, підкатегорію 👇"
+    text = "Оберіть, будь ласка, розділ 👇"
 
     if callback_message:
         edit_message(chat_id, callback_message["message_id"], text, keyboard)
@@ -2343,10 +2452,10 @@ def show_products_by_subcategory(chat_id, subcategory_id, callback_message=None)
     products = get_products_by_subcategory(subcategory_id)
 
     if not products:
-        text = "У цій підкатегорії поки немає товарів 😔"
+        text = "У цьому розділі поки немає товарів 😔"
         keyboard = {
             "inline_keyboard": [
-                [inline_button("⬅️ Назад до категорій", "back_categories")]
+                [inline_button("⬅️ Назад до каталогу", "back_categories")]
             ]
         }
 
@@ -2364,6 +2473,35 @@ def show_products_by_subcategory(chat_id, subcategory_id, callback_message=None)
         category_id=str(subcategory_id),
         callback_message=callback_message
     )
+
+
+def show_products_by_subsection(chat_id, subsection_id, callback_message=None):
+    products = get_products_by_subsection(subsection_id)
+
+    if not products:
+        text = "У цьому підрозділі поки немає товарів 😔"
+        keyboard = back_to_main_inline()
+
+        if callback_message:
+            edit_message(chat_id, callback_message["message_id"], text, keyboard)
+        else:
+            send_message(chat_id, text, keyboard)
+        return
+
+    state = USER_STATES.get(str(chat_id), {})
+
+    show_products_page(
+        chat_id=chat_id,
+        products=products,
+        page=0,
+        mode="subsection",
+        category_id=str(subsection_id),
+        callback_message=callback_message
+    )
+
+    state["step"] = "viewing_products"
+    state["subsection_id"] = subsection_id
+    USER_STATES[str(chat_id)] = {**USER_STATES.get(str(chat_id), {}), **state}
 
 def show_products_by_category(chat_id, category_id):
     products = get_active_products_by_category(category_id)
@@ -3604,7 +3742,13 @@ def webhook():
             pass
         elif text == "⬅️ Назад":
             state = USER_STATES.get(str(chat_id), {})
-            if state.get("step") == "choosing_subcategory":
+            if state.get("step") == "choosing_subsection":
+                category_id = state.get("category_id")
+                if category_id:
+                    with_loading(chat_id, "📂 Повертаємось до розділів...", show_subcategories_reply, chat_id, category_id)
+                else:
+                    with_loading(chat_id, "🛍️ Завантажуємо каталог для Вас...", show_catalog_menu, chat_id)
+            elif state.get("step") == "choosing_subcategory":
                 USER_STATES.pop(str(chat_id), None)
                 with_loading(chat_id, "🛍️ Завантажуємо каталог для Вас...", show_catalog_menu, chat_id)
             else:
@@ -3612,10 +3756,13 @@ def webhook():
         elif text == "📦 Каталог":
             with_loading(chat_id, "🛍️ Зачекайте, будь ласка...\n\nПідбираємо для Вас товари ✨", show_catalog_menu, chat_id)
         elif category:
-            with_loading(chat_id, "📂 Завантажуємо підкатегорії...", show_subcategories_reply, chat_id, category.get("ID категорії"))
+            with_loading(chat_id, "📂 Завантажуємо розділи...", show_subcategories_reply, chat_id, category.get("ID категорії"))
         elif get_subcategory_by_button_text(text, USER_STATES.get(str(chat_id), {}).get("category_id")):
             subcategory = get_subcategory_by_button_text(text, USER_STATES.get(str(chat_id), {}).get("category_id"))
-            with_loading(chat_id, "📦 Завантажуємо товари...", show_products_by_subcategory, chat_id, subcategory.get("ID підкатегорії"))
+            with_loading(chat_id, "▫️ Завантажуємо підрозділи...", show_subsections_reply, chat_id, subcategory.get("ID підкатегорії"))
+        elif get_subsection_by_button_text(text, USER_STATES.get(str(chat_id), {}).get("subcategory_id")):
+            subsection = get_subsection_by_button_text(text, USER_STATES.get(str(chat_id), {}).get("subcategory_id"))
+            with_loading(chat_id, "📦 Завантажуємо товари...", show_products_by_subsection, chat_id, subsection.get("ID підрозділу"))
         elif text == "🔥 Акції":
             with_loading(chat_id, "🔥 Шукаємо найвигідніші пропозиції для Вас...\n\nЗачекайте декілька секунд ⏳", show_sales, chat_id)
         elif text == "🛒 Кошик":
