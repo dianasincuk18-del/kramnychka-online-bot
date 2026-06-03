@@ -2,6 +2,7 @@ import os
 import json
 import requests
 import gspread
+import time
 from flask import Flask, request
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
@@ -30,6 +31,20 @@ CACHE = {
     "records": {},
     "values": {}
 }
+
+# Кешуємо саме підключення до Google Sheets і обʼєкти аркушів,
+# щоб не відкривати таблицю заново при кожному кліку.
+SHEET_CONNECTION_TTL_SECONDS = int(os.environ.get("SHEET_CONNECTION_TTL_SECONDS", "3600"))
+SHEET_CONNECTION_CACHE = {
+    "created_at": None,
+    "sheet": None,
+    "worksheets": {}
+}
+
+# Не записуємо активність користувача в Google Sheets при кожному кліку.
+# Це сильно зменшує кількість запитів і прибирає помилки 429.
+USER_ACTIVITY_THROTTLE_SECONDS = int(os.environ.get("USER_ACTIVITY_THROTTLE_SECONDS", "600"))
+USER_ACTIVITY_CACHE = {}
 
 
 def cache_get(bucket, key):
@@ -77,6 +92,73 @@ def clear_cache(sheet_name=None):
         print("clear_cache error:", e)
 
 
+
+def is_quota_error(error):
+    text = str(error).lower()
+    return "429" in text or "quota exceeded" in text or "read requests" in text
+
+
+def google_call_with_retry(func, attempts=3):
+    """
+    Якщо Google Sheets тимчасово віддає 429, пробуємо ще раз.
+    Це не замінює кеш, але допомагає не падати одразу.
+    """
+    last_error = None
+
+    for attempt in range(attempts):
+        try:
+            return func()
+        except Exception as e:
+            last_error = e
+            if not is_quota_error(e) or attempt == attempts - 1:
+                raise
+            time.sleep(2 + attempt * 3)
+
+    raise last_error
+
+
+def get_cached_worksheet(sheet_name):
+    created_at = SHEET_CONNECTION_CACHE.get("created_at")
+    sheet = SHEET_CONNECTION_CACHE.get("sheet")
+
+    if (
+        sheet is None
+        or created_at is None
+        or (datetime.now() - created_at).total_seconds() > SHEET_CONNECTION_TTL_SECONDS
+    ):
+        # Оновлюємо підключення до всієї таблиці.
+        creds_dict = json.loads(GOOGLE_CREDS_JSON)
+        scope = [
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive"
+        ]
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        client = gspread.authorize(creds)
+        sheet = google_call_with_retry(lambda: client.open_by_key(SHEET_ID))
+
+        SHEET_CONNECTION_CACHE["sheet"] = sheet
+        SHEET_CONNECTION_CACHE["created_at"] = datetime.now()
+        SHEET_CONNECTION_CACHE["worksheets"] = {}
+
+    worksheets = SHEET_CONNECTION_CACHE.setdefault("worksheets", {})
+    if sheet_name not in worksheets:
+        worksheets[sheet_name] = google_call_with_retry(lambda: sheet.worksheet(sheet_name))
+
+    return worksheets[sheet_name]
+
+
+def clear_sheet_connection_cache(sheet_name=None):
+    try:
+        if not sheet_name:
+            SHEET_CONNECTION_CACHE["created_at"] = None
+            SHEET_CONNECTION_CACHE["sheet"] = None
+            SHEET_CONNECTION_CACHE["worksheets"] = {}
+            return
+        SHEET_CONNECTION_CACHE.setdefault("worksheets", {}).pop(sheet_name, None)
+    except Exception as e:
+        print("clear_sheet_connection_cache error:", e)
+
+
 def get_cached_records(sheet_name):
     cached = cache_get("records", sheet_name)
     if cached is not None:
@@ -99,6 +181,16 @@ def get_cached_values(sheet_name):
 # =========================
 
 def get_sheet():
+    created_at = SHEET_CONNECTION_CACHE.get("created_at")
+    sheet = SHEET_CONNECTION_CACHE.get("sheet")
+
+    if (
+        sheet is not None
+        and created_at is not None
+        and (datetime.now() - created_at).total_seconds() <= SHEET_CONNECTION_TTL_SECONDS
+    ):
+        return sheet
+
     creds_dict = json.loads(GOOGLE_CREDS_JSON)
 
     scope = [
@@ -108,33 +200,47 @@ def get_sheet():
 
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     client = gspread.authorize(creds)
-    return client.open_by_key(SHEET_ID)
+    sheet = google_call_with_retry(lambda: client.open_by_key(SHEET_ID))
+
+    SHEET_CONNECTION_CACHE["created_at"] = datetime.now()
+    SHEET_CONNECTION_CACHE["sheet"] = sheet
+    SHEET_CONNECTION_CACHE["worksheets"] = {}
+
+    return sheet
 
 
 def get_records(sheet_name):
-    sh = get_sheet()
-    worksheet = sh.worksheet(sheet_name)
-    return worksheet.get_all_records()
+    cached = cache_get("records", sheet_name)
+    if cached is not None:
+        return cached
+
+    worksheet = get_cached_worksheet(sheet_name)
+    data = google_call_with_retry(lambda: worksheet.get_all_records())
+    return cache_set("records", sheet_name, data)
 
 
 def get_values(sheet_name):
-    sh = get_sheet()
-    worksheet = sh.worksheet(sheet_name)
-    return worksheet.get_all_values()
+    cached = cache_get("values", sheet_name)
+    if cached is not None:
+        return cached
 
+    worksheet = get_cached_worksheet(sheet_name)
+    data = google_call_with_retry(lambda: worksheet.get_all_values())
+    return cache_set("values", sheet_name, data)
 
 def get_or_create_worksheet(sheet_name, headers):
     sh = get_sheet()
 
     try:
-        ws = sh.worksheet(sheet_name)
+        ws = get_cached_worksheet(sheet_name)
     except Exception:
-        ws = sh.add_worksheet(title=sheet_name, rows=1000, cols=len(headers))
-        ws.append_row(headers, value_input_option="USER_ENTERED")
+        ws = google_call_with_retry(lambda: sh.add_worksheet(title=sheet_name, rows=1000, cols=len(headers)))
+        SHEET_CONNECTION_CACHE.setdefault("worksheets", {})[sheet_name] = ws
+        google_call_with_retry(lambda: ws.append_row(headers, value_input_option="USER_ENTERED"))
 
-    values = ws.get_all_values()
+    values = google_call_with_retry(lambda: ws.get_all_values())
     if not values:
-        ws.append_row(headers, value_input_option="USER_ENTERED")
+        google_call_with_retry(lambda: ws.append_row(headers, value_input_option="USER_ENTERED"))
 
     return ws
 
@@ -148,7 +254,7 @@ def append_contact_request(row):
 def get_contact_requests_with_rows():
     headers = ["Дата", "Telegram ID", "ПІБ", "Телефон", "Статус"]
     ws = get_or_create_worksheet("Заявки", headers)
-    rows = ws.get_all_values()
+    rows = google_call_with_retry(lambda: ws.get_all_values())
     result = []
 
     for i, row in enumerate(rows[1:], start=2):
@@ -165,30 +271,26 @@ def get_contact_requests_with_rows():
 
 
 def append_row(sheet_name, row):
-    sh = get_sheet()
-    worksheet = sh.worksheet(sheet_name)
-    worksheet.append_row(row, value_input_option="USER_ENTERED")
+    worksheet = get_cached_worksheet(sheet_name)
+    google_call_with_retry(lambda: worksheet.append_row(row, value_input_option="USER_ENTERED"))
     clear_cache(sheet_name)
 
 
 def update_cell(sheet_name, row, col, value):
-    sh = get_sheet()
-    worksheet = sh.worksheet(sheet_name)
-    worksheet.update_cell(row, col, value)
+    worksheet = get_cached_worksheet(sheet_name)
+    google_call_with_retry(lambda: worksheet.update_cell(row, col, value))
     clear_cache(sheet_name)
 
 
 def delete_row(sheet_name, row_index):
-    sh = get_sheet()
-    worksheet = sh.worksheet(sheet_name)
-    worksheet.delete_rows(row_index)
+    worksheet = get_cached_worksheet(sheet_name)
+    google_call_with_retry(lambda: worksheet.delete_rows(row_index))
     clear_cache(sheet_name)
 
 
 def clear_user_cart(telegram_id):
-    sh = get_sheet()
-    ws = sh.worksheet("Кошик")
-    rows = ws.get_all_values()
+    ws = get_cached_worksheet("Кошик")
+    rows = google_call_with_retry(lambda: ws.get_all_values())
     rows_to_delete = []
 
     for i, row in enumerate(rows[1:], start=2):
@@ -196,7 +298,10 @@ def clear_user_cart(telegram_id):
             rows_to_delete.append(i)
 
     for row_index in reversed(rows_to_delete):
-        ws.delete_rows(row_index)
+        google_call_with_retry(lambda row_index=row_index: ws.delete_rows(row_index))
+
+    if rows_to_delete:
+        clear_cache("Кошик")
 
 
 def get_user_cart(telegram_id):
@@ -268,15 +373,16 @@ def get_cart_worksheet():
     sh = get_sheet()
 
     try:
-        ws = sh.worksheet("Кошик")
+        ws = get_cached_worksheet("Кошик")
     except Exception:
-        ws = sh.add_worksheet(title="Кошик", rows=1000, cols=len(CART_BASE_HEADERS))
-        ws.append_row(CART_BASE_HEADERS, value_input_option="USER_ENTERED")
+        ws = google_call_with_retry(lambda: sh.add_worksheet(title="Кошик", rows=1000, cols=len(CART_BASE_HEADERS)))
+        SHEET_CONNECTION_CACHE.setdefault("worksheets", {})["Кошик"] = ws
+        google_call_with_retry(lambda: google_call_with_retry(lambda: ws.append_row(CART_BASE_HEADERS, value_input_option="USER_ENTERED")))
         return ws
 
-    values = ws.get_all_values()
+    values = google_call_with_retry(lambda: ws.get_all_values())
     if not values:
-        ws.append_row(CART_BASE_HEADERS, value_input_option="USER_ENTERED")
+        google_call_with_retry(lambda: ws.append_row(CART_BASE_HEADERS, value_input_option="USER_ENTERED"))
         return ws
 
     headers = values[0]
@@ -284,7 +390,7 @@ def get_cart_worksheet():
 
     for idx, header in enumerate(CART_BASE_HEADERS, start=1):
         if len(headers) < idx or not str(headers[idx - 1]).strip():
-            ws.update_cell(1, idx, header)
+            google_call_with_retry(lambda idx=idx, header=header: ws.update_cell(1, idx, header))
             changed = True
 
     if changed:
@@ -302,13 +408,13 @@ def update_cart_reminder_columns(row_index, updated_at=None, reminder1=None, rem
         ws = get_cart_worksheet()
 
         if updated_at is not None:
-            ws.update_cell(row_index, 7, updated_at)
+            google_call_with_retry(lambda: ws.update_cell(row_index, 7, updated_at))
         if reminder1 is not None:
-            ws.update_cell(row_index, 8, reminder1)
+            google_call_with_retry(lambda: ws.update_cell(row_index, 8, reminder1))
         if reminder2 is not None:
-            ws.update_cell(row_index, 9, reminder2)
+            google_call_with_retry(lambda: ws.update_cell(row_index, 9, reminder2))
         if reminder3 is not None:
-            ws.update_cell(row_index, 10, reminder3)
+            google_call_with_retry(lambda: ws.update_cell(row_index, 10, reminder3))
 
     except Exception as e:
         print("update_cart_reminder_columns error:", e)
@@ -351,7 +457,7 @@ def cart_reminder_text(reminder_number, total=0, discount_percent=0):
 
 def get_cart_rows_grouped_by_user():
     ws = get_cart_worksheet()
-    rows = ws.get_all_values()
+    rows = google_call_with_retry(lambda: ws.get_all_values())
     grouped = {}
 
     for row_index, row in enumerate(rows[1:], start=2):
@@ -453,7 +559,7 @@ def process_cart_reminders():
         sent_at = now_str()
         for row_index in data.get("rows", []):
             try:
-                get_cart_worksheet().update_cell(row_index, reminder_col, sent_at)
+                google_call_with_retry(lambda row_index=row_index: get_cart_worksheet().update_cell(row_index, reminder_col, sent_at))
             except Exception as e:
                 print("cart reminder mark error:", e)
 
@@ -948,7 +1054,7 @@ def get_admins():
     try:
         headers = ["Telegram ID", "ПІБ", "Роль"]
         ws = get_or_create_worksheet("Адміністратори", headers)
-        rows = ws.get_all_records()
+        rows = google_call_with_retry(lambda: ws.get_all_records())
 
         for row in rows:
             telegram_id = str(row.get("Telegram ID", "")).strip()
@@ -1031,11 +1137,15 @@ def register_user_activity(chat_id, user=None):
     """
     try:
         user = user or {}
+        telegram_id = str(chat_id).strip()
+        last_activity = USER_ACTIVITY_CACHE.get(telegram_id)
+        if last_activity and (datetime.now() - last_activity).total_seconds() < USER_ACTIVITY_THROTTLE_SECONDS:
+            return
+
         ws = get_users_worksheet()
-        rows = ws.get_all_values()
+        rows = google_call_with_retry(lambda: ws.get_all_values())
 
         now = datetime.now().strftime("%d.%m.%Y %H:%M")
-        telegram_id = str(chat_id).strip()
         username = str(user.get("username", "") or "").strip()
         first_name = str(user.get("first_name", "") or "").strip()
         last_name = str(user.get("last_name", "") or "").strip()
@@ -1054,11 +1164,13 @@ def register_user_activity(chat_id, user=None):
                 if last_name:
                     ws.update_cell(i, 4, last_name)
 
-                ws.update_cell(i, 6, now)
-                ws.update_cell(i, 7, visits + 1)
+                google_call_with_retry(lambda: ws.update_cell(i, 6, now))
+                google_call_with_retry(lambda: ws.update_cell(i, 7, visits + 1))
+                clear_cache("Користувачі")
+                USER_ACTIVITY_CACHE[telegram_id] = datetime.now()
                 return
 
-        ws.append_row([
+        google_call_with_retry(lambda: ws.append_row([
             telegram_id,
             username,
             first_name,
@@ -1066,7 +1178,9 @@ def register_user_activity(chat_id, user=None):
             now,
             now,
             1
-        ], value_input_option="USER_ENTERED")
+        ], value_input_option="USER_ENTERED"))
+        clear_cache("Користувачі")
+        USER_ACTIVITY_CACHE[telegram_id] = datetime.now()
 
     except Exception as e:
         print("register_user_activity error:", e)
@@ -1086,7 +1200,7 @@ def parse_bot_datetime(value):
 
 def get_clients_monitoring_stats():
     try:
-        users_rows = get_users_worksheet().get_all_values()[1:]
+        users_rows = get_values("Користувачі")[1:]
     except Exception as e:
         print("get users stats error:", e)
         users_rows = []
@@ -1209,7 +1323,7 @@ def bonus_expiry_date():
 
 def get_bonus_rows():
     try:
-        return get_bonus_worksheet().get_all_values()
+        return get_values("Бонуси")
     except Exception as e:
         print("get_bonus_rows error:", e)
         return []
@@ -1308,7 +1422,7 @@ def register_referral_from_start(chat_id, referrer_id):
             return
 
         ws = get_referrals_worksheet()
-        rows = ws.get_all_values()
+        rows = google_call_with_retry(lambda: ws.get_all_values())
 
         for row in rows[1:]:
             existing_referral = str(row[2] if len(row) > 2 else "").strip()
@@ -1435,7 +1549,7 @@ def get_referral_stats_for_user(chat_id):
     }
 
     try:
-        rows = get_referrals_worksheet().get_all_values()[1:]
+        rows = get_values("Реферали")[1:]
         for row in rows:
             referrer_id = str(row[1] if len(row) > 1 else "").strip()
             status = str(row[6] if len(row) > 6 else "").strip().lower()
@@ -1453,7 +1567,7 @@ def get_referral_stats_for_user(chat_id):
             else:
                 stats["waiting"] += 1
 
-        bonus_rows = get_bonus_worksheet().get_all_values()[1:]
+        bonus_rows = get_values("Бонуси")[1:]
         for row in bonus_rows:
             telegram_id = str(row[1] if len(row) > 1 else "").strip()
             transaction_type = str(row[2] if len(row) > 2 else "").strip().lower()
@@ -1492,7 +1606,7 @@ def get_admin_referral_stats():
     successful_by_referrer = {}
 
     try:
-        rows = get_referrals_worksheet().get_all_values()[1:]
+        rows = get_values("Реферали")[1:]
 
         for row in rows:
             referrer_id = str(row[1] if len(row) > 1 else "").strip()
@@ -1515,7 +1629,7 @@ def get_admin_referral_stats():
 
         stats["referrers_count"] = len(referrers)
 
-        bonus_rows = get_bonus_worksheet().get_all_values()[1:]
+        bonus_rows = get_values("Бонуси")[1:]
         for row in bonus_rows:
             transaction_type = str(row[2] if len(row) > 2 else "").strip().lower()
             if "рефераль" not in transaction_type:
@@ -1582,7 +1696,7 @@ def show_admin_referral_stats(chat_id, callback_message=None):
 def find_referral_for_client(chat_id):
     try:
         ws = get_referrals_worksheet()
-        rows = ws.get_all_values()
+        rows = google_call_with_retry(lambda: ws.get_all_values())
 
         for i, row in enumerate(rows[1:], start=2):
             referral_id = str(row[2] if len(row) > 2 else "").strip()
@@ -1619,7 +1733,7 @@ def phone_already_used_for_referral(phone, current_referral_row_index=None):
         return False
 
     try:
-        rows = get_referrals_worksheet().get_all_values()
+        rows = get_values("Реферали")
 
         for i, row in enumerate(rows[1:], start=2):
             if current_referral_row_index and i == int(current_referral_row_index):
@@ -1707,7 +1821,7 @@ def process_referral_bonus_for_order(order):
 
 def bonus_already_added_for_order(order_row_index, transaction_type="Бонус за покупку"):
     try:
-        rows = get_bonus_worksheet().get_all_values()
+        rows = get_values("Бонуси")
         for row in rows[1:]:
             row_type = str(row[2] if len(row) > 2 else "").strip()
             row_order = str(row[8] if len(row) > 8 else "").strip()
@@ -1779,7 +1893,7 @@ def cancel_purchase_bonus_for_order(order):
         if not chat_id or not order_row_index:
             return
 
-        rows = get_bonus_worksheet().get_all_values()
+        rows = get_values("Бонуси")
         for row in rows[1:]:
             row_type = str(row[2] if len(row) > 2 else "").strip()
             row_order = str(row[8] if len(row) > 8 else "").strip()
@@ -1822,7 +1936,7 @@ def cancel_referral_bonus_for_order(order):
         referred_id = str(order.get("Telegram ID", "")).strip()
 
         ws = get_referrals_worksheet()
-        rows = ws.get_all_values()
+        rows = google_call_with_retry(lambda: ws.get_all_values())
 
         for i, row in enumerate(rows[1:], start=2):
             row_order = str(row[4] if len(row) > 4 else "").strip()
@@ -1870,7 +1984,7 @@ def process_bonus_reminders():
     а просто нагадуємо про наявний бонусний рахунок.
     """
     try:
-        rows = get_bonus_worksheet().get_all_values()
+        rows = get_values("Бонуси")
         notified = set()
         sent = 0
 
@@ -1922,7 +2036,7 @@ def get_clients_worksheet():
 def get_client_row(chat_id):
     try:
         ws = get_clients_worksheet()
-        rows = ws.get_all_values()
+        rows = google_call_with_retry(lambda: ws.get_all_values())
 
         for i, row in enumerate(rows[1:], start=2):
             if len(row) > 0 and str(row[0]).strip() == str(chat_id).strip():
@@ -2071,7 +2185,7 @@ def ensure_headers(ws, headers):
     не ламаючи вже існуючі колонки.
     """
     try:
-        values = ws.get_all_values()
+        values = google_call_with_retry(lambda: ws.get_all_values())
         if not values:
             ws.append_row(headers, value_input_option="USER_ENTERED")
             return
@@ -2153,7 +2267,7 @@ def get_broadcast_client_ids():
     """
     ids = []
     try:
-        rows = get_users_worksheet().get_all_values()[1:]
+        rows = get_values("Користувачі")[1:]
         for row in rows:
             telegram_id = str(row[0] if len(row) > 0 else "").strip()
             if telegram_id and telegram_id not in ids:
@@ -2256,7 +2370,7 @@ def process_marketing_broadcasts():
     За один запуск бере обмежену кількість розсилок, щоб не було спаму.
     """
     ws = get_marketing_worksheet()
-    rows = ws.get_all_values()
+    rows = google_call_with_retry(lambda: ws.get_all_values())
     if not rows:
         return 0
 
@@ -2309,7 +2423,7 @@ def process_marketing_broadcasts():
 
 def sale_product_already_broadcasted(product_id):
     try:
-        rows = get_sale_broadcasts_worksheet().get_all_values()[1:]
+        rows = get_values("Надіслані акції")[1:]
         for row in rows:
             if str(row[1] if len(row) > 1 else "").strip() == str(product_id).strip():
                 return True
@@ -2388,7 +2502,7 @@ def process_inactive_clients_reminders():
 
     ws = get_users_worksheet()
     ensure_headers(ws, headers_needed)
-    rows = ws.get_all_values()
+    rows = google_call_with_retry(lambda: ws.get_all_values())
     if not rows:
         return 0
 
@@ -2446,7 +2560,7 @@ def get_auto_product_broadcasts_worksheet():
 def auto_product_broadcast_sent_today():
     today = datetime.now().strftime("%d.%m.%Y")
     try:
-        rows = get_auto_product_broadcasts_worksheet().get_all_values()[1:]
+        rows = get_values("Надіслані товари дня")[1:]
         for row in rows:
             sent_date = str(row[0] if len(row) > 0 else "").strip()
             status = str(row[3] if len(row) > 3 else "").strip().lower()
@@ -2460,7 +2574,7 @@ def auto_product_broadcast_sent_today():
 def get_auto_broadcasted_product_ids():
     ids = set()
     try:
-        rows = get_auto_product_broadcasts_worksheet().get_all_values()[1:]
+        rows = get_values("Надіслані товари дня")[1:]
         for row in rows:
             product_id = str(row[1] if len(row) > 1 else "").strip()
             status = str(row[3] if len(row) > 3 else "").strip().lower()
