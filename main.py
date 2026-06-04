@@ -3532,19 +3532,84 @@ def start_order(chat_id):
 
     send_message(chat_id, "Введіть, будь ласка, Ваше ПІБ:")
 
+def is_menu_or_catalog_text(text):
+    text = str(text or "").strip()
+    if not text:
+        return False
+
+    main_buttons = [
+        "/start",
+        "/myid",
+        "⬅️ Назад",
+        "📦 Каталог",
+        "🔥 Акції",
+        "🛒 Кошик",
+        "📦 Мої замовлення",
+        "🎁 Мої бонуси",
+        "👥 Реферальна програма",
+        "📞 Зв’язатися з менеджером",
+        "🚚 Доставка і оплата",
+        "👑 Кабінет",
+    ]
+
+    if text in main_buttons:
+        return True
+
+    # Кнопки каталогу часто починаються з emoji або службових префіксів.
+    # Їх не можна записувати як ПІБ або телефон у заявці.
+    blocked_starts = ["📁", "📂", "▫️", "🏠", "💄", "💇", "🦷", "💆", "👙", "🌸", "💎", "👜", "✨"]
+    return any(text.startswith(prefix) for prefix in blocked_starts)
+
+
+def looks_like_phone(text):
+    text = str(text or "").strip()
+    digits = "".join(ch for ch in text if ch.isdigit())
+    return len(digits) >= 7
+
+
+def looks_like_name(text):
+    text = str(text or "").strip()
+    if len(text) < 2:
+        return False
+    if is_menu_or_catalog_text(text):
+        return False
+    digits = sum(1 for ch in text if ch.isdigit())
+    letters = sum(1 for ch in text if ch.isalpha())
+    return letters >= 2 and digits == 0
+
+
 def handle_contact_state(chat_id, text, user):
     state = USER_STATES.get(str(chat_id))
 
     if not state:
         return False
 
-    if state.get("step") == "contact_waiting_full_name":
+    step = state.get("step")
+    if step not in ["contact_waiting_full_name", "contact_waiting_phone"]:
+        return False
+
+    # Якщо людина під час заявки натиснула кнопку меню/каталогу —
+    # не записуємо це як ПІБ або телефон, а скасовуємо заявку і даємо обробити кнопку далі.
+    if is_menu_or_catalog_text(text):
+        USER_STATES.pop(str(chat_id), None)
+        return False
+
+    if step == "contact_waiting_full_name":
+        if not looks_like_name(text):
+            send_message(chat_id, "Введіть, будь ласка, Ваше ПІБ текстом. Наприклад: Іваненко Іван")
+            return True
+
         state["contact_full_name"] = text.strip()
         state["step"] = "contact_waiting_phone"
+        USER_STATES[str(chat_id)] = state
         send_message(chat_id, "Введіть, будь ласка, Ваш номер телефону:")
         return True
 
-    if state.get("step") == "contact_waiting_phone":
+    if step == "contact_waiting_phone":
+        if not looks_like_phone(text):
+            send_message(chat_id, "Введіть, будь ласка, коректний номер телефону. Наприклад: +380XXXXXXXXX")
+            return True
+
         state["contact_phone"] = text.strip()
         finish_contact_request(chat_id, user, state)
         USER_STATES.pop(str(chat_id), None)
