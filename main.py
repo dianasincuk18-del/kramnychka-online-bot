@@ -1208,15 +1208,33 @@ def register_user_activity(chat_id, user=None):
                 USER_ACTIVITY_CACHE[telegram_id] = datetime.now()
                 return False
 
-        google_call_with_retry(lambda: ws.append_row([
-            telegram_id,
-            username,
-            first_name,
-            last_name,
-            now,
-            now,
-            1
-        ], value_input_option="USER_ENTERED"))
+        # ВАЖЛИВО:
+        # Не використовуємо append_row для листа "Користувачі",
+        # бо Google Sheets іноді бачить окрему "таблицю" праворуч
+        # і додає нового користувача не в A:G, а в I:O.
+        # Тому знаходимо наступний вільний рядок саме по колонках A:G
+        # і записуємо дані чітко в діапазон A:G.
+        last_user_row = 1
+        for row_index, row in enumerate(rows[1:], start=2):
+            left_part = row[:7]
+            if any(str(cell).strip() for cell in left_part):
+                last_user_row = row_index
+
+        next_row = last_user_row + 1
+
+        google_call_with_retry(lambda: ws.update(
+            f"A{next_row}:G{next_row}",
+            [[
+                telegram_id,
+                username,
+                first_name,
+                last_name,
+                now,
+                now,
+                1
+            ]],
+            value_input_option="USER_ENTERED"
+        ))
         clear_cache("Користувачі")
         USER_ACTIVITY_CACHE[telegram_id] = datetime.now()
         return True
