@@ -3600,6 +3600,7 @@ def show_cart(chat_id, callback_message=None):
     if available_bonuses:
         text += (
             f"\n\n🎁 Ваші бонуси: <b>{available_bonuses}</b>"
+            f"\n💰 Бонусами можна оплатити до <b>{int(BONUS_MAX_USE_PERCENT)}%</b> суми замовлення."
             f"\nМожна списати в цьому замовленні: <b>{max_bonus_to_use} грн</b>"
         )
         if bonus_used:
