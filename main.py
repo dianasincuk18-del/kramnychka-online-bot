@@ -1284,6 +1284,7 @@ def show_clients_stats(chat_id, callback_message=None):
 
 BONUS_RATE_UAH = 1
 WELCOME_BONUS_AMOUNT = float(os.environ.get("WELCOME_BONUS_AMOUNT", "100"))
+WELCOME_BONUS_BROADCAST_LIMIT_PER_RUN = int(os.environ.get("WELCOME_BONUS_BROADCAST_LIMIT_PER_RUN", "30"))
 REFERRAL_BONUS_AMOUNT = int(os.environ.get("REFERRAL_BONUS_AMOUNT", "50"))
 REFERRAL_MIN_ORDER_SUM = float(os.environ.get("REFERRAL_MIN_ORDER_SUM", "500"))
 BONUS_MAX_USE_PERCENT = float(os.environ.get("BONUS_MAX_USE_PERCENT", "30"))
@@ -1411,17 +1412,34 @@ def spend_bonuses(chat_id, amount, order_row_index="", comment="Списання
     )
 
 
+def welcome_bonus_message_text():
+    return (
+        "🎁 <b>Вітаємо!</b>\n\n"
+        "Ми оновили бонусну програму нашої крамнички 💛\n\n"
+        "На знак подяки кожному клієнту та всім новим користувачам ми нараховуємо "
+        f"<b>{int(WELCOME_BONUS_AMOUNT)} вітальних бонусів</b>.\n\n"
+        f"🎁 Ваш бонусний рахунок уже поповнено на <b>{int(WELCOME_BONUS_AMOUNT)} бонусів</b>.\n\n"
+        "1 бонус = 1 грн.\n\n"
+        f"💰 Бонусами можна оплатити до <b>{int(BONUS_MAX_USE_PERCENT)}%</b> суми замовлення.\n\n"
+        "🛍 Завітайте до каталогу та оберіть щось для себе — бонуси вже чекають на використання!\n\n"
+        "Бажаємо приємних покупок 💛"
+    )
+
+
 def welcome_bonus_already_added(chat_id):
     """
-    Перевіряємо, чи вже нараховували клієнту бонус за перший вхід.
-    Це захищає від повторного нарахування при повторному /start.
+    Перевіряємо, чи вже нараховували клієнту вітальний бонус.
+    Враховуємо і бонус за перший вхід, і одноразову акційну розсилку.
     """
     try:
         rows = get_values("Бонуси")
         for row in rows[1:]:
             telegram_id = str(row[1] if len(row) > 1 else "").strip()
             transaction_type = str(row[2] if len(row) > 2 else "").strip().lower()
-            if telegram_id == str(chat_id).strip() and transaction_type == "бонус за перший вхід":
+            if telegram_id == str(chat_id).strip() and transaction_type in [
+                "бонус за перший вхід",
+                "акційний вітальний бонус"
+            ]:
                 return True
     except Exception as e:
         print("welcome_bonus_already_added error:", e)
@@ -1453,17 +1471,54 @@ def grant_welcome_bonus(chat_id, only_if_new=True):
 
         send_message(
             chat_id,
-            "🎁 <b>Вітаємо у нашій крамничці!</b>\n\n"
-            f"Ми нарахували Вам <b>{int(WELCOME_BONUS_AMOUNT)} бонусів</b> за перший вхід 💛\n\n"
-            "1 бонус = 1 грн\n"
-            f"Бонусами можна оплатити до <b>{int(BONUS_MAX_USE_PERCENT)}%</b> суми замовлення.\n"
-            f"Термін дії бонусів: <b>{BONUS_VALID_DAYS} днів</b>."
+            welcome_bonus_message_text()
         )
         return True
 
     except Exception as e:
         print("grant_welcome_bonus error:", e)
         return False
+
+
+def process_welcome_bonus_broadcast():
+    """
+    Одноразово нараховує 100 вітальних бонусів усім користувачам з листа "Користувачі".
+    Повторно одному й тому самому клієнту бонус не нараховується.
+    За один запуск обробляємо обмежену кількість клієнтів, щоб не впертися в ліміти Telegram/Google.
+    """
+    try:
+        users_rows = get_values("Користувачі")[1:]
+    except Exception as e:
+        print("process_welcome_bonus_broadcast users error:", e)
+        return 0
+
+    sent_count = 0
+
+    for row in users_rows:
+        if sent_count >= WELCOME_BONUS_BROADCAST_LIMIT_PER_RUN:
+            break
+
+        chat_id = str(row[0] if len(row) > 0 else "").strip()
+        if not chat_id:
+            continue
+
+        if welcome_bonus_already_added(chat_id):
+            continue
+
+        add_bonus_transaction(
+            chat_id=chat_id,
+            amount=WELCOME_BONUS_AMOUNT,
+            transaction_type="Акційний вітальний бонус",
+            comment="Бонус за оновлення бонусної програми",
+            order_row_index="",
+            status="Активний",
+            expires_at=bonus_expiry_date()
+        )
+
+        send_message(chat_id, welcome_bonus_message_text())
+        sent_count += 1
+
+    return sent_count
 
 
 def register_referral_from_start(chat_id, referrer_id):
@@ -4957,6 +5012,21 @@ def webhook():
 
     return "ok"
 
+
+
+@app.route("/welcome-bonus-broadcast", methods=["GET", "POST"])
+def welcome_bonus_broadcast_endpoint():
+    token = request.args.get("token", "")
+
+    if CRON_SECRET and token != CRON_SECRET:
+        return "Forbidden", 403
+
+    try:
+        sent_count = process_welcome_bonus_broadcast()
+        return f"Welcome bonuses added: {sent_count}"
+    except Exception as e:
+        print("welcome_bonus_broadcast_endpoint error:", e)
+        return "Welcome bonus broadcast error", 500
 
 
 @app.route("/bonus-reminders", methods=["GET", "POST"])
