@@ -880,15 +880,53 @@ def edit_media_photo(chat_id, message_id, photo_url, caption, keyboard=None):
 
 
 
-def answer_callback(callback_id):
+def answer_callback(callback_id, text=None, show_alert=False):
     try:
+        payload = {"callback_query_id": callback_id}
+        if text:
+            payload["text"] = str(text)[:200]
+            payload["show_alert"] = bool(show_alert)
+
         requests.post(
             f"{BASE_URL}/answerCallbackQuery",
-            json={"callback_query_id": callback_id},
+            json=payload,
             timeout=15
         )
     except Exception as e:
         print("answer_callback error:", e)
+
+
+def callback_loading_text(data_value):
+    data_value = str(data_value or "")
+
+    if data_value.startswith("photo_") or data_value.startswith("more_photos_"):
+        return "📸 Завантажуємо фото..."
+    if data_value.startswith("products_page_") or data_value.startswith("catpage_"):
+        return "📦 Завантажуємо товари..."
+    if data_value.startswith("sale_page_"):
+        return "🔥 Завантажуємо акцію..."
+    if data_value.startswith("add_one_"):
+        return "🛒 Додаємо товар у кошик..."
+    if data_value.startswith("cart_plus_") or data_value.startswith("cart_minus_") or data_value.startswith("cart_qty_"):
+        return "🛒 Оновлюємо кошик..."
+    if data_value.startswith("promo_product_"):
+        return "🛍 Завантажуємо товар..."
+    if data_value in ["open_catalog", "add_more_products"]:
+        return "📦 Відкриваємо каталог..."
+    if data_value in ["open_cart", "continue_checkout"]:
+        return "🛒 Завантажуємо кошик..."
+    if data_value in ["bonus_use", "bonus_disable", "open_bonus_cabinet"]:
+        return "🎁 Оновлюємо бонуси..."
+    if data_value.startswith("delivery_"):
+        return "🚚 Обираємо доставку..."
+    if data_value.startswith("payment_"):
+        return "💳 Обираємо оплату..."
+    if data_value.startswith("admin_") or data_value.startswith("set_status_") or data_value.startswith("mark_"):
+        return "👑 Оновлюємо кабінет..."
+    if data_value.startswith("contact_"):
+        return "📞 Завантажуємо заявки..."
+
+    return "⏳ Обробляємо Ваш запит..."
 
 
 def main_menu(is_admin=False):
@@ -4749,7 +4787,7 @@ def webhook():
         elif text == "👥 Реферальна програма":
             with_loading(chat_id, "👥 Завантажуємо умови реферальної програми...", show_referral_program, chat_id)
         elif text == "📞 Зв’язатися з менеджером":
-            contact_manager(chat_id, user)
+            with_loading(chat_id, "📞 Відкриваємо форму звернення до менеджера...", contact_manager, chat_id, user)
         elif text == "🚚 Доставка і оплата":
             with_loading(chat_id, "🚚 Завантажуємо інформацію про доставку та оплату...", show_delivery_payment, chat_id)
         elif text == "👑 Кабінет":
@@ -4768,7 +4806,7 @@ def webhook():
         register_user_activity(chat_id, user)
 
         if callback_id:
-            answer_callback(callback_id)
+            answer_callback(callback_id, callback_loading_text(data_value))
 
         if data_value.startswith("photo_"):
             # Формат: photo_productindex_photoindex
