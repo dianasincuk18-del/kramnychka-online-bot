@@ -1140,7 +1140,7 @@ def register_user_activity(chat_id, user=None):
         telegram_id = str(chat_id).strip()
         last_activity = USER_ACTIVITY_CACHE.get(telegram_id)
         if last_activity and (datetime.now() - last_activity).total_seconds() < USER_ACTIVITY_THROTTLE_SECONDS:
-            return
+            return False
 
         ws = get_users_worksheet()
         rows = google_call_with_retry(lambda: ws.get_all_values())
@@ -1168,7 +1168,7 @@ def register_user_activity(chat_id, user=None):
                 google_call_with_retry(lambda: ws.update_cell(i, 7, visits + 1))
                 clear_cache("Користувачі")
                 USER_ACTIVITY_CACHE[telegram_id] = datetime.now()
-                return
+                return False
 
         google_call_with_retry(lambda: ws.append_row([
             telegram_id,
@@ -1181,9 +1181,11 @@ def register_user_activity(chat_id, user=None):
         ], value_input_option="USER_ENTERED"))
         clear_cache("Користувачі")
         USER_ACTIVITY_CACHE[telegram_id] = datetime.now()
+        return True
 
     except Exception as e:
         print("register_user_activity error:", e)
+        return False
 
 
 def parse_bot_datetime(value):
@@ -1281,9 +1283,10 @@ def show_clients_stats(chat_id, callback_message=None):
 # =========================
 
 BONUS_RATE_UAH = 1
+WELCOME_BONUS_AMOUNT = float(os.environ.get("WELCOME_BONUS_AMOUNT", "100"))
 REFERRAL_BONUS_AMOUNT = int(os.environ.get("REFERRAL_BONUS_AMOUNT", "50"))
 REFERRAL_MIN_ORDER_SUM = float(os.environ.get("REFERRAL_MIN_ORDER_SUM", "500"))
-BONUS_MAX_USE_PERCENT = float(os.environ.get("BONUS_MAX_USE_PERCENT", "20"))
+BONUS_MAX_USE_PERCENT = float(os.environ.get("BONUS_MAX_USE_PERCENT", "30"))
 BONUS_VALID_DAYS = int(os.environ.get("BONUS_VALID_DAYS", "60"))
 
 
@@ -1406,6 +1409,61 @@ def spend_bonuses(chat_id, amount, order_row_index="", comment="Списання
         status="Списано",
         expires_at=""
     )
+
+
+def welcome_bonus_already_added(chat_id):
+    """
+    Перевіряємо, чи вже нараховували клієнту бонус за перший вхід.
+    Це захищає від повторного нарахування при повторному /start.
+    """
+    try:
+        rows = get_values("Бонуси")
+        for row in rows[1:]:
+            telegram_id = str(row[1] if len(row) > 1 else "").strip()
+            transaction_type = str(row[2] if len(row) > 2 else "").strip().lower()
+            if telegram_id == str(chat_id).strip() and transaction_type == "бонус за перший вхід":
+                return True
+    except Exception as e:
+        print("welcome_bonus_already_added error:", e)
+
+    return False
+
+
+def grant_welcome_bonus(chat_id, only_if_new=True):
+    """
+    Нараховує 100 бонусів за перший вхід у бот.
+    За замовчуванням працює тільки для нових користувачів.
+    """
+    try:
+        if only_if_new is False:
+            return False
+
+        if welcome_bonus_already_added(chat_id):
+            return False
+
+        add_bonus_transaction(
+            chat_id=chat_id,
+            amount=WELCOME_BONUS_AMOUNT,
+            transaction_type="Бонус за перший вхід",
+            comment="Вітальний бонус за перший вхід у бот",
+            order_row_index="",
+            status="Активний",
+            expires_at=bonus_expiry_date()
+        )
+
+        send_message(
+            chat_id,
+            "🎁 <b>Вітаємо у нашій крамничці!</b>\n\n"
+            f"Ми нарахували Вам <b>{int(WELCOME_BONUS_AMOUNT)} бонусів</b> за перший вхід 💛\n\n"
+            "1 бонус = 1 грн\n"
+            f"Бонусами можна оплатити до <b>{int(BONUS_MAX_USE_PERCENT)}%</b> суми замовлення.\n"
+            f"Термін дії бонусів: <b>{BONUS_VALID_DAYS} днів</b>."
+        )
+        return True
+
+    except Exception as e:
+        print("grant_welcome_bonus error:", e)
+        return False
 
 
 def register_referral_from_start(chat_id, referrer_id):
@@ -4581,7 +4639,7 @@ def webhook():
         chat_id = message["chat"]["id"]
         text = message.get("text", "")
         user = message.get("from", {})
-        register_user_activity(chat_id, user)
+        is_new_user = register_user_activity(chat_id, user)
 
         if handle_payment_receipt(chat_id, message):
             return "ok"
@@ -4592,6 +4650,7 @@ def webhook():
             parts = text.split(maxsplit=1)
             if len(parts) > 1 and parts[1].startswith("ref_"):
                 register_referral_from_start(chat_id, parts[1].replace("ref_", "").strip())
+            grant_welcome_bonus(chat_id, only_if_new=is_new_user)
             with_loading(chat_id, "🌸 Раді бачити Вас у нашій крамничці!\n\n⏳ Завантажуємо меню для Вас...", start, chat_id)
         elif text == "/myid":
             show_my_id(chat_id)
