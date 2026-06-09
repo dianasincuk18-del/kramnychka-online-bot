@@ -6,6 +6,7 @@ import time
 from flask import Flask, request
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
@@ -18,6 +19,16 @@ CRON_SECRET = os.environ.get("CRON_SECRET", "")
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 USER_STATES = {}
+
+# =========================
+# TIMEZONE
+# =========================
+# Render/server time can be UTC, тому всі дати та перевірки часу
+# рахуємо в київському часовому поясі.
+KYIV_TZ = ZoneInfo(os.environ.get("BOT_TIMEZONE", "Europe/Kyiv"))
+
+def current_time():
+    return datetime.now(KYIV_TZ)
 
 
 # =========================
@@ -56,7 +67,7 @@ def cache_get(bucket, key):
     if not created_at:
         return None
 
-    age = (datetime.now() - created_at).total_seconds()
+    age = (current_time() - created_at).total_seconds()
     if age > CACHE_TTL_SECONDS:
         try:
             del CACHE[bucket][key]
@@ -69,7 +80,7 @@ def cache_get(bucket, key):
 
 def cache_set(bucket, key, data):
     CACHE.setdefault(bucket, {})[key] = {
-        "created_at": datetime.now(),
+        "created_at": current_time(),
         "data": data
     }
     return data
@@ -124,7 +135,7 @@ def get_cached_worksheet(sheet_name):
     if (
         sheet is None
         or created_at is None
-        or (datetime.now() - created_at).total_seconds() > SHEET_CONNECTION_TTL_SECONDS
+        or (current_time() - created_at).total_seconds() > SHEET_CONNECTION_TTL_SECONDS
     ):
         # Оновлюємо підключення до всієї таблиці.
         creds_dict = json.loads(GOOGLE_CREDS_JSON)
@@ -137,7 +148,7 @@ def get_cached_worksheet(sheet_name):
         sheet = google_call_with_retry(lambda: client.open_by_key(SHEET_ID))
 
         SHEET_CONNECTION_CACHE["sheet"] = sheet
-        SHEET_CONNECTION_CACHE["created_at"] = datetime.now()
+        SHEET_CONNECTION_CACHE["created_at"] = current_time()
         SHEET_CONNECTION_CACHE["worksheets"] = {}
 
     worksheets = SHEET_CONNECTION_CACHE.setdefault("worksheets", {})
@@ -187,7 +198,7 @@ def get_sheet():
     if (
         sheet is not None
         and created_at is not None
-        and (datetime.now() - created_at).total_seconds() <= SHEET_CONNECTION_TTL_SECONDS
+        and (current_time() - created_at).total_seconds() <= SHEET_CONNECTION_TTL_SECONDS
     ):
         return sheet
 
@@ -202,7 +213,7 @@ def get_sheet():
     client = gspread.authorize(creds)
     sheet = google_call_with_retry(lambda: client.open_by_key(SHEET_ID))
 
-    SHEET_CONNECTION_CACHE["created_at"] = datetime.now()
+    SHEET_CONNECTION_CACHE["created_at"] = current_time()
     SHEET_CONNECTION_CACHE["sheet"] = sheet
     SHEET_CONNECTION_CACHE["worksheets"] = {}
 
@@ -364,6 +375,11 @@ CART_BASE_HEADERS = [
     "Нагадування 3"
 ]
 
+# Щоб клієнтам не прилітали нагадування вночі.
+# За замовчуванням надсилаємо тільки з 10:00 до 20:59 за Києвом.
+CART_REMINDER_MIN_HOUR = int(os.environ.get("CART_REMINDER_MIN_HOUR", "10"))
+CART_REMINDER_MAX_HOUR = int(os.environ.get("CART_REMINDER_MAX_HOUR", "21"))
+
 
 def get_cart_worksheet():
     """
@@ -400,7 +416,7 @@ def get_cart_worksheet():
 
 
 def now_str():
-    return datetime.now().strftime("%d.%m.%Y %H:%M")
+    return current_time().strftime("%d.%m.%Y %H:%M")
 
 
 def update_cart_reminder_columns(row_index, updated_at=None, reminder1=None, reminder2=None, reminder3=None):
@@ -496,7 +512,7 @@ def get_cart_rows_grouped_by_user():
         else:
             # Старі рядки без дати не спамимо одразу — ставимо поточну дату.
             update_cart_reminder_columns(row_index, updated_at=now_str(), reminder1="", reminder2="", reminder3="")
-            grouped[telegram_id]["updated_dates"].append(datetime.now())
+            grouped[telegram_id]["updated_dates"].append(current_time())
 
         if not str(reminder1).strip():
             grouped[telegram_id]["reminder1_sent"] = False
@@ -513,9 +529,15 @@ def process_cart_reminders():
     Запускається через окремий URL /cart-reminders.
     Надсилає максимум одне нагадування одному клієнту за один запуск,
     щоб не засипати повідомленнями, якщо бот довго не перевіряв кошики.
+    Також не надсилає повідомлення вночі за київським часом.
     """
+    now = current_time()
+
+    if now.hour < CART_REMINDER_MIN_HOUR or now.hour >= CART_REMINDER_MAX_HOUR:
+        print(f"cart reminders skipped by Kyiv quiet hours: {now_str()}")
+        return 0
+
     grouped = get_cart_rows_grouped_by_user()
-    now = datetime.now()
     sent_count = 0
 
     for telegram_id, data in grouped.items():
@@ -624,7 +646,7 @@ def append_payment_receipt(chat_id, full_name, order_row_index, file_id, file_ty
     headers = ["Дата", "Telegram ID", "ПІБ", "Рядок замовлення", "Тип файлу", "File ID", "Коментар", "Статус"]
     ws = get_or_create_worksheet("Квитанції", headers)
     ws.append_row([
-        datetime.now().strftime("%d.%m.%Y %H:%M"),
+        current_time().strftime("%d.%m.%Y %H:%M"),
         chat_id,
         full_name,
         order_row_index,
@@ -1278,13 +1300,13 @@ def register_user_activity(chat_id, user=None):
         user = user or {}
         telegram_id = str(chat_id).strip()
         last_activity = USER_ACTIVITY_CACHE.get(telegram_id)
-        if last_activity and (datetime.now() - last_activity).total_seconds() < USER_ACTIVITY_THROTTLE_SECONDS:
+        if last_activity and (current_time() - last_activity).total_seconds() < USER_ACTIVITY_THROTTLE_SECONDS:
             return False
 
         ws = get_users_worksheet()
         rows = google_call_with_retry(lambda: ws.get_all_values())
 
-        now = datetime.now().strftime("%d.%m.%Y %H:%M")
+        now = current_time().strftime("%d.%m.%Y %H:%M")
         username = str(user.get("username", "") or "").strip()
         first_name = str(user.get("first_name", "") or "").strip()
         last_name = str(user.get("last_name", "") or "").strip()
@@ -1306,7 +1328,7 @@ def register_user_activity(chat_id, user=None):
                 google_call_with_retry(lambda: ws.update_cell(i, 6, now))
                 google_call_with_retry(lambda: ws.update_cell(i, 7, visits + 1))
                 clear_cache("Користувачі")
-                USER_ACTIVITY_CACHE[telegram_id] = datetime.now()
+                USER_ACTIVITY_CACHE[telegram_id] = current_time()
                 return False
 
         # ВАЖЛИВО:
@@ -1337,7 +1359,7 @@ def register_user_activity(chat_id, user=None):
             value_input_option="USER_ENTERED"
         ))
         clear_cache("Користувачі")
-        USER_ACTIVITY_CACHE[telegram_id] = datetime.now()
+        USER_ACTIVITY_CACHE[telegram_id] = current_time()
         return True
 
     except Exception as e:
@@ -1350,7 +1372,8 @@ def parse_bot_datetime(value):
 
     for fmt in ["%d.%m.%Y %H:%M", "%d.%m.%Y"]:
         try:
-            return datetime.strptime(value, fmt)
+            parsed = datetime.strptime(value, fmt)
+            return parsed.replace(tzinfo=KYIV_TZ)
         except:
             pass
 
@@ -1365,7 +1388,7 @@ def get_clients_monitoring_stats():
         users_rows = []
 
     orders = get_orders_with_rows()
-    now = datetime.now()
+    now = current_time()
     today_prefix = now.strftime("%d.%m.%Y")
     month_part = now.strftime(".%m.%Y")
 
@@ -1479,7 +1502,7 @@ def get_referrals_worksheet():
 
 def bonus_expiry_date():
     from datetime import timedelta
-    return (datetime.now() + timedelta(days=BONUS_VALID_DAYS)).strftime("%d.%m.%Y")
+    return (current_time() + timedelta(days=BONUS_VALID_DAYS)).strftime("%d.%m.%Y")
 
 
 def get_bonus_rows():
@@ -1498,7 +1521,7 @@ def get_available_bonus_balance(chat_id):
     Прострочені бонуси не враховуємо.
     """
     rows = get_bonus_rows()
-    today = datetime.now().date()
+    today = current_time().date()
     balance = 0
 
     for row in rows[1:]:
@@ -2337,7 +2360,7 @@ def get_client_discount_percent(chat_id):
 def upsert_client_discount(chat_id, full_name="", phone="", discount_percent=NEXT_ORDER_DISCOUNT_PERCENT, active="Так"):
     try:
         ws, row_index, row = get_client_row(chat_id)
-        date_now = datetime.now().strftime("%d.%m.%Y %H:%M")
+        date_now = current_time().strftime("%d.%m.%Y %H:%M")
 
         if row_index:
             ws.update_cell(row_index, 2, full_name or (row[1] if len(row) > 1 else ""))
@@ -2453,9 +2476,10 @@ SALE_BROADCAST_LIMIT_PER_RUN = int(os.environ.get("SALE_BROADCAST_LIMIT_PER_RUN"
 # DAILY SOFT REMINDERS
 # =========================
 # Легкі повідомлення "настрій дня", щоб нагадувати про магазин без спаму.
-# За замовчуванням: Пн/Ср/Пт/Нд, після 10:00, не більше 1 разу на день.
+# За замовчуванням: Пн/Ср/Пт/Нд, з 10:00 до 20:59, не більше 1 разу на день.
 DAILY_REMINDER_DAYS_OF_WEEK = os.environ.get("DAILY_REMINDER_DAYS_OF_WEEK", "1,3,5,7")
 DAILY_REMINDER_MIN_HOUR = int(os.environ.get("DAILY_REMINDER_MIN_HOUR", "10"))
+DAILY_REMINDER_MAX_HOUR = int(os.environ.get("DAILY_REMINDER_MAX_HOUR", "21"))
 DAILY_REMINDER_LIMIT_PER_RUN = int(os.environ.get("DAILY_REMINDER_LIMIT_PER_RUN", "1"))
 
 DEFAULT_DAILY_MESSAGES = [
@@ -2586,15 +2610,19 @@ def daily_reminders_allowed_today():
             if str(x).strip().isdigit()
         ]
     except Exception:
-        allowed_days = [1, 3, 5]
+        allowed_days = [1, 3, 5, 7]
+
+    now = current_time()
 
     # isoweekday: понеділок=1 ... неділя=7
-    today_day = datetime.now().isoweekday()
+    today_day = now.isoweekday()
 
     if allowed_days and today_day not in allowed_days:
+        print(f"daily reminders skipped by weekday: {now_str()}")
         return False
 
-    if datetime.now().hour < DAILY_REMINDER_MIN_HOUR:
+    if now.hour < DAILY_REMINDER_MIN_HOUR or now.hour >= DAILY_REMINDER_MAX_HOUR:
+        print(f"daily reminders skipped by Kyiv send window: {now_str()}")
         return False
 
     return True
@@ -2603,7 +2631,7 @@ def daily_reminders_allowed_today():
 def daily_reminder_sent_today():
     try:
         rows = get_values("Надіслані повідомлення дня")[1:]
-        today_prefix = datetime.now().strftime("%d.%m.%Y")
+        today_prefix = current_time().strftime("%d.%m.%Y")
         for row in rows:
             sent_date = str(row[0] if len(row) > 0 else "").strip()
             status = str(row[4] if len(row) > 4 else "").strip().lower()
@@ -2898,7 +2926,7 @@ def process_marketing_broadcasts():
         return 0
 
     headers = rows[0]
-    today = datetime.now().date()
+    today = current_time().date()
     sent_campaigns = 0
 
     for row_index, row in enumerate(rows[1:], start=2):
@@ -3030,7 +3058,7 @@ def process_inactive_clients_reminders():
         return 0
 
     headers = rows[0]
-    now_dt = datetime.now()
+    now_dt = current_time()
     sent = 0
 
     for row_index, row in enumerate(rows[1:], start=2):
@@ -3081,7 +3109,7 @@ def get_auto_product_broadcasts_worksheet():
 
 
 def auto_product_broadcast_sent_today():
-    today = datetime.now().strftime("%d.%m.%Y")
+    today = current_time().strftime("%d.%m.%Y")
     try:
         rows = get_values("Надіслані товари дня")[1:]
         for row in rows:
@@ -4305,7 +4333,7 @@ def finish_order(chat_id, user, need_contact, callback_message=None):
     for item in cart:
         products_text.append(format_cart_item_for_order(item))
 
-    order_date = datetime.now().strftime("%d.%m.%Y %H:%M")
+    order_date = current_time().strftime("%d.%m.%Y %H:%M")
     full_name = state.get("full_name", "")
     phone = state.get("phone", "")
     address = state.get("address", "")
@@ -4504,7 +4532,7 @@ def contact_manager(chat_id, user):
 
 
 def finish_contact_request(chat_id, user, state):
-    request_date = datetime.now().strftime("%d.%m.%Y %H:%M")
+    request_date = current_time().strftime("%d.%m.%Y %H:%M")
     full_name = state.get("contact_full_name", "")
     phone = state.get("contact_phone", "")
 
@@ -4958,7 +4986,7 @@ def show_summary(chat_id, period="today", callback_message=None):
     if not is_admin(chat_id):
         return
 
-    now = datetime.now()
+    now = current_time()
     orders = get_orders_with_rows()
     contact_requests = get_contact_requests_with_rows()
 
