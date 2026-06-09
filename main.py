@@ -1070,6 +1070,107 @@ def safe_float(value, default=0):
         return float(default or 0)
 
 
+def safe_int(value, default=0):
+    try:
+        return int(float(str(value or default).replace(",", ".")))
+    except:
+        return int(default or 0)
+
+
+def normalize_sale_text(value):
+    return str(value or "").strip()
+
+
+def get_product_sale_text(product):
+    if not product:
+        return ""
+    return normalize_sale_text(product.get("Акція") or product.get("Акція 1=2") or product.get("Тип акції") or "")
+
+
+def parse_promo_deal(sale_text):
+    """
+    Повертає умови акції для кошика.
+    1=2      → клієнт отримує 2 шт, платить за 1
+    1+1=3    → клієнт отримує 3 шт, платить за 2
+    """
+    original = normalize_sale_text(sale_text)
+    compact = original.lower().replace(" ", "")
+    compact = compact.replace("акція", "")
+
+    if "1+1=3" in compact or "1+1+1" in compact:
+        return {
+            "label": original or "Акція 1+1=3",
+            "paid_qty": 2,
+            "receive_qty": 3
+        }
+
+    if "1=2" in compact or "1+1" in compact:
+        return {
+            "label": original or "Акція 1=2",
+            "paid_qty": 1,
+            "receive_qty": 2
+        }
+
+    return None
+
+
+def get_product_promo_deal(product):
+    return parse_promo_deal(get_product_sale_text(product))
+
+
+def get_cart_item_product(item):
+    product_id = item.get("product_id") or item.get("ID товару") or item.get("id") or ""
+    if product_id:
+        try:
+            return get_product_by_id(product_id)
+        except Exception:
+            pass
+    return None
+
+
+def format_cart_item_line(item):
+    name = item.get("name") or item.get("Назва товару") or "Товар"
+    product = get_cart_item_product(item)
+    promo = get_product_promo_deal(product)
+
+    price = safe_float(item.get("price") or item.get("Ціна") or 0)
+    qty = safe_int(item.get("qty") or item.get("Кількість") or 1, 1)
+    summa = safe_float(item.get("sum") or item.get("Сума") or price * qty)
+
+    if promo:
+        paid_qty = promo.get("paid_qty", 1)
+        receive_qty = promo.get("receive_qty", 1)
+        label = promo.get("label", "Акція")
+        packs = qty / receive_qty if receive_qty else qty
+        paid_units = packs * paid_qty
+
+        if abs(packs - round(packs)) < 0.001:
+            packs = int(round(packs))
+        if abs(paid_units - round(paid_units)) < 0.001:
+            paid_units = int(round(paid_units))
+
+        if label:
+            return f"• {name} ({label}) — {qty} шт. / оплата за {paid_units} шт. = <b>{summa} грн</b>\n"
+        return f"• {name} — {qty} шт. / оплата за {paid_units} шт. = <b>{summa} грн</b>\n"
+
+    return f"• {name} — {qty} шт. × {price} грн = <b>{summa} грн</b>\n"
+
+
+def format_cart_item_for_order(item):
+    name = item.get("Назва товару") or item.get("name") or "Товар"
+    product_id = item.get("ID товару") or item.get("product_id") or ""
+    product = get_product_by_id(product_id) if product_id else None
+    promo = get_product_promo_deal(product)
+    qty = safe_int(item.get("Кількість") or item.get("qty") or 1, 1)
+    summa = safe_float(item.get("Сума") or item.get("sum") or 0)
+
+    if promo:
+        label = promo.get("label", "Акція")
+        return f"{name} ({label}) x{qty} шт. = {summa} грн"
+
+    return f"{name} x{qty}"
+
+
 def back_to_main_inline():
     return {
         "inline_keyboard": [
@@ -3760,29 +3861,47 @@ def add_to_cart(chat_id, product_id, callback_message=None):
 
     name = safe_text(product.get("Назва товару"), "Товар")
     price = safe_float(product.get("Акційна ціна") or product.get("Ціна") or 0)
+    promo = get_product_promo_deal(product)
+
+    # Для акцій типу 1=2 та 1+1=3 у кошику показуємо фактичну кількість,
+    # але рахуємо суму тільки за оплачені одиниці.
+    receive_qty = int(promo.get("receive_qty", 1)) if promo else 1
+    paid_qty = int(promo.get("paid_qty", 1)) if promo else 1
+    qty_to_add = receive_qty
+    sum_to_add = round(price * paid_qty, 2)
 
     existing = find_cart_row_by_product(chat_id, product_id)
 
     if existing:
         row_index = existing["row_index"]
-        old_qty = int(float(existing["qty"] or 1))
-        new_qty = old_qty + 1
-        new_sum = price * new_qty
+        old_qty = safe_int(existing.get("qty"), 1)
+        old_sum = safe_float(existing.get("sum"), 0)
+        new_qty = old_qty + qty_to_add
+        new_sum = round(old_sum + sum_to_add, 2)
 
         update_cell("Кошик", row_index, 5, new_qty)
         update_cell("Кошик", row_index, 6, new_sum)
         update_cart_reminder_columns(row_index, updated_at=now_str(), reminder1="", reminder2="", reminder3="")
     else:
-        new_qty = 1
-        new_sum = price
+        new_qty = qty_to_add
+        new_sum = sum_to_add
         get_cart_worksheet()
         append_row("Кошик", [chat_id, product_id, name, price, new_qty, new_sum, now_str(), "", "", ""])
 
-    text = (
-        f"✅ Товар <b>{name}</b> додано в кошик.\n\n"
-        f"Кількість: <b>{new_qty} шт.</b>\n"
-        f"Сума: <b>{new_sum} грн</b>"
-    )
+    if promo:
+        promo_label = promo.get("label", "Акція")
+        text = (
+            f"✅ Товар <b>{name}</b> додано в кошик.\n\n"
+            f"🎁 Акція: <b>{promo_label}</b>\n"
+            f"Кількість у кошику: <b>{new_qty} шт.</b>\n"
+            f"До оплати за цей товар: <b>{new_sum} грн</b>"
+        )
+    else:
+        text = (
+            f"✅ Товар <b>{name}</b> додано в кошик.\n\n"
+            f"Кількість: <b>{new_qty} шт.</b>\n"
+            f"Сума: <b>{new_sum} грн</b>"
+        )
 
     keyboard = {
         "inline_keyboard": [
@@ -3818,14 +3937,13 @@ def show_cart(chat_id, callback_message=None):
     buttons = []
 
     for item in items:
-        name = item["name"]
-        price = float(item["price"] or 0)
-        qty = int(float(item["qty"] or 1))
-        summa = float(item["sum"] or price * qty)
+        price = safe_float(item.get("price") or 0)
+        qty = safe_int(item.get("qty") or 1, 1)
+        summa = safe_float(item.get("sum") or price * qty)
         row_index = item["row_index"]
 
         subtotal += summa
-        text += f"• {name} — {qty} шт. × {price} грн = <b>{summa} грн</b>\n"
+        text += format_cart_item_line(item)
 
         buttons.append([
             inline_button("➖", f"cart_minus_{row_index}"),
@@ -3903,20 +4021,31 @@ def change_cart_qty(chat_id, row_index, delta, callback_message=None):
         return
 
     try:
+        product_id = str(row[1] if len(row) > 1 else "").strip()
         price = safe_float(row[3] or 0)
-        qty = int(safe_float(row[4] or 1))
+        qty = safe_int(row[4] or 1, 1)
+        current_sum = safe_float(row[5] or 0)
     except:
+        product_id = ""
         price = 0
         qty = 1
+        current_sum = 0
 
-    new_qty = qty + int(delta)
+    product = get_product_by_id(product_id) if product_id else None
+    promo = get_product_promo_deal(product)
 
-    if new_qty <= 0:
+    receive_qty = int(promo.get("receive_qty", 1)) if promo else 1
+    paid_qty = int(promo.get("paid_qty", 1)) if promo else 1
+    qty_step = receive_qty
+    sum_step = round(price * paid_qty, 2)
+
+    new_qty = qty + int(delta) * qty_step
+    new_sum = round(current_sum + int(delta) * sum_step, 2)
+
+    if new_qty <= 0 or new_sum <= 0:
         delete_row("Кошик", row_index)
         show_cart(chat_id, callback_message)
         return
-
-    new_sum = price * new_qty
 
     update_cell("Кошик", row_index, 5, new_qty)
     update_cell("Кошик", row_index, 6, new_sum)
@@ -4174,9 +4303,7 @@ def finish_order(chat_id, user, need_contact, callback_message=None):
     products_text = []
 
     for item in cart:
-        name = item.get("Назва товару")
-        qty = int(item.get("Кількість") or 1)
-        products_text.append(f"{name} x{qty}")
+        products_text.append(format_cart_item_for_order(item))
 
     order_date = datetime.now().strftime("%d.%m.%Y %H:%M")
     full_name = state.get("full_name", "")
