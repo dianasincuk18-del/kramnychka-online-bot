@@ -2453,8 +2453,8 @@ SALE_BROADCAST_LIMIT_PER_RUN = int(os.environ.get("SALE_BROADCAST_LIMIT_PER_RUN"
 # DAILY SOFT REMINDERS
 # =========================
 # Легкі повідомлення "настрій дня", щоб нагадувати про магазин без спаму.
-# За замовчуванням: Пн/Ср/Пт, після 10:00, не більше 1 разу на день.
-DAILY_REMINDER_DAYS_OF_WEEK = os.environ.get("DAILY_REMINDER_DAYS_OF_WEEK", "1,3,5")
+# За замовчуванням: Пн/Ср/Пт/Нд, після 10:00, не більше 1 разу на день.
+DAILY_REMINDER_DAYS_OF_WEEK = os.environ.get("DAILY_REMINDER_DAYS_OF_WEEK", "1,3,5,7")
 DAILY_REMINDER_MIN_HOUR = int(os.environ.get("DAILY_REMINDER_MIN_HOUR", "10"))
 DAILY_REMINDER_LIMIT_PER_RUN = int(os.environ.get("DAILY_REMINDER_LIMIT_PER_RUN", "1"))
 
