@@ -1104,7 +1104,7 @@ def normalize_sale_text(value):
 
 
 def get_product_sale_text(product):
-    if not product:
+    if not product or not is_product_sale_active(product):
         return ""
     return normalize_sale_text(product.get("Акція") or product.get("Акція 1=2") or product.get("Тип акції") or "")
 
@@ -2785,6 +2785,112 @@ def parse_sheet_date(value):
     return None
 
 
+def get_product_sale_start(product):
+    return parse_sheet_date(
+        product.get("Акція від")
+        or product.get("Акція з")
+        or product.get("Дата початку акції")
+        or ""
+    )
+
+
+def get_product_sale_end(product):
+    return parse_sheet_date(
+        product.get("Акція до")
+        or product.get("Дата завершення акції")
+        or product.get("Дата кінця акції")
+        or ""
+    )
+
+
+def product_has_sale_period(product):
+    return bool(get_product_sale_start(product) or get_product_sale_end(product))
+
+
+def is_product_sale_active(product, today=None):
+    """
+    Акція активна тільки у вказаний період.
+    Якщо дати порожні — акція працює як постійна.
+    """
+    if not product:
+        return False
+
+    sale_text = normalize_sale_text(
+        product.get("Акція")
+        or product.get("Акція 1=2")
+        or product.get("Тип акції")
+        or ""
+    )
+    sale_price = str(product.get("Акційна ціна", "") or "").strip()
+    old_price = str(product.get("Стара ціна", "") or "").strip()
+
+    if not sale_text and not sale_price and not old_price:
+        return False
+
+    today = today or current_time().date()
+    start = get_product_sale_start(product)
+    end = get_product_sale_end(product)
+
+    if start and today < start:
+        return False
+    if end and today > end:
+        return False
+
+    return True
+
+
+def get_active_sale_price(product):
+    if is_product_sale_active(product):
+        return str(product.get("Акційна ціна", "") or "").strip()
+    return ""
+
+
+def sale_days_left(product):
+    end = get_product_sale_end(product)
+    if not end:
+        return None
+    return (end - current_time().date()).days
+
+
+def sale_period_text(product):
+    if not is_product_sale_active(product):
+        return ""
+
+    start = get_product_sale_start(product)
+    end = get_product_sale_end(product)
+    parts = []
+
+    if start:
+        parts.append(f"з {start.strftime('%d.%m.%Y')}")
+    if end:
+        parts.append(f"до {end.strftime('%d.%m.%Y')}")
+
+    if not parts:
+        return ""
+
+    days_left = sale_days_left(product)
+    prefix = "⏳ Термін дії акції: " + " ".join(parts)
+
+    if days_left == 0:
+        prefix += "\n🚨 <b>Сьогодні останній день акції!</b>"
+    elif days_left == 1:
+        prefix += "\n⏰ До завершення акції залишився <b>1 день</b>"
+    elif days_left is not None and 1 < days_left <= 3:
+        prefix += f"\n⏰ До завершення акції залишилось <b>{days_left} дні</b>"
+
+    return prefix
+
+
+def sale_broadcast_key(product):
+    product_id = str(product.get("ID товару", "") or "").strip()
+    sale = get_product_sale_text(product)
+    start = str(product.get("Акція від", "") or product.get("Акція з", "") or "").strip()
+    end = str(product.get("Акція до", "") or "").strip()
+    return f"{product_id}|{sale}|{start}|{end}"
+
+
+
+
 def get_marketing_worksheet():
     headers = [
         "ID розсилки",
@@ -2806,9 +2912,15 @@ def get_sale_broadcasts_worksheet():
         "Дата",
         "ID товару",
         "Назва товару",
-        "Статус"
+        "Статус",
+        "Тип",
+        "Ключ акції",
+        "Акція від",
+        "Акція до"
     ]
-    return get_or_create_worksheet("Надіслані акції", headers)
+    ws = get_or_create_worksheet("Надіслані акції", headers)
+    ensure_headers(ws, headers)
+    return ws
 
 
 def get_broadcast_client_ids():
@@ -2870,9 +2982,9 @@ def marketing_message_text(row_type, title, body, product=None):
     if product:
         name = safe_text(product.get("Назва товару"), "Товар")
         price = str(product.get("Ціна", "") or "").strip()
-        sale_price = str(product.get("Акційна ціна", "") or "").strip()
-        old_price = str(product.get("Стара ціна", "") or "").strip()
-        sale = str(product.get("Акція", "") or "").strip()
+        sale_price = get_active_sale_price(product)
+        old_price = str(product.get("Стара ціна", "") or "").strip() if is_product_sale_active(product) else ""
+        sale = get_product_sale_text(product)
 
         text += f"🛍 <b>{name}</b>\n"
 
@@ -2886,6 +2998,9 @@ def marketing_message_text(row_type, title, body, product=None):
 
         if sale:
             text += f"🎁 Акція: <b>{sale}</b>\n"
+            period_info = sale_period_text(product)
+            if period_info:
+                text += f"{period_info}\n"
 
     text += "\nЗаходьте переглянути актуальні пропозиції 💛"
     return text
@@ -2972,32 +3087,80 @@ def process_marketing_broadcasts():
     return sent_campaigns
 
 
-def sale_product_already_broadcasted(product_id):
+def sale_product_already_broadcasted(product, broadcast_type="Старт"):
+    """
+    Перевіряє, чи конкретну акцію вже розсилали.
+    Ключ включає ID товару + тип акції + період, тому нова акція на той самий товар
+    у майбутньому зможе розіслатися ще раз.
+    """
     try:
-        rows = get_values("Надіслані акції")[1:]
-        for row in rows:
-            if str(row[1] if len(row) > 1 else "").strip() == str(product_id).strip():
-                return True
+        product_id = str(product.get("ID товару", "") if isinstance(product, dict) else product).strip()
+        key = sale_broadcast_key(product) if isinstance(product, dict) else product_id
+        rows = get_values("Надіслані акції")
+        if not rows:
+            return False
+
+        headers = rows[0]
+        for row in rows[1:]:
+            row_product_id = str(get_cell_by_header(row, headers, "ID товару", row[1] if len(row) > 1 else "")).strip()
+            row_type = str(get_cell_by_header(row, headers, "Тип", "")).strip()
+            row_key = str(get_cell_by_header(row, headers, "Ключ акції", "")).strip()
+            row_status = str(get_cell_by_header(row, headers, "Статус", "")).strip().lower()
+
+            if row_key:
+                if row_key == key and row_type == broadcast_type:
+                    return True
+            else:
+                # Старі записи без ключа: вважаємо, що стартову розсилку по цьому товару вже робили.
+                if broadcast_type == "Старт" and row_product_id == product_id and row_status in ["надіслано", "так", "sent"]:
+                    return True
+
     except Exception as e:
         print("sale_product_already_broadcasted error:", e)
     return False
 
 
-def mark_sale_product_broadcasted(product):
+def mark_sale_product_broadcasted(product, broadcast_type="Старт"):
     try:
         product_id = str(product.get("ID товару", "")).strip()
         name = str(product.get("Назва товару", "")).strip()
         ws = get_sale_broadcasts_worksheet()
-        ws.append_row([now_str(), product_id, name, "Надіслано"], value_input_option="USER_ENTERED")
+        ws.append_row([
+            now_str(),
+            product_id,
+            name,
+            "Надіслано",
+            broadcast_type,
+            sale_broadcast_key(product),
+            str(product.get("Акція від", "") or product.get("Акція з", "") or ""),
+            str(product.get("Акція до", "") or "")
+        ], value_input_option="USER_ENTERED")
+        clear_cache("Надіслані акції")
     except Exception as e:
         print("mark_sale_product_broadcasted error:", e)
+
+
+def sale_broadcast_text(product, broadcast_type="Старт"):
+    if broadcast_type == "Останній день":
+        title = "🚨 ОСТАННІЙ ДЕНЬ АКЦІЇ!"
+        body = "Сьогодні останній день дії цієї пропозиції. Завтра акція вже може бути недоступна."
+    elif broadcast_type == "3 дні":
+        title = "⏳ Акція скоро завершується"
+        body = "До завершення акції залишилось лише 3 дні. Встигніть скористатися вигодою."
+    else:
+        title = "🔥 Нова акційна пропозиція"
+        body = "Ми додали вигідну пропозицію для Вас."
+
+    return marketing_message_text("Акція", title, body, product)
 
 
 def process_sale_broadcasts():
     """
     Запускається через /sale-broadcasts.
-    Якщо в таблиці з'явився новий активний акційний товар,
-    бот один раз повідомить про нього клієнтам.
+    Працює комплексно:
+    1) нова активна акція — розсилка один раз;
+    2) за 3 дні до завершення — нагадування один раз;
+    3) в останній день — нагадування один раз.
     """
     sale_products = get_sale_products()
     sent_count = 0
@@ -3007,20 +3170,28 @@ def process_sale_broadcasts():
             break
 
         product_id = str(product.get("ID товару", "")).strip()
-        if not product_id or sale_product_already_broadcasted(product_id):
+        if not product_id:
+            continue
+
+        days_left = sale_days_left(product)
+
+        broadcast_type = None
+        if days_left == 0 and not sale_product_already_broadcasted(product, "Останній день"):
+            broadcast_type = "Останній день"
+        elif days_left == 3 and not sale_product_already_broadcasted(product, "3 дні"):
+            broadcast_type = "3 дні"
+        elif not sale_product_already_broadcasted(product, "Старт"):
+            broadcast_type = "Старт"
+
+        if not broadcast_type:
             continue
 
         photos = get_product_photos(product)
         photo_url = photos[0] if photos else None
-        text = marketing_message_text(
-            "Акція",
-            "🔥 Нова акційна пропозиція",
-            "Ми додали вигідну пропозицію для Вас.",
-            product
-        )
+        text = sale_broadcast_text(product, broadcast_type)
         keyboard = product_marketing_keyboard(product_id, "🔥 Переглянути товар")
         send_marketing_to_all(text, keyboard, photo_url)
-        mark_sale_product_broadcasted(product)
+        mark_sale_product_broadcasted(product, broadcast_type)
         sent_count += 1
 
     return sent_count
@@ -3332,8 +3503,8 @@ def get_sale_products():
     products = get_cached_records("Товари")
     return [
         p for p in products
-        if str(p.get("Акція")).strip() != ""
-        and str(p.get("Активний")).strip().lower() in ["так", "yes", "true", "1"]
+        if is_product_sale_active(p)
+        and str(p.get("Активний")).strip().lower() in ["так", "yes", "true", "1", "активний"]
     ]
 
 
@@ -3341,9 +3512,9 @@ def product_text(product, index=None, total=None):
     name = safe_text(product.get("Назва товару"), "Товар без назви")
     description = safe_text(product.get("Опис"), "")
     price = safe_text(product.get("Ціна"), "0")
-    old_price = str(product.get("Стара ціна", "") or "").strip()
-    sale_price = str(product.get("Акційна ціна", "") or "").strip()
-    sale = str(product.get("Акція") or "").strip()
+    old_price = str(product.get("Стара ціна", "") or "").strip() if is_product_sale_active(product) else ""
+    sale_price = get_active_sale_price(product)
+    sale = get_product_sale_text(product)
 
     availability = safe_text(product.get("Наявність"), "")
     brand = safe_text(product.get("Бренд"), "")
@@ -3388,6 +3559,9 @@ def product_text(product, index=None, total=None):
 
     if sale:
         text += f"\n🎁 Акція: <b>{sale}</b>"
+        period_info = sale_period_text(product)
+        if period_info:
+            text += f"\n{period_info}"
 
     return text
 
@@ -3888,7 +4062,7 @@ def add_to_cart(chat_id, product_id, callback_message=None):
         return
 
     name = safe_text(product.get("Назва товару"), "Товар")
-    price = safe_float(product.get("Акційна ціна") or product.get("Ціна") or 0)
+    price = safe_float(get_active_sale_price(product) or product.get("Ціна") or 0)
     promo = get_product_promo_deal(product)
 
     # Для акцій типу 1=2 та 1+1=3 у кошику показуємо фактичну кількість,
