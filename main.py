@@ -1140,6 +1140,213 @@ def get_product_promo_deal(product):
     return parse_promo_deal(get_product_sale_text(product))
 
 
+# =========================
+# PROMO GIFT: PRODUCT + GIFT FOR 1 UAH
+# =========================
+
+PROMO_GIFT_ROW_PREFIX = "PROMO_GIFT__"
+
+
+def promo_gift_cart_id(gift_product_id):
+    return f"{PROMO_GIFT_ROW_PREFIX}{str(gift_product_id).strip()}"
+
+
+def is_promo_gift_cart_id(product_id):
+    return str(product_id or "").startswith(PROMO_GIFT_ROW_PREFIX)
+
+
+def promo_gift_original_product_id(product_id):
+    product_id = str(product_id or "").strip()
+    if is_promo_gift_cart_id(product_id):
+        return product_id.replace(PROMO_GIFT_ROW_PREFIX, "", 1)
+    return product_id
+
+
+def get_promo_gift_config(product):
+    """
+    Універсальна акція: при купівлі товару автоматично додається подарунок/додатковий товар
+    за спеціальною ціною.
+
+    У таблиці "Товари" для основного товару заповнюємо:
+    - Акція = наприклад "Кушон + SPF за 1 грн"
+    - Акція від / Акція до = період дії
+    - Подарунок ID = ID товару-подарунка
+    - Ціна подарунка = ціна, за яку він додається у кошик
+    """
+    if not product or not is_product_sale_active(product):
+        return None
+
+    gift_id = str(
+        product.get("Подарунок ID")
+        or product.get("ID подарунка")
+        or product.get("ID подарунку")
+        or product.get("Подарунок товар ID")
+        or ""
+    ).strip()
+
+    if not gift_id:
+        return None
+
+    gift_price = safe_float(
+        product.get("Ціна подарунка")
+        or product.get("Ціна подарунку")
+        or product.get("Подарунок ціна")
+        or product.get("Ціна подарункового товару")
+        or 1,
+        1
+    )
+
+    if gift_price <= 0:
+        gift_price = 1
+
+    gift_product = get_product_by_id(gift_id)
+    gift_name = safe_text(
+        gift_product.get("Назва товару") if gift_product else "",
+        "Подарунок за акцією"
+    )
+
+    sale_label = get_product_sale_text(product) or "Акція"
+
+    return {
+        "gift_id": gift_id,
+        "cart_product_id": promo_gift_cart_id(gift_id),
+        "gift_name": gift_name,
+        "gift_price": round(gift_price, 2),
+        "sale_label": sale_label
+    }
+
+
+def promo_gift_text_for_product(product):
+    config = get_promo_gift_config(product)
+    if not config:
+        return ""
+
+    gift_name = config.get("gift_name", "Подарунок за акцією")
+    gift_price = config.get("gift_price", 1)
+
+    return (
+        f"🎁 До цього товару за умовами акції можна отримати:\n"
+        f"<b>{gift_name}</b> всього за <b>{gift_price} грн</b>"
+    )
+
+
+def sync_cart_promo_gifts(chat_id):
+    """
+    Синхронізує подарунки у кошику:
+    - є акційний кушон/товар → додає подарунок за 1 грн;
+    - кількість основного товару змінилась → змінює кількість подарунка;
+    - основний товар видалили або акція завершилась → прибирає подарунок.
+    """
+    try:
+        items = find_user_cart_rows(chat_id)
+        requirements = {}
+        existing_gift_rows = {}
+
+        for item in items:
+            product_id = str(item.get("product_id") or "").strip()
+
+            if is_promo_gift_cart_id(product_id):
+                original_gift_id = promo_gift_original_product_id(product_id)
+                existing_gift_rows.setdefault(original_gift_id, []).append(item)
+                continue
+
+            product = get_product_by_id(product_id)
+            config = get_promo_gift_config(product)
+            if not config:
+                continue
+
+            qty = safe_int(item.get("qty") or 1, 1)
+            if qty <= 0:
+                continue
+
+            gift_id = config["gift_id"]
+            if gift_id not in requirements:
+                requirements[gift_id] = {
+                    "cart_product_id": config["cart_product_id"],
+                    "gift_name": config["gift_name"],
+                    "gift_price": config["gift_price"],
+                    "qty": 0,
+                    "sum": 0,
+                    "labels": []
+                }
+
+            requirements[gift_id]["qty"] += qty
+            requirements[gift_id]["sum"] = round(
+                requirements[gift_id]["sum"] + qty * config["gift_price"],
+                2
+            )
+            if config.get("sale_label") and config.get("sale_label") not in requirements[gift_id]["labels"]:
+                requirements[gift_id]["labels"].append(config.get("sale_label"))
+
+        changed = False
+
+        # Оновлюємо або створюємо потрібні подарунки.
+        for gift_id, req in requirements.items():
+            rows = existing_gift_rows.get(gift_id, [])
+            display_name = req["gift_name"]
+            if req.get("labels"):
+                display_name = f"{display_name} ({req['labels'][0]})"
+
+            if rows:
+                main_row = rows[0]
+                row_index = main_row["row_index"]
+                old_name = str(main_row.get("name") or "")
+                old_price = safe_float(main_row.get("price") or 0)
+                old_qty = safe_int(main_row.get("qty") or 0)
+                old_sum = safe_float(main_row.get("sum") or 0)
+
+                if old_name != display_name:
+                    update_cell("Кошик", row_index, 3, display_name)
+                    changed = True
+                if old_price != req["gift_price"]:
+                    update_cell("Кошик", row_index, 4, req["gift_price"])
+                    changed = True
+                if old_qty != req["qty"]:
+                    update_cell("Кошик", row_index, 5, req["qty"])
+                    changed = True
+                if old_sum != req["sum"]:
+                    update_cell("Кошик", row_index, 6, req["sum"])
+                    changed = True
+
+                update_cart_reminder_columns(row_index, updated_at=now_str(), reminder1="", reminder2="", reminder3="")
+
+                # Якщо раптом дублікати подарунка — видаляємо зайві.
+                for extra in rows[1:]:
+                    delete_row("Кошик", extra["row_index"])
+                    changed = True
+            else:
+                get_cart_worksheet()
+                append_row("Кошик", [
+                    chat_id,
+                    req["cart_product_id"],
+                    display_name,
+                    req["gift_price"],
+                    req["qty"],
+                    req["sum"],
+                    now_str(),
+                    "",
+                    "",
+                    ""
+                ])
+                changed = True
+
+        # Видаляємо подарунки, якщо акційного товару вже немає або акція завершилась.
+        for gift_id, rows in existing_gift_rows.items():
+            if gift_id not in requirements:
+                for row in reversed(rows):
+                    delete_row("Кошик", row["row_index"])
+                    changed = True
+
+        if changed:
+            clear_cache("Кошик")
+
+        return changed
+
+    except Exception as e:
+        print("sync_cart_promo_gifts error:", e)
+        return False
+
+
 def get_cart_item_product(item):
     product_id = item.get("product_id") or item.get("ID товару") or item.get("id") or ""
     if product_id:
@@ -1158,6 +1365,9 @@ def format_cart_item_line(item):
     price = safe_float(item.get("price") or item.get("Ціна") or 0)
     qty = safe_int(item.get("qty") or item.get("Кількість") or 1, 1)
     summa = safe_float(item.get("sum") or item.get("Сума") or price * qty)
+
+    if is_promo_gift_cart_id(item.get("product_id") or item.get("ID товару")):
+        return f"🎁 {name} — {qty} шт. × {price} грн = <b>{summa} грн</b>\n"
 
     if promo:
         paid_qty = promo.get("paid_qty", 1)
@@ -1181,6 +1391,11 @@ def format_cart_item_line(item):
 def format_cart_item_for_order(item):
     name = item.get("Назва товару") or item.get("name") or "Товар"
     product_id = item.get("ID товару") or item.get("product_id") or ""
+    if is_promo_gift_cart_id(product_id):
+        send_message(chat_id, "🎁 Акційний товар автоматично змінюється разом з основним товаром.")
+        show_cart(chat_id, callback_message)
+        return
+
     product = get_product_by_id(product_id) if product_id else None
     promo = get_product_promo_deal(product)
     qty = safe_int(item.get("Кількість") or item.get("qty") or 1, 1)
@@ -3002,6 +3217,10 @@ def marketing_message_text(row_type, title, body, product=None):
             if period_info:
                 text += f"{period_info}\n"
 
+        gift_info = promo_gift_text_for_product(product)
+        if gift_info:
+            text += f"\n{gift_info}\n"
+
     text += "\nЗаходьте переглянути актуальні пропозиції 💛"
     return text
 
@@ -3141,6 +3360,33 @@ def mark_sale_product_broadcasted(product, broadcast_type="Старт"):
 
 
 def sale_broadcast_text(product, broadcast_type="Старт"):
+    gift_config = get_promo_gift_config(product)
+
+    if gift_config:
+        gift_name = gift_config.get("gift_name", "подарунок")
+        gift_price = gift_config.get("gift_price", 1)
+
+        if broadcast_type == "Останній день":
+            title = "🚨 ОСТАННІЙ ДЕНЬ АКЦІЇ НА КУШОНИ!"
+            body = (
+                f"Сьогодні останній день, коли при виборі будь-якого кушону "
+                f"Ви можете отримати <b>{gift_name}</b> всього за <b>{gift_price} грн</b>."
+            )
+        elif broadcast_type == "3 дні":
+            title = "⏳ Акція на кушони скоро завершується"
+            body = (
+                f"До завершення пропозиції залишилось лише 3 дні. Обирайте кушон, "
+                f"а <b>{gift_name}</b> отримуйте всього за <b>{gift_price} грн</b>."
+            )
+        else:
+            title = "☀️ Акція на кушони"
+            body = (
+                f"При виборі будь-якого кушону в асортименті Ви отримуєте "
+                f"<b>{gift_name}</b> всього за <b>{gift_price} грн</b>."
+            )
+
+        return marketing_message_text("Акція", title, body, product)
+
     if broadcast_type == "Останній день":
         title = "🚨 ОСТАННІЙ ДЕНЬ АКЦІЇ!"
         body = "Сьогодні останній день дії цієї пропозиції. Завтра акція вже може бути недоступна."
@@ -3152,7 +3398,6 @@ def sale_broadcast_text(product, broadcast_type="Старт"):
         body = "Ми додали вигідну пропозицію для Вас."
 
     return marketing_message_text("Акція", title, body, product)
-
 
 def process_sale_broadcasts():
     """
@@ -3562,6 +3807,10 @@ def product_text(product, index=None, total=None):
         period_info = sale_period_text(product)
         if period_info:
             text += f"\n{period_info}"
+
+    gift_info = promo_gift_text_for_product(product)
+    if gift_info:
+        text += f"\n\n{gift_info}"
 
     return text
 
@@ -4064,6 +4313,7 @@ def add_to_cart(chat_id, product_id, callback_message=None):
     name = safe_text(product.get("Назва товару"), "Товар")
     price = safe_float(get_active_sale_price(product) or product.get("Ціна") or 0)
     promo = get_product_promo_deal(product)
+    gift_config = get_promo_gift_config(product)
 
     # Для акцій типу 1=2 та 1+1=3 у кошику показуємо фактичну кількість,
     # але рахуємо суму тільки за оплачені одиниці.
@@ -4090,6 +4340,8 @@ def add_to_cart(chat_id, product_id, callback_message=None):
         get_cart_worksheet()
         append_row("Кошик", [chat_id, product_id, name, price, new_qty, new_sum, now_str(), "", "", ""])
 
+    sync_cart_promo_gifts(chat_id)
+
     if promo:
         promo_label = promo.get("label", "Акція")
         text = (
@@ -4103,6 +4355,12 @@ def add_to_cart(chat_id, product_id, callback_message=None):
             f"✅ Товар <b>{name}</b> додано в кошик.\n\n"
             f"Кількість: <b>{new_qty} шт.</b>\n"
             f"Сума: <b>{new_sum} грн</b>"
+        )
+
+    if gift_config:
+        text += (
+            f"\n\n🎁 За умовами акції до кошика також додано:\n"
+            f"<b>{gift_config['gift_name']}</b> — <b>{gift_config['gift_price']} грн</b>"
         )
 
     keyboard = {
@@ -4120,8 +4378,8 @@ def add_to_cart(chat_id, product_id, callback_message=None):
     else:
         send_message(chat_id, text, keyboard)
 
-
 def show_cart(chat_id, callback_message=None):
+    sync_cart_promo_gifts(chat_id)
     items = find_user_cart_rows(chat_id)
 
     if not items:
@@ -4147,12 +4405,17 @@ def show_cart(chat_id, callback_message=None):
         subtotal += summa
         text += format_cart_item_line(item)
 
-        buttons.append([
-            inline_button("➖", f"cart_minus_{row_index}"),
-            inline_button(f"{qty} шт", f"cart_qty_{row_index}"),
-            inline_button("➕", f"cart_plus_{row_index}"),
-            inline_button("❌", f"delete_cart_row_{row_index}")
-        ])
+        if is_promo_gift_cart_id(item.get("product_id")):
+            buttons.append([
+                inline_button(f"🎁 Акційний товар: {qty} шт", f"cart_qty_{row_index}")
+            ])
+        else:
+            buttons.append([
+                inline_button("➖", f"cart_minus_{row_index}"),
+                inline_button(f"{qty} шт", f"cart_qty_{row_index}"),
+                inline_button("➕", f"cart_plus_{row_index}"),
+                inline_button("❌", f"delete_cart_row_{row_index}")
+            ])
 
     totals = calculate_cart_totals(chat_id)
     discount_percent = totals["discount_percent"]
@@ -4246,12 +4509,14 @@ def change_cart_qty(chat_id, row_index, delta, callback_message=None):
 
     if new_qty <= 0 or new_sum <= 0:
         delete_row("Кошик", row_index)
+        sync_cart_promo_gifts(chat_id)
         show_cart(chat_id, callback_message)
         return
 
     update_cell("Кошик", row_index, 5, new_qty)
     update_cell("Кошик", row_index, 6, new_sum)
     update_cart_reminder_columns(row_index, updated_at=now_str(), reminder1="", reminder2="", reminder3="")
+    sync_cart_promo_gifts(chat_id)
 
     show_cart(chat_id, callback_message)
 
@@ -4259,6 +4524,7 @@ def change_cart_qty(chat_id, row_index, delta, callback_message=None):
 def delete_cart_item(chat_id, row_index, callback_message=None):
     try:
         delete_row("Кошик", int(row_index))
+        sync_cart_promo_gifts(chat_id)
         show_cart(chat_id, callback_message)
     except Exception:
         send_message(chat_id, "Не вдалося видалити товар. Спробуйте ще раз.", main_menu(is_admin(chat_id)))
