@@ -939,6 +939,8 @@ def callback_loading_text(data_value):
         return "🛒 Оновлюємо кошик..."
     if data_value.startswith("promo_product_"):
         return "🛍 Завантажуємо товар..."
+    if data_value.startswith("contact_product_"):
+        return "📞 Готуємо заявку менеджеру..."
     if data_value in ["open_catalog", "add_more_products"]:
         return "📦 Відкриваємо каталог..."
     if data_value in ["open_cart", "continue_checkout"]:
@@ -962,7 +964,8 @@ def main_menu(is_admin=False):
         [{"text": "📦 Каталог"}, {"text": "🔥 Акції"}],
         [{"text": "🛒 Кошик"}, {"text": "📦 Мої замовлення"}],
         [{"text": "🎁 Мої бонуси"}, {"text": "👥 Реферальна програма"}],
-        [{"text": "📞 Зв’язатися з менеджером"}, {"text": "🚚 Доставка і оплата"}]
+        [{"text": "📞 Зв’язатися з менеджером"}, {"text": "🚚 Доставка і оплата"}],
+        [{"text": "📞 Оформити через менеджера"}]
     ]
 
     if is_admin:
@@ -3926,7 +3929,8 @@ def build_product_keyboard(product_id, products, index, mode="category", categor
         ]
     else:
         buttons = [
-            [inline_button("🛒 Додати в кошик", f"add_one_{product_id}")]
+            [inline_button("🛒 Додати в кошик", f"add_one_{product_id}")],
+            [inline_button("📞 Замовити через менеджера", f"contact_product_{product_id}")]
         ]
 
     if extra_photos:
@@ -4647,6 +4651,7 @@ def is_menu_or_catalog_text(text):
         "🎁 Мої бонуси",
         "👥 Реферальна програма",
         "📞 Зв’язатися з менеджером",
+        "📞 Оформити через менеджера",
         "🚚 Доставка і оплата",
         "👑 Кабінет",
     ]
@@ -5040,18 +5045,97 @@ def show_my_orders(chat_id):
     send_message(chat_id, text, main_menu(is_admin(chat_id)))
 
 
-def contact_manager(chat_id, user, source="manual"):
+
+def manager_request_cart_summary(chat_id):
+    """
+    Формує короткий підсумок кошика для адміна, коли клієнт просить оформити через менеджера.
+    Показує товари, суму, бонуси та скільки бонусів можна списати.
+    """
+    try:
+        cart = get_user_cart(chat_id)
+    except Exception as e:
+        print("manager_request_cart_summary cart error:", e)
+        cart = []
+
+    if not cart:
+        try:
+            balance = get_available_bonus_balance(chat_id)
+        except Exception:
+            balance = 0
+
+        return (
+            "\n🛒 <b>Кошик клієнта:</b>\n"
+            "Поки порожній або не вдалося підтягнути товари.\n"
+            f"🎁 <b>Доступно бонусів:</b> {balance}\n"
+        )
+
+    text = "\n🛒 <b>Товари в кошику:</b>\n"
+
+    for item in cart:
+        try:
+            text += format_cart_item_line(item)
+        except Exception:
+            name = safe_text(item.get("Назва товару") or item.get("name") or "Товар")
+            qty = safe_text(item.get("Кількість") or item.get("qty") or "1")
+            summa = safe_text(item.get("Сума") or item.get("sum") or "0")
+            text += f"• {name} — {qty} шт. = <b>{summa} грн</b>\n"
+
+    try:
+        totals = calculate_cart_totals(chat_id, use_bonuses=False)
+    except Exception as e:
+        print("manager_request_cart_summary totals error:", e)
+        totals = {
+            "subtotal": 0,
+            "bonus_eligible_after_discount": 0,
+            "available_bonuses": 0,
+            "max_bonus_to_use": 0,
+            "total": 0
+        }
+
+    text += (
+        f"\n💰 <b>Сума кошика:</b> {totals.get('subtotal', 0)} грн\n"
+        f"🎁 <b>Доступно бонусів:</b> {totals.get('available_bonuses', 0)}\n"
+        f"✅ <b>Сума неакційних товарів для бонусів:</b> {totals.get('bonus_eligible_after_discount', 0)} грн\n"
+        f"💳 <b>Можна списати до:</b> {totals.get('max_bonus_to_use', 0)} бонусів\n"
+    )
+
+    return text
+
+
+def contact_manager(chat_id, user, source="manual", product_id=""):
+    product_name = ""
+    if product_id:
+        try:
+            product = get_product_by_id(product_id)
+            product_name = safe_text(product.get("Назва товару") if product else "", "")
+        except Exception as e:
+            print("contact_manager product lookup error:", e)
+            product_name = ""
+
     USER_STATES[str(chat_id)] = {
         "step": "contact_waiting_full_name",
         "contact_full_name": "",
         "contact_phone": "",
-        "contact_source": source
+        "contact_source": source,
+        "contact_product_id": str(product_id or ""),
+        "contact_product_name": product_name
     }
 
     if source == "cart_reminder":
         send_message(
             chat_id,
             "📞 Залиште, будь ласка, Ваше ПІБ — менеджер зв’яжеться з Вами та допоможе з товарами у кошику:"
+        )
+    elif source == "product_card":
+        product_part = f" щодо товару <b>{product_name}</b>" if product_name else " щодо цього товару"
+        send_message(
+            chat_id,
+            f"📞 Залиште, будь ласка, Ваше ПІБ — менеджер зв’яжеться з Вами{product_part} та допоможе оформити замовлення:"
+        )
+    elif source == "manager_order":
+        send_message(
+            chat_id,
+            "📞 Залиште, будь ласка, Ваше ПІБ — менеджер зв’яжеться з Вами та оформить замовлення:"
         )
     else:
         send_message(chat_id, "Введіть, будь ласка, Ваше ПІБ:")
@@ -5077,16 +5161,37 @@ def finish_contact_request(chat_id, user, state):
     )
 
     source = state.get("contact_source", "manual")
-    source_text = "Кошик / нагадування" if source == "cart_reminder" else "Звичайна заявка"
+    if source == "cart_reminder":
+        source_text = "Кошик / нагадування"
+    elif source == "product_card":
+        source_text = "Картка товару"
+    elif source == "manager_order":
+        source_text = "Оформити через менеджера"
+    else:
+        source_text = "Звичайна заявка"
+
+    product_name = state.get("contact_product_name", "")
+    product_id = state.get("contact_product_id", "")
+    product_line = ""
+    if product_name or product_id:
+        product_line = f"<b>Товар:</b> {product_name or '—'}"
+        if product_id:
+            product_line += f" / ID: {product_id}"
+        product_line += "\n"
+
+    cart_line = ""
+    if source in ["manager_order", "cart_reminder"]:
+        cart_line = manager_request_cart_summary(chat_id)
 
     admin_text = (
         "📞 <b>Нова заявка на зв’язок</b>\n\n"
         f"<b>Джерело:</b> {source_text}\n"
+        f"{product_line}"
         f"<b>ПІБ:</b> {full_name}\n"
         f"<b>Телефон:</b> {phone}\n"
-        f"<b>Telegram ID:</b> {chat_id}"
+        f"<b>Telegram ID:</b> {chat_id}\n"
+        f"{cart_line}"
     )
-
     for admin_id in get_admin_ids():
         send_message(admin_id, admin_text)
 
@@ -6191,6 +6296,8 @@ def webhook():
             with_loading(chat_id, "👥 Завантажуємо умови реферальної програми...", show_referral_program, chat_id)
         elif text == "📞 Зв’язатися з менеджером":
             with_loading(chat_id, "📞 Відкриваємо форму звернення до менеджера...", contact_manager, chat_id, user)
+        elif text == "📞 Оформити через менеджера":
+            with_loading(chat_id, "📞 Передаємо заявку менеджеру...", contact_manager, chat_id, user, "manager_order")
         elif text == "🚚 Доставка і оплата":
             with_loading(chat_id, "🚚 Завантажуємо інформацію про доставку та оплату...", show_delivery_payment, chat_id)
         elif text == "👑 Кабінет":
@@ -6389,6 +6496,10 @@ def webhook():
 
             edit_message(chat_id, message_id, "Коментар пропущено ✅")
             ask_free_delivery_offer(chat_id)
+
+        elif data_value.startswith("contact_product_"):
+            product_id = data_value.replace("contact_product_", "")
+            with_loading(chat_id, "📞 Відкриваємо заявку менеджеру по товару...", contact_manager, chat_id, user, "product_card", product_id)
 
         elif data_value == "contact_from_cart":
             with_loading(chat_id, "📞 Відкриваємо заявку на зв’язок...", contact_manager, chat_id, user, "cart_reminder")
