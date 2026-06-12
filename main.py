@@ -1772,9 +1772,33 @@ def get_available_bonus_balance(chat_id):
     return max(0, round(balance, 2))
 
 
-def calculate_bonus_to_use(chat_id, subtotal_after_discount):
+def is_bonus_eligible_product(product):
+    """
+    Бонуси можна списувати тільки на неакційні товари.
+    Якщо у товару активна акція, акційна ціна, стара ціна або подарунок за акцією — бонуси на нього не застосовуються.
+    """
+    if not product:
+        return False
+
+    try:
+        return not is_product_sale_active(product)
+    except Exception:
+        return False
+
+
+def is_bonus_eligible_cart_item(item):
+    product_id = item.get("product_id") or item.get("ID товару") or item.get("id") or ""
+
+    if is_promo_gift_cart_id(product_id):
+        return False
+
+    product = get_product_by_id(product_id) if product_id else None
+    return is_bonus_eligible_product(product)
+
+
+def calculate_bonus_to_use(chat_id, bonus_eligible_amount):
     balance = get_available_bonus_balance(chat_id)
-    max_allowed = round(float(subtotal_after_discount or 0) * BONUS_MAX_USE_PERCENT / 100, 2)
+    max_allowed = round(float(bonus_eligible_amount or 0) * BONUS_MAX_USE_PERCENT / 100, 2)
     return max(0, min(balance, max_allowed))
 
 
@@ -1797,7 +1821,7 @@ def add_bonus_transaction(chat_id, amount, transaction_type, comment="", order_r
         print("add_bonus_transaction error:", e)
 
 
-def spend_bonuses(chat_id, amount, order_row_index="", comment="Списання бонусів за замовлення"):
+def spend_bonuses(chat_id, amount, order_row_index="", comment="Списання бонусів за замовлення (тільки з неакційних товарів)"):
     amount = float(amount or 0)
     if amount <= 0:
         return
@@ -1821,7 +1845,8 @@ def welcome_bonus_message_text():
         f"<b>{int(WELCOME_BONUS_AMOUNT)} вітальних бонусів</b>.\n\n"
         f"🎁 Ваш бонусний рахунок уже поповнено на <b>{int(WELCOME_BONUS_AMOUNT)} бонусів</b>.\n\n"
         "1 бонус = 1 грн.\n\n"
-        f"💰 Бонусами можна оплатити до <b>{int(BONUS_MAX_USE_PERCENT)}%</b> суми замовлення.\n\n"
+        f"💰 Бонусами можна оплатити до <b>{int(BONUS_MAX_USE_PERCENT)}%</b> суми неакційних товарів.\n"
+        "На акційні товари бонуси не списуються.\n\n"
         "🛍 Завітайте до каталогу та оберіть щось для себе — бонуси вже чекають на використання!\n\n"
         "Бажаємо приємних покупок 💛"
     )
@@ -1985,7 +2010,8 @@ def show_bonus_cabinet(chat_id, callback_message=None):
         "За перше успішне замовлення друга від "
         f"<b>{int(REFERRAL_MIN_ORDER_SUM)} грн</b> Ви отримаєте "
         f"<b>{REFERRAL_BONUS_AMOUNT} бонусів</b>.\n\n"
-        f"Бонусами можна оплатити до <b>{int(BONUS_MAX_USE_PERCENT)}%</b> суми замовлення.\n"
+        f"Бонусами можна оплатити до <b>{int(BONUS_MAX_USE_PERCENT)}%</b> суми неакційних товарів.\n"
+        "На акційні товари, подарунки за 1 грн та товари зі знижкою бонуси не списуються.\n"
         f"Термін дії бонусів: <b>{BONUS_VALID_DAYS} днів</b>."
     )
 
@@ -2015,10 +2041,12 @@ def show_referral_program(chat_id, callback_message=None):
         "Наприклад: замовлення на 1000 грн → 50 бонусів.\n\n"
         "💰 <b>Як використовувати бонуси?</b>\n"
         "• 1 бонус = 1 грн\n"
-        f"• бонусами можна оплатити до <b>{int(BONUS_MAX_USE_PERCENT)}%</b> суми замовлення\n"
+        f"• бонусами можна оплатити до <b>{int(BONUS_MAX_USE_PERCENT)}%</b> суми неакційних товарів\n"
+        "• бонуси не застосовуються до акційних товарів, подарунків за 1 грн та товарів зі знижкою\n"
         f"• бонуси діють <b>{BONUS_VALID_DAYS} днів</b> з моменту нарахування\n\n"
         "⚠️ <b>Умови програми</b>\n"
         "• бонуси нараховуються тільки після статусу <b>Завершено</b>\n"
+        "• списати бонуси можна тільки на товари без активної акції\n"
         f"• мінімальна сума першого замовлення друга для реферального бонусу — <b>{int(REFERRAL_MIN_ORDER_SUM)} грн</b>\n"
         "• бонус за друга нараховується лише за його перше успішне замовлення\n"
         "• один номер телефону може брати участь у програмі лише один раз\n"
@@ -2605,23 +2633,34 @@ def upsert_client_discount(chat_id, full_name="", phone="", discount_percent=NEX
 def calculate_cart_totals(chat_id, use_bonuses=None):
     cart = get_user_cart(chat_id)
     subtotal = 0
+    bonus_eligible_subtotal = 0
 
     for item in cart:
         try:
-            subtotal += float(item.get("Сума") or 0)
-        except:
-            pass
+            item_sum = safe_float(item.get("Сума") or 0)
+            subtotal += item_sum
+
+            if is_bonus_eligible_cart_item(item):
+                bonus_eligible_subtotal += item_sum
+        except Exception as e:
+            print("calculate_cart_totals item error:", e)
+
+    subtotal = round(subtotal, 2)
+    bonus_eligible_subtotal = round(bonus_eligible_subtotal, 2)
 
     discount_percent = get_client_discount_percent(chat_id)
     discount_amount = round(subtotal * discount_percent / 100, 2) if discount_percent else 0
     after_discount = round(subtotal - discount_amount, 2)
+
+    bonus_eligible_discount_amount = round(bonus_eligible_subtotal * discount_percent / 100, 2) if discount_percent else 0
+    bonus_eligible_after_discount = round(bonus_eligible_subtotal - bonus_eligible_discount_amount, 2)
 
     if use_bonuses is None:
         state = USER_STATES.get(str(chat_id), {})
         use_bonuses = bool(state.get("use_bonuses"))
 
     available_bonuses = get_available_bonus_balance(chat_id)
-    max_bonus_to_use = calculate_bonus_to_use(chat_id, after_discount)
+    max_bonus_to_use = calculate_bonus_to_use(chat_id, bonus_eligible_after_discount)
     bonus_used = max_bonus_to_use if use_bonuses else 0
 
     total = round(after_discount - bonus_used, 2)
@@ -2630,6 +2669,10 @@ def calculate_cart_totals(chat_id, use_bonuses=None):
         "subtotal": subtotal,
         "discount_percent": discount_percent,
         "discount_amount": discount_amount,
+        "after_discount": after_discount,
+        "bonus_eligible_subtotal": bonus_eligible_subtotal,
+        "bonus_eligible_discount_amount": bonus_eligible_discount_amount,
+        "bonus_eligible_after_discount": bonus_eligible_after_discount,
         "available_bonuses": available_bonuses,
         "max_bonus_to_use": max_bonus_to_use,
         "bonus_used": bonus_used,
@@ -4440,11 +4483,17 @@ def show_cart(chat_id, callback_message=None):
         )
 
     if available_bonuses:
+        bonus_eligible_subtotal = totals.get("bonus_eligible_subtotal", 0)
         text += (
             f"\n\n🎁 Ваші бонуси: <b>{available_bonuses}</b>"
-            f"\n💰 Бонусами можна оплатити до <b>{int(BONUS_MAX_USE_PERCENT)}%</b> суми замовлення."
+            f"\n💰 Бонусами можна оплатити до <b>{int(BONUS_MAX_USE_PERCENT)}%</b> суми неакційних товарів."
+            f"\n🧾 Сума товарів, доступна для списання бонусів: <b>{bonus_eligible_subtotal} грн</b>"
             f"\nМожна списати в цьому замовленні: <b>{max_bonus_to_use} грн</b>"
         )
+
+        if bonus_eligible_subtotal <= 0:
+            text += "\n⚠️ У кошику зараз лише акційні товари, тому бонуси до них не застосовуються."
+
         if bonus_used:
             text += f"\n✅ Бонуси застосовано: <b>-{bonus_used} грн</b>"
 
@@ -4792,7 +4841,7 @@ def finish_order(chat_id, user, need_contact, callback_message=None):
     if discount_percent:
         extra_notes.append(f"Знижка застосована: -{int(discount_percent)}% ({discount_amount} грн)")
     if bonus_used:
-        extra_notes.append(f"Бонуси списано: {bonus_used} грн")
+        extra_notes.append(f"Бонуси списано: {bonus_used} грн (тільки з неакційних товарів)")
 
     if extra_notes:
         comment_for_sheet = (comment + "\n" if comment else "") + "\n".join(extra_notes)
@@ -4855,7 +4904,7 @@ def finish_order(chat_id, user, need_contact, callback_message=None):
         )
 
     if bonus_used:
-        final_text += f"🎁 Списано бонусів: <b>{bonus_used} грн</b>\n"
+        final_text += f"🎁 Списано бонусів: <b>{bonus_used} грн</b> <i>(тільки з неакційних товарів)</i>\n"
 
     final_text += f"💰 Вартість Вашого замовлення за товар: <b>{total} грн</b>\n"
     final_text += f"{delivery_note_for_client(delivery_method, total)}\n\n"
@@ -5386,6 +5435,7 @@ def parse_admin_product_lines(text):
 def build_admin_order_preview(client_id, items, use_bonuses=False):
     products_lines = []
     subtotal = 0
+    bonus_eligible_subtotal = 0
     errors = []
 
     for item in items:
@@ -5400,6 +5450,7 @@ def build_admin_order_preview(client_id, items, use_bonuses=False):
         name = safe_text(product.get("Назва товару"), "Товар")
         price = safe_float(get_active_sale_price(product) or product.get("Ціна") or 0)
         promo = get_product_promo_deal(product)
+        product_is_bonus_eligible = is_bonus_eligible_product(product)
 
         if promo:
             receive_qty = int(promo.get("receive_qty", 1))
@@ -5416,6 +5467,9 @@ def build_admin_order_preview(client_id, items, use_bonuses=False):
 
         subtotal = round(subtotal + line_sum, 2)
 
+        if product_is_bonus_eligible:
+            bonus_eligible_subtotal = round(bonus_eligible_subtotal + line_sum, 2)
+
         gift_config = get_promo_gift_config(product)
         if gift_config:
             gift_qty = actual_qty
@@ -5424,13 +5478,17 @@ def build_admin_order_preview(client_id, items, use_bonuses=False):
             sale_label = safe_text(gift_config.get("sale_label"), "Акція")
             products_lines.append(f"{gift_name} ({sale_label}) x{gift_qty} шт. = {gift_sum} грн")
             subtotal = round(subtotal + gift_sum, 2)
+            # Подарунки/акційні товари за 1 грн не входять у суму для списання бонусів.
 
     discount_percent = get_client_discount_percent(client_id)
     discount_amount = round(subtotal * discount_percent / 100, 2) if discount_percent else 0
     after_discount = round(subtotal - discount_amount, 2)
 
+    bonus_eligible_discount_amount = round(bonus_eligible_subtotal * discount_percent / 100, 2) if discount_percent else 0
+    bonus_eligible_after_discount = round(bonus_eligible_subtotal - bonus_eligible_discount_amount, 2)
+
     available_bonuses = get_available_bonus_balance(client_id)
-    max_bonus_to_use = min(available_bonuses, round(after_discount * BONUS_MAX_USE_PERCENT / 100, 2))
+    max_bonus_to_use = calculate_bonus_to_use(client_id, bonus_eligible_after_discount)
     bonus_used = max_bonus_to_use if use_bonuses else 0
     total = round(after_discount - bonus_used, 2)
 
@@ -5440,13 +5498,16 @@ def build_admin_order_preview(client_id, items, use_bonuses=False):
         "subtotal": subtotal,
         "discount_percent": discount_percent,
         "discount_amount": discount_amount,
+        "after_discount": after_discount,
+        "bonus_eligible_subtotal": bonus_eligible_subtotal,
+        "bonus_eligible_discount_amount": bonus_eligible_discount_amount,
+        "bonus_eligible_after_discount": bonus_eligible_after_discount,
         "available_bonuses": available_bonuses,
         "max_bonus_to_use": max_bonus_to_use,
         "bonus_used": bonus_used,
         "total": total,
         "errors": errors
     }
-
 
 def admin_order_preview_text(state):
     order = state.get("admin_order", {})
@@ -5479,8 +5540,12 @@ def admin_order_preview_text(state):
 
     text += (
         f"\n🎁 Доступно бонусів: <b>{totals['available_bonuses']}</b>"
+        f"\n🧾 Сума неакційних товарів для бонусів: <b>{totals.get('bonus_eligible_subtotal', 0)} грн</b>"
         f"\n💰 Можна списати до <b>{totals['max_bonus_to_use']} грн</b>"
     )
+
+    if totals.get('available_bonuses', 0) and totals.get('bonus_eligible_subtotal', 0) <= 0:
+        text += "\n⚠️ У замовленні тільки акційні товари — бонуси списати не можна."
 
     if totals["bonus_used"]:
         text += f"\n✅ Буде списано бонусів: <b>{totals['bonus_used']} грн</b>"
@@ -5573,7 +5638,7 @@ def finish_admin_created_order(admin_chat_id, callback_message=None):
     if totals.get("discount_percent"):
         extra_notes.append(f"Знижка застосована: -{int(totals['discount_percent'])}% ({totals['discount_amount']} грн)")
     if totals.get("bonus_used"):
-        extra_notes.append(f"Бонуси списано: {totals['bonus_used']} грн")
+        extra_notes.append(f"Бонуси списано: {totals['bonus_used']} грн (тільки з неакційних товарів)")
 
     comment_for_sheet = (comment + "\n" if comment else "") + "\n".join(extra_notes)
     status = "Очікується оплата" if payment_method == "Оплата за реквізитами IBAN" else "Нове"
@@ -5601,7 +5666,7 @@ def finish_admin_created_order(admin_chat_id, callback_message=None):
         order_row_index = ""
 
     if totals.get("bonus_used"):
-        spend_bonuses(client_id, totals["bonus_used"], order_row_index, "Списання бонусів за замовлення, створене менеджером")
+        spend_bonuses(client_id, totals["bonus_used"], order_row_index, "Списання бонусів за замовлення, створене менеджером (тільки з неакційних товарів)")
 
     USER_STATES.pop(str(admin_chat_id), None)
 
@@ -5627,7 +5692,7 @@ def finish_admin_created_order(admin_chat_id, callback_message=None):
     )
 
     if totals.get("bonus_used"):
-        client_text += f"🎁 Списано бонусів: <b>{totals['bonus_used']} грн</b>\n"
+        client_text += f"🎁 Списано бонусів: <b>{totals['bonus_used']} грн</b> <i>(тільки з неакційних товарів)</i>\n"
 
     client_text += "Якщо потрібно щось уточнити — менеджер зв’яжеться з Вами 💛"
 
