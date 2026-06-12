@@ -436,11 +436,16 @@ def update_cart_reminder_columns(row_index, updated_at=None, reminder1=None, rem
         print("update_cart_reminder_columns error:", e)
 
 
-def cart_reminder_keyboard():
+def cart_reminder_keyboard(reminder_number=None):
+    buttons = []
+
+    if reminder_number == 2:
+        buttons.append([inline_button("📞 Залишити заявку на зв’язок", "contact_from_cart")])
+
+    buttons.append([inline_button("🛒 Перейти до кошика", "open_cart")])
+
     return {
-        "inline_keyboard": [
-            [inline_button("🛒 Перейти до кошика", "open_cart")]
-        ]
+        "inline_keyboard": buttons
     }
 
 
@@ -454,9 +459,10 @@ def cart_reminder_text(reminder_number, total=0, discount_percent=0):
 
     if reminder_number == 2:
         return (
-            "⏰ <b>Нагадуємо про Ваш кошик</b>\n\n"
-            "Обрані товари все ще очікують на Вас 🛍\n\n"
-            "Якщо бажаєте оформити замовлення — поверніться до кошика та завершіть покупку 💛"
+            "⏰ <b>Бачимо, що у Вашому кошику залишилися товари.</b>\n\n"
+            "Можливо, у Вас виникли додаткові питання щодо товару, доставки або оплати? 💛\n\n"
+            "Залиште заявку на зв’язок — менеджер допоможе Вам з вибором та оформленням замовлення.\n\n"
+            "Або Ви можете одразу повернутися до кошика та завершити покупку 🛍"
         )
 
     extra = ""
@@ -576,7 +582,7 @@ def process_cart_reminders():
             discount_percent=discount_percent
         )
 
-        send_message(telegram_id, text, cart_reminder_keyboard())
+        send_message(telegram_id, text, cart_reminder_keyboard(reminder_number))
 
         sent_at = now_str()
         for row_index in data.get("rows", []):
@@ -4961,14 +4967,21 @@ def show_my_orders(chat_id):
     send_message(chat_id, text, main_menu(is_admin(chat_id)))
 
 
-def contact_manager(chat_id, user):
+def contact_manager(chat_id, user, source="manual"):
     USER_STATES[str(chat_id)] = {
         "step": "contact_waiting_full_name",
         "contact_full_name": "",
-        "contact_phone": ""
+        "contact_phone": "",
+        "contact_source": source
     }
 
-    send_message(chat_id, "Введіть, будь ласка, Ваше ПІБ:")
+    if source == "cart_reminder":
+        send_message(
+            chat_id,
+            "📞 Залиште, будь ласка, Ваше ПІБ — менеджер зв’яжеться з Вами та допоможе з товарами у кошику:"
+        )
+    else:
+        send_message(chat_id, "Введіть, будь ласка, Ваше ПІБ:")
 
 
 def finish_contact_request(chat_id, user, state):
@@ -4990,8 +5003,12 @@ def finish_contact_request(chat_id, user, state):
         main_menu(is_admin(chat_id))
     )
 
+    source = state.get("contact_source", "manual")
+    source_text = "Кошик / нагадування" if source == "cart_reminder" else "Звичайна заявка"
+
     admin_text = (
         "📞 <b>Нова заявка на зв’язок</b>\n\n"
+        f"<b>Джерело:</b> {source_text}\n"
         f"<b>ПІБ:</b> {full_name}\n"
         f"<b>Телефон:</b> {phone}\n"
         f"<b>Telegram ID:</b> {chat_id}"
@@ -5851,6 +5868,9 @@ def webhook():
 
             edit_message(chat_id, message_id, "Коментар пропущено ✅")
             ask_free_delivery_offer(chat_id)
+
+        elif data_value == "contact_from_cart":
+            with_loading(chat_id, "📞 Відкриваємо заявку на зв’язок...", contact_manager, chat_id, user, "cart_reminder")
 
         elif data_value == "need_contact_yes":
             with_loading(chat_id, "📦 Оформлюємо Ваше замовлення...", finish_order, chat_id, user, "Так", callback_message)
