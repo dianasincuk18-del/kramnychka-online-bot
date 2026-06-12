@@ -1692,6 +1692,30 @@ BONUS_MAX_USE_PERCENT = float(os.environ.get("BONUS_MAX_USE_PERCENT", "30"))
 BONUS_VALID_DAYS = int(os.environ.get("BONUS_VALID_DAYS", "60"))
 
 
+# Короткі callback-коди для Telegram.
+# Telegram дозволяє callback_data максимум 64 байти, тому не можна передавати довгі українські назви в кнопках.
+DELIVERY_METHODS = {
+    "np": "Нова пошта",
+    "ukr": "Укрпошта"
+}
+
+PAYMENT_METHODS = {
+    "iban": "Оплата за реквізитами IBAN",
+    "cod": "Накладений платіж"
+}
+
+ORDER_STATUS_CODES = {
+    "new": "Нове",
+    "pay": "Очікується оплата",
+    "work": "В обробці",
+    "sent": "Відправлено",
+    "done": "Завершено",
+    "cancel": "Скасовано"
+}
+
+ORDER_STATUS_TO_CODE = {v: k for k, v in ORDER_STATUS_CODES.items()}
+
+
 def get_bonus_worksheet():
     headers = [
         "Дата",
@@ -2091,7 +2115,7 @@ def get_referral_stats_for_user(chat_id):
     }
 
     try:
-        rows = get_values("Реферали")[1:]
+        rows = google_call_with_retry(lambda: get_referrals_worksheet().get_all_values())[1:]
         for row in rows:
             referrer_id = str(row[1] if len(row) > 1 else "").strip()
             status = str(row[6] if len(row) > 6 else "").strip().lower()
@@ -2148,7 +2172,7 @@ def get_admin_referral_stats():
     successful_by_referrer = {}
 
     try:
-        rows = get_values("Реферали")[1:]
+        rows = google_call_with_retry(lambda: get_referrals_worksheet().get_all_values())[1:]
 
         for row in rows:
             referrer_id = str(row[1] if len(row) > 1 else "").strip()
@@ -4715,8 +4739,8 @@ def handle_order_state(chat_id, text, user):
 
         keyboard = {
             "inline_keyboard": [
-                [inline_button("🚚 Нова пошта", "delivery_Нова пошта")],
-                [inline_button("📦 Укрпошта", "delivery_Укрпошта")]
+                [inline_button("🚚 Нова пошта", "delivery_np")],
+                [inline_button("📦 Укрпошта", "delivery_ukr")]
             ]
         }
         send_message(chat_id, "Оберіть, будь ласка, спосіб доставки:", keyboard)
@@ -4736,8 +4760,8 @@ def handle_order_state(chat_id, text, user):
             state["step"] = "waiting_delivery"
             keyboard = {
                 "inline_keyboard": [
-                    [inline_button("🚚 Нова пошта", "delivery_Нова пошта")],
-                    [inline_button("📦 Укрпошта", "delivery_Укрпошта")]
+                    [inline_button("🚚 Нова пошта", "delivery_np")],
+                    [inline_button("📦 Укрпошта", "delivery_ukr")]
                 ]
             }
             send_message(chat_id, "Оберіть, будь ласка, спосіб доставки:", keyboard)
@@ -4775,8 +4799,8 @@ def handle_order_state(chat_id, text, user):
 def ask_payment_method(chat_id, callback_message=None):
     keyboard = {
         "inline_keyboard": [
-            [inline_button("💳 Оплата за реквізитами IBAN", "payment_Оплата за реквізитами IBAN")],
-            [inline_button("📦 Накладений платіж", "payment_Накладений платіж")]
+            [inline_button("💳 Оплата за реквізитами IBAN", "payment_iban")],
+            [inline_button("📦 Накладений платіж", "payment_cod")]
         ]
     }
 
@@ -5147,12 +5171,12 @@ def show_admin_cabinet(chat_id, callback_message=None):
 
     keyboard = {
         "inline_keyboard": [
-            [inline_button("🆕 Нові", "admin_status_Нове")],
-            [inline_button("💳 Очікується оплата", "admin_status_Очікується оплата")],
-            [inline_button("🟡 В обробці", "admin_status_В обробці")],
-            [inline_button("🚚 Відправлено", "admin_status_Відправлено")],
-            [inline_button("✅ Завершено", "admin_status_Завершено")],
-            [inline_button("❌ Скасовано", "admin_status_Скасовано")],
+            [inline_button("🆕 Нові", "admin_status_new")],
+            [inline_button("💳 Очікується оплата", "admin_status_pay")],
+            [inline_button("🟡 В обробці", "admin_status_work")],
+            [inline_button("🚚 Відправлено", "admin_status_sent")],
+            [inline_button("✅ Завершено", "admin_status_done")],
+            [inline_button("❌ Скасовано", "admin_status_cancel")],
             [inline_button("📞 Заявки на зв’язок", "contact_requests")],
             [inline_button("👥 Клієнти", "clients_stats")],
             [inline_button("👥 Рефералка", "admin_referrals")],
@@ -5204,11 +5228,11 @@ def order_details_text(order, title="Замовлення"):
 def order_status_keyboard(row_index, extra_back="admin_back"):
     return {
         "inline_keyboard": [
-            [inline_button("💳 Очікується оплата", f"set_status_{row_index}_Очікується оплата")],
-            [inline_button("🟡 В обробці", f"set_status_{row_index}_В обробці")],
-            [inline_button("🚚 Відправлено", f"set_status_{row_index}_Відправлено")],
-            [inline_button("✅ Завершено", f"set_status_{row_index}_Завершено")],
-            [inline_button("❌ Скасовано", f"set_status_{row_index}_Скасовано")],
+            [inline_button("💳 Очікується оплата", f"set_status_{row_index}_pay")],
+            [inline_button("🟡 В обробці", f"set_status_{row_index}_work")],
+            [inline_button("🚚 Відправлено", f"set_status_{row_index}_sent")],
+            [inline_button("✅ Завершено", f"set_status_{row_index}_done")],
+            [inline_button("❌ Скасовано", f"set_status_{row_index}_cancel")],
             [inline_button("⬅️ Назад у кабінет", extra_back)]
         ]
     }
@@ -5242,7 +5266,7 @@ def show_orders_by_status(chat_id, status, callback_message=None):
 
     for idx, order in enumerate(filtered, start=1):
         text = order_details_text(order, f"{status_emoji(status)} Замовлення {idx} з {len(filtered)}: {status}")
-        keyboard = order_status_keyboard(order.get("row_index"), f"admin_status_{status}")
+        keyboard = order_status_keyboard(order.get("row_index"), f"admin_status_{ORDER_STATUS_TO_CODE.get(status, status)}")
         send_message(chat_id, text, keyboard)
 
 def notify_client_order_sent(order):
@@ -5329,7 +5353,7 @@ def set_order_status(chat_id, row_index, status, callback_message=None):
 
         keyboard = {
             "inline_keyboard": [
-                [inline_button("🔄 Оновити цей статус", f"admin_status_{status}")],
+                [inline_button("🔄 Оновити цей статус", f"admin_status_{ORDER_STATUS_TO_CODE.get(status, status)}")],
                 [inline_button("⬅️ Назад у кабінет", "admin_back")]
             ]
         }
@@ -5577,8 +5601,8 @@ def ask_admin_order_delivery(chat_id, callback_message=None):
     text = admin_order_preview_text(state) + "\n\nОберіть спосіб доставки:"
     keyboard = {
         "inline_keyboard": [
-            [inline_button("🚚 Нова пошта", "admin_order_delivery_Нова пошта")],
-            [inline_button("📦 Укрпошта", "admin_order_delivery_Укрпошта")],
+            [inline_button("🚚 Нова пошта", "admin_order_delivery_np")],
+            [inline_button("📦 Укрпошта", "admin_order_delivery_ukr")],
             [inline_button("❌ Скасувати", "admin_back")]
         ]
     }
@@ -5597,8 +5621,8 @@ def ask_admin_order_payment(chat_id, callback_message=None):
     text = "Оберіть спосіб оплати для замовлення:"
     keyboard = {
         "inline_keyboard": [
-            [inline_button("💳 Оплата за реквізитами IBAN", "admin_order_payment_Оплата за реквізитами IBAN")],
-            [inline_button("📦 Накладений платіж", "admin_order_payment_Накладений платіж")],
+            [inline_button("💳 Оплата за реквізитами IBAN", "admin_order_payment_iban")],
+            [inline_button("📦 Накладений платіж", "admin_order_payment_cod")],
             [inline_button("❌ Скасувати", "admin_back")]
         ]
     }
@@ -6329,7 +6353,8 @@ def webhook():
 
         elif data_value.startswith("delivery_"):
             state = USER_STATES.get(str(chat_id), {})
-            state["delivery_method"] = data_value.replace("delivery_", "")
+            delivery_code = data_value.replace("delivery_", "")
+            state["delivery_method"] = DELIVERY_METHODS.get(delivery_code, delivery_code)
             state["step"] = "waiting_city"
             USER_STATES[str(chat_id)] = state
 
@@ -6337,7 +6362,8 @@ def webhook():
 
         elif data_value.startswith("payment_"):
             state = USER_STATES.get(str(chat_id), {})
-            state["payment_method"] = data_value.replace("payment_", "")
+            payment_code = data_value.replace("payment_", "")
+            state["payment_method"] = PAYMENT_METHODS.get(payment_code, payment_code)
             state["step"] = "waiting_comment"
             USER_STATES[str(chat_id)] = state
 
@@ -6392,7 +6418,8 @@ def webhook():
 
         elif data_value.startswith("admin_order_delivery_"):
             state = USER_STATES.get(str(chat_id), {})
-            delivery_method = data_value.replace("admin_order_delivery_", "")
+            delivery_code = data_value.replace("admin_order_delivery_", "")
+            delivery_method = DELIVERY_METHODS.get(delivery_code, delivery_code)
             state.setdefault("admin_order", {})["delivery_method"] = delivery_method
             state["step"] = "admin_order_city"
             USER_STATES[str(chat_id)] = state
@@ -6400,20 +6427,23 @@ def webhook():
 
         elif data_value.startswith("admin_order_payment_"):
             state = USER_STATES.get(str(chat_id), {})
-            payment_method = data_value.replace("admin_order_payment_", "")
+            payment_code = data_value.replace("admin_order_payment_", "")
+            payment_method = PAYMENT_METHODS.get(payment_code, payment_code)
             state.setdefault("admin_order", {})["payment_method"] = payment_method
             state["step"] = "admin_order_comment"
             USER_STATES[str(chat_id)] = state
             edit_message(chat_id, message_id, "Додайте коментар до замовлення або введіть <code>-</code>, якщо коментар не потрібен:")
 
         elif data_value.startswith("admin_status_"):
-            status = data_value.replace("admin_status_", "")
+            status_code = data_value.replace("admin_status_", "")
+            status = ORDER_STATUS_CODES.get(status_code, status_code)
             with_loading(chat_id, "👑 Завантажуємо замовлення за статусом...", show_orders_by_status, chat_id, status, callback_message)
 
         elif data_value.startswith("set_status_"):
             parts = data_value.split("_", 3)
             row_index = parts[2]
-            status = parts[3]
+            status_code = parts[3]
+            status = ORDER_STATUS_CODES.get(status_code, status_code)
             with_loading(chat_id, "🔄 Оновлюємо статус замовлення...", set_order_status, chat_id, row_index, status, callback_message)
 
         elif data_value == "admin_search":
