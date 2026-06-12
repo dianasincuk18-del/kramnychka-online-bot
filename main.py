@@ -5107,6 +5107,7 @@ def show_admin_cabinet(chat_id, callback_message=None):
             [inline_button("📞 Заявки на зв’язок", "contact_requests")],
             [inline_button("👥 Клієнти", "clients_stats")],
             [inline_button("👥 Рефералка", "admin_referrals")],
+            [inline_button("➕ Створити замовлення клієнту", "admin_create_order")],
             [inline_button("📊 Підсумок за сьогодні", "summary_today")],
             [inline_button("📊 Підсумок за місяць", "summary_month")],
             [inline_button("🔍 Пошук", "admin_search")],
@@ -5320,6 +5321,345 @@ def show_admin_orders_sum(chat_id, callback_message=None):
     else:
         send_message(chat_id, text, keyboard)
 
+
+# =========================
+# ADMIN MANUAL ORDER CREATION
+# =========================
+
+def start_admin_create_order(chat_id, callback_message=None):
+    if not is_admin(chat_id):
+        return
+
+    USER_STATES[str(chat_id)] = {
+        "step": "admin_order_client_id",
+        "admin_order": {}
+    }
+
+    text = (
+        "➕ <b>Створення замовлення клієнту</b>\n\n"
+        "Введіть Telegram ID клієнта.\n"
+        "Він потрібен, щоб бот правильно підтягнув бонуси, знижки та історію клієнта."
+    )
+
+    if callback_message:
+        edit_message(chat_id, callback_message["message_id"], text)
+    else:
+        send_message(chat_id, text)
+
+
+def parse_admin_product_lines(text):
+    """
+    Формат для адміна:
+    123 x 2
+    456*1
+    789 3
+
+    Для звичайних товарів кількість = кількість штук.
+    Для акцій 1=2 / 1+1=3 кількість = кількість акційних наборів.
+    Наприклад: 1 набір 1=2 дасть 2 шт. у замовленні з оплатою за 1 шт.
+    """
+    raw = str(text or "").replace(",", "\n").replace(";", "\n")
+    result = []
+
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        clean = line.lower().replace("×", "x").replace("*", "x")
+        parts = clean.split("x")
+
+        if len(parts) >= 2:
+            product_id = parts[0].strip()
+            qty = safe_int(parts[1].strip(), 1)
+        else:
+            bits = clean.split()
+            product_id = bits[0].strip() if bits else ""
+            qty = safe_int(bits[1], 1) if len(bits) > 1 else 1
+
+        if product_id and qty > 0:
+            result.append({"product_id": product_id, "qty": qty})
+
+    return result
+
+
+def build_admin_order_preview(client_id, items, use_bonuses=False):
+    products_lines = []
+    subtotal = 0
+    errors = []
+
+    for item in items:
+        product_id = str(item.get("product_id", "")).strip()
+        packs_qty = safe_int(item.get("qty"), 1)
+        product = get_product_by_id(product_id)
+
+        if not product:
+            errors.append(f"ID {product_id}: товар не знайдено")
+            continue
+
+        name = safe_text(product.get("Назва товару"), "Товар")
+        price = safe_float(get_active_sale_price(product) or product.get("Ціна") or 0)
+        promo = get_product_promo_deal(product)
+
+        if promo:
+            receive_qty = int(promo.get("receive_qty", 1))
+            paid_qty = int(promo.get("paid_qty", 1))
+            actual_qty = packs_qty * receive_qty
+            paid_units = packs_qty * paid_qty
+            line_sum = round(price * paid_units, 2)
+            label = promo.get("label", "Акція")
+            products_lines.append(f"{name} ({label}) x{actual_qty} шт. / оплата за {paid_units} шт. = {line_sum} грн")
+        else:
+            actual_qty = packs_qty
+            line_sum = round(price * packs_qty, 2)
+            products_lines.append(f"{name} x{actual_qty} шт. = {line_sum} грн")
+
+        subtotal = round(subtotal + line_sum, 2)
+
+        gift_config = get_promo_gift_config(product)
+        if gift_config:
+            gift_qty = actual_qty
+            gift_sum = round(gift_qty * safe_float(gift_config.get("gift_price"), 1), 2)
+            gift_name = safe_text(gift_config.get("gift_name"), "Подарунок за акцією")
+            sale_label = safe_text(gift_config.get("sale_label"), "Акція")
+            products_lines.append(f"{gift_name} ({sale_label}) x{gift_qty} шт. = {gift_sum} грн")
+            subtotal = round(subtotal + gift_sum, 2)
+
+    discount_percent = get_client_discount_percent(client_id)
+    discount_amount = round(subtotal * discount_percent / 100, 2) if discount_percent else 0
+    after_discount = round(subtotal - discount_amount, 2)
+
+    available_bonuses = get_available_bonus_balance(client_id)
+    max_bonus_to_use = min(available_bonuses, round(after_discount * BONUS_MAX_USE_PERCENT / 100, 2))
+    bonus_used = max_bonus_to_use if use_bonuses else 0
+    total = round(after_discount - bonus_used, 2)
+
+    return {
+        "products_lines": products_lines,
+        "products_text": ", ".join(products_lines),
+        "subtotal": subtotal,
+        "discount_percent": discount_percent,
+        "discount_amount": discount_amount,
+        "available_bonuses": available_bonuses,
+        "max_bonus_to_use": max_bonus_to_use,
+        "bonus_used": bonus_used,
+        "total": total,
+        "errors": errors
+    }
+
+
+def admin_order_preview_text(state):
+    order = state.get("admin_order", {})
+    client_id = order.get("client_id", "")
+    items = order.get("items", [])
+    use_bonuses = bool(order.get("use_bonuses"))
+    totals = build_admin_order_preview(client_id, items, use_bonuses)
+
+    text = (
+        "🧾 <b>Попередній розрахунок замовлення</b>\n\n"
+        f"<b>Telegram ID клієнта:</b> <code>{client_id}</code>\n\n"
+    )
+
+    if totals.get("products_lines"):
+        text += "<b>Товари:</b>\n"
+        for line in totals["products_lines"]:
+            text += f"• {line}\n"
+    else:
+        text += "Товари ще не додано.\n"
+
+    if totals.get("errors"):
+        text += "\n⚠️ <b>Помилки:</b>\n"
+        for err in totals["errors"]:
+            text += f"• {err}\n"
+
+    text += f"\n💰 Сума товарів: <b>{totals['subtotal']} грн</b>"
+
+    if totals["discount_percent"]:
+        text += f"\n🎁 Знижка клієнта: <b>-{int(totals['discount_percent'])}%</b> ({totals['discount_amount']} грн)"
+
+    text += (
+        f"\n🎁 Доступно бонусів: <b>{totals['available_bonuses']}</b>"
+        f"\n💰 Можна списати до <b>{totals['max_bonus_to_use']} грн</b>"
+    )
+
+    if totals["bonus_used"]:
+        text += f"\n✅ Буде списано бонусів: <b>{totals['bonus_used']} грн</b>"
+
+    text += f"\n\n✅ До сплати за товари: <b>{totals['total']} грн</b>"
+    return text
+
+
+def admin_order_bonus_keyboard(state):
+    order = state.get("admin_order", {})
+    totals = build_admin_order_preview(order.get("client_id", ""), order.get("items", []), False)
+    buttons = []
+
+    if totals.get("max_bonus_to_use", 0) > 0:
+        buttons.append([inline_button(f"🎁 Використати бонуси (-{totals['max_bonus_to_use']} грн)", "admin_order_bonus_yes")])
+        buttons.append([inline_button("Без списання бонусів", "admin_order_bonus_no")])
+    else:
+        buttons.append([inline_button("Продовжити без бонусів", "admin_order_bonus_no")])
+
+    buttons.append([inline_button("❌ Скасувати", "admin_back")])
+    return {"inline_keyboard": buttons}
+
+
+def ask_admin_order_delivery(chat_id, callback_message=None):
+    state = USER_STATES.get(str(chat_id), {})
+    state["step"] = "admin_order_delivery"
+    USER_STATES[str(chat_id)] = state
+
+    text = admin_order_preview_text(state) + "\n\nОберіть спосіб доставки:"
+    keyboard = {
+        "inline_keyboard": [
+            [inline_button("🚚 Нова пошта", "admin_order_delivery_Нова пошта")],
+            [inline_button("📦 Укрпошта", "admin_order_delivery_Укрпошта")],
+            [inline_button("❌ Скасувати", "admin_back")]
+        ]
+    }
+
+    if callback_message:
+        edit_message(chat_id, callback_message["message_id"], text, keyboard)
+    else:
+        send_message(chat_id, text, keyboard)
+
+
+def ask_admin_order_payment(chat_id, callback_message=None):
+    state = USER_STATES.get(str(chat_id), {})
+    state["step"] = "admin_order_payment"
+    USER_STATES[str(chat_id)] = state
+
+    text = "Оберіть спосіб оплати для замовлення:"
+    keyboard = {
+        "inline_keyboard": [
+            [inline_button("💳 Оплата за реквізитами IBAN", "admin_order_payment_Оплата за реквізитами IBAN")],
+            [inline_button("📦 Накладений платіж", "admin_order_payment_Накладений платіж")],
+            [inline_button("❌ Скасувати", "admin_back")]
+        ]
+    }
+
+    if callback_message:
+        edit_message(chat_id, callback_message["message_id"], text, keyboard)
+    else:
+        send_message(chat_id, text, keyboard)
+
+
+def finish_admin_created_order(admin_chat_id, callback_message=None):
+    if not is_admin(admin_chat_id):
+        return
+
+    state = USER_STATES.get(str(admin_chat_id), {})
+    order = state.get("admin_order", {})
+    client_id = str(order.get("client_id", "")).strip()
+    items = order.get("items", [])
+    use_bonuses = bool(order.get("use_bonuses"))
+    totals = build_admin_order_preview(client_id, items, use_bonuses)
+
+    if not client_id or not items or totals.get("errors"):
+        send_message(admin_chat_id, "Не вдалося створити замовлення. Перевірте Telegram ID клієнта та товари.")
+        return
+
+    full_name = order.get("full_name", "")
+    phone = order.get("phone", "")
+    address = order.get("address", "")
+    delivery_method = order.get("delivery_method", "")
+    payment_method = order.get("payment_method", "")
+    comment = order.get("comment", "")
+    products_joined = totals.get("products_text", "")
+    total = totals.get("total", 0)
+    order_date = current_time().strftime("%d.%m.%Y %H:%M")
+
+    extra_notes = [f"Замовлення створив адміністратор: {admin_chat_id}"]
+    if totals.get("discount_percent"):
+        extra_notes.append(f"Знижка застосована: -{int(totals['discount_percent'])}% ({totals['discount_amount']} грн)")
+    if totals.get("bonus_used"):
+        extra_notes.append(f"Бонуси списано: {totals['bonus_used']} грн")
+
+    comment_for_sheet = (comment + "\n" if comment else "") + "\n".join(extra_notes)
+    status = "Очікується оплата" if payment_method == "Оплата за реквізитами IBAN" else "Нове"
+
+    append_row("Замовлення", [
+        order_date,
+        client_id,
+        full_name,
+        phone,
+        address,
+        delivery_method,
+        payment_method,
+        products_joined,
+        total,
+        "Так",
+        comment_for_sheet,
+        status
+    ])
+
+    order_row_index = ""
+    try:
+        order_rows = get_values("Замовлення")
+        order_row_index = len(order_rows)
+    except Exception:
+        order_row_index = ""
+
+    if totals.get("bonus_used"):
+        spend_bonuses(client_id, totals["bonus_used"], order_row_index, "Списання бонусів за замовлення, створене менеджером")
+
+    USER_STATES.pop(str(admin_chat_id), None)
+
+    notify_admin(
+        full_name=full_name,
+        phone=phone,
+        address=address,
+        delivery_method=delivery_method,
+        payment_method=payment_method,
+        comment=comment_for_sheet,
+        products=products_joined,
+        total=total,
+        need_contact="Так",
+        telegram_id=client_id
+    )
+
+    client_text = (
+        "✅ <b>Менеджер оформив для Вас замовлення</b>\n\n"
+        f"<b>Товари:</b> {products_joined}\n"
+        f"💰 До сплати за товари: <b>{total} грн</b>\n"
+        f"🚚 Доставка: <b>{delivery_method}</b>\n"
+        f"💳 Оплата: <b>{payment_method}</b>\n\n"
+    )
+
+    if totals.get("bonus_used"):
+        client_text += f"🎁 Списано бонусів: <b>{totals['bonus_used']} грн</b>\n"
+
+    client_text += "Якщо потрібно щось уточнити — менеджер зв’яжеться з Вами 💛"
+
+    if payment_method == "Оплата за реквізитами IBAN":
+        payment_details = get_setting_value("IBAN") or get_setting_value("Реквізити для оплати")
+        if payment_details:
+            client_text += (
+                "\n\n💳 <b>Реквізити для оплати:</b>\n"
+                f"{payment_details}\n\n"
+                "Після оплати надішліть, будь ласка, квитанцію сюди в бот 🧾"
+            )
+        USER_STATES[str(client_id)] = {"step": "waiting_payment_receipt"}
+
+    try:
+        send_message(client_id, client_text)
+    except Exception as e:
+        print("send admin-created order to client error:", e)
+
+    text = (
+        "✅ <b>Замовлення клієнту створено</b>\n\n"
+        f"Клієнт: <code>{client_id}</code>\n"
+        f"Сума: <b>{total} грн</b>\n"
+        f"Статус: <b>{status}</b>\n"
+        "Клієнту надіслано повідомлення в бот."
+    )
+    keyboard = {"inline_keyboard": [[inline_button("⬅️ Назад у кабінет", "admin_back")]]}
+
+    if callback_message:
+        edit_message(admin_chat_id, callback_message["message_id"], text, keyboard)
+    else:
+        send_message(admin_chat_id, text, keyboard)
+
 def start_admin_search(chat_id, callback_message=None):
     if not is_admin(chat_id):
         return
@@ -5385,6 +5725,96 @@ def handle_admin_state(chat_id, text):
 
     if not is_admin(chat_id):
         return False
+
+
+    if state.get("step") == "admin_order_client_id":
+        client_id = "".join(ch for ch in str(text).strip() if ch.isdigit() or ch == "-")
+        if not client_id:
+            send_message(chat_id, "Введіть, будь ласка, коректний Telegram ID клієнта.")
+            return True
+
+        state.setdefault("admin_order", {})["client_id"] = client_id
+        state["step"] = "admin_order_products"
+        USER_STATES[str(chat_id)] = state
+
+        balance = get_available_bonus_balance(client_id)
+        send_message(
+            chat_id,
+            "✅ Клієнта вибрано.\n\n"
+            f"Telegram ID: <code>{client_id}</code>\n"
+            f"Доступно бонусів: <b>{balance}</b>\n\n"
+            "Тепер введіть товари у форматі:\n"
+            "<code>ID товару x кількість</code>\n\n"
+            "Наприклад:\n"
+            "<code>123 x 1\n456 x 2</code>\n\n"
+            "Для акцій 1=2 / 1+1=3 кількість означає кількість акційних наборів."
+        )
+        return True
+
+    if state.get("step") == "admin_order_products":
+        items = parse_admin_product_lines(text)
+        if not items:
+            send_message(chat_id, "Не бачу товарів. Введіть, будь ласка, у форматі: <code>ID товару x кількість</code>")
+            return True
+
+        state.setdefault("admin_order", {})["items"] = items
+        preview = build_admin_order_preview(state["admin_order"].get("client_id"), items, False)
+
+        if preview.get("errors"):
+            err_text = "⚠️ Є помилки у товарах:\n" + "\n".join([f"• {e}" for e in preview["errors"]])
+            err_text += "\n\nВведіть список товарів ще раз."
+            send_message(chat_id, err_text)
+            return True
+
+        state["step"] = "admin_order_bonus_choice"
+        USER_STATES[str(chat_id)] = state
+        send_message(chat_id, admin_order_preview_text(state), admin_order_bonus_keyboard(state))
+        return True
+
+    if state.get("step") == "admin_order_full_name":
+        state.setdefault("admin_order", {})["full_name"] = text.strip()
+        state["step"] = "admin_order_phone"
+        USER_STATES[str(chat_id)] = state
+        send_message(chat_id, "Введіть номер телефону клієнта:")
+        return True
+
+    if state.get("step") == "admin_order_phone":
+        state.setdefault("admin_order", {})["phone"] = text.strip()
+        ask_admin_order_delivery(chat_id)
+        return True
+
+    if state.get("step") == "admin_order_city":
+        state.setdefault("admin_order", {})["city"] = text.strip()
+        delivery_method = state["admin_order"].get("delivery_method", "")
+        if delivery_method == "Нова пошта":
+            state["step"] = "admin_order_np_branch"
+            USER_STATES[str(chat_id)] = state
+            send_message(chat_id, "Введіть відділення Нової пошти:")
+        else:
+            state["step"] = "admin_order_ukrposhta_index"
+            USER_STATES[str(chat_id)] = state
+            send_message(chat_id, "Введіть індекс Укрпошти:")
+        return True
+
+    if state.get("step") == "admin_order_np_branch":
+        city = state.setdefault("admin_order", {}).get("city", "")
+        state["admin_order"]["delivery_point"] = text.strip()
+        state["admin_order"]["address"] = f"Місто: {city}; Відділення Нової пошти: {text.strip()}"
+        ask_admin_order_payment(chat_id)
+        return True
+
+    if state.get("step") == "admin_order_ukrposhta_index":
+        city = state.setdefault("admin_order", {}).get("city", "")
+        state["admin_order"]["delivery_point"] = text.strip()
+        state["admin_order"]["address"] = f"Місто: {city}; Індекс Укрпошти: {text.strip()}"
+        ask_admin_order_payment(chat_id)
+        return True
+
+    if state.get("step") == "admin_order_comment":
+        state.setdefault("admin_order", {})["comment"] = "" if str(text).strip() == "-" else text.strip()
+        USER_STATES[str(chat_id)] = state
+        finish_admin_created_order(chat_id)
+        return True
 
     if state.get("step") == "admin_search":
         query = text.strip().lower()
@@ -5877,6 +6307,39 @@ def webhook():
 
         elif data_value == "need_contact_no":
             with_loading(chat_id, "📦 Оформлюємо Ваше замовлення...", finish_order, chat_id, user, "Ні", callback_message)
+
+        elif data_value == "admin_create_order":
+            with_loading(chat_id, "➕ Відкриваємо створення замовлення...", start_admin_create_order, chat_id, callback_message)
+
+        elif data_value == "admin_order_bonus_yes":
+            state = USER_STATES.get(str(chat_id), {})
+            state.setdefault("admin_order", {})["use_bonuses"] = True
+            state["step"] = "admin_order_full_name"
+            USER_STATES[str(chat_id)] = state
+            edit_message(chat_id, message_id, admin_order_preview_text(state) + "\n\nВведіть ПІБ клієнта:")
+
+        elif data_value == "admin_order_bonus_no":
+            state = USER_STATES.get(str(chat_id), {})
+            state.setdefault("admin_order", {})["use_bonuses"] = False
+            state["step"] = "admin_order_full_name"
+            USER_STATES[str(chat_id)] = state
+            edit_message(chat_id, message_id, admin_order_preview_text(state) + "\n\nВведіть ПІБ клієнта:")
+
+        elif data_value.startswith("admin_order_delivery_"):
+            state = USER_STATES.get(str(chat_id), {})
+            delivery_method = data_value.replace("admin_order_delivery_", "")
+            state.setdefault("admin_order", {})["delivery_method"] = delivery_method
+            state["step"] = "admin_order_city"
+            USER_STATES[str(chat_id)] = state
+            edit_message(chat_id, message_id, "Введіть місто доставки:")
+
+        elif data_value.startswith("admin_order_payment_"):
+            state = USER_STATES.get(str(chat_id), {})
+            payment_method = data_value.replace("admin_order_payment_", "")
+            state.setdefault("admin_order", {})["payment_method"] = payment_method
+            state["step"] = "admin_order_comment"
+            USER_STATES[str(chat_id)] = state
+            edit_message(chat_id, message_id, "Додайте коментар до замовлення або введіть <code>-</code>, якщо коментар не потрібен:")
 
         elif data_value.startswith("admin_status_"):
             status = data_value.replace("admin_status_", "")
