@@ -2402,27 +2402,62 @@ def bonus_already_added_for_order(order_row_index, transaction_type="Бонус 
     return False
 
 
+def get_purchase_bonus_amount_for_order(order_row_index):
+    """
+    Повертає суму бонусу за покупку по конкретному рядку замовлення.
+    Потрібно для повідомлення адміну після зміни статусу на "Завершено".
+    """
+    try:
+        rows = get_values("Бонуси")
+        for row in reversed(rows[1:]):
+            row_type = str(row[2] if len(row) > 2 else "").strip()
+            row_order = str(row[8] if len(row) > 8 else "").strip()
+            row_status = str(row[6] if len(row) > 6 else "").strip().lower()
+            if row_type == "Бонус за покупку" and row_order == str(order_row_index).strip() and row_status == "активний":
+                return safe_float(row[3] if len(row) > 3 else 0)
+    except Exception as e:
+        print("get_purchase_bonus_amount_for_order error:", e)
+    return 0
+
+
 def process_purchase_bonus_for_order(order):
     """
-    Нараховує клієнту 5% бонусами після статусу "Завершено".
+    Нараховує клієнту бонус за покупку після статусу "Завершено".
     Повторно за те саме замовлення бонус не нараховується.
+
+    Важливо: повертає True, якщо бонус реально нараховано,
+    і False, якщо бонус уже був / немає суми / немає Telegram ID / сталася помилка.
     """
     try:
         if not order:
+            print("purchase bonus skipped: empty order")
             return False
 
         chat_id = str(order.get("Telegram ID", "")).strip()
         order_row_index = str(order.get("row_index", "")).strip()
         total = safe_float(order.get("Сума"))
 
-        if not chat_id or not order_row_index or total <= 0:
+        if not chat_id:
+            print("purchase bonus skipped: empty Telegram ID", order)
+            return False
+        if not order_row_index:
+            print("purchase bonus skipped: empty order row", order)
+            return False
+        if total <= 0:
+            print("purchase bonus skipped: empty/zero order total", order)
             return False
 
+        # Перед перевіркою чистимо кеш бонусів, щоб після зміни статусу
+        # не спиратися на старі дані з кешу.
+        clear_cache("Бонуси")
+
         if bonus_already_added_for_order(order_row_index, "Бонус за покупку"):
+            print(f"purchase bonus skipped: already added for order row {order_row_index}")
             return False
 
         bonus_amount = round(total * PURCHASE_BONUS_PERCENT / 100, 2)
         if bonus_amount <= 0:
+            print("purchase bonus skipped: calculated bonus is zero", total, PURCHASE_BONUS_PERCENT)
             return False
 
         add_bonus_transaction(
@@ -2435,17 +2470,27 @@ def process_purchase_bonus_for_order(order):
             expires_at=bonus_expiry_date()
         )
 
+        clear_cache("Бонуси")
+
+        try:
+            new_balance = get_available_bonus_balance(chat_id)
+        except Exception:
+            new_balance = bonus_amount
+
         send_message(
             chat_id,
-            "🎉 <b>Дякуємо за покупку!</b>\n\n"
-            "Ваше замовлення успішно завершене 💛\n\n"
-            f"🎁 На Ваш бонусний рахунок нараховано <b>{bonus_amount} бонусів</b>.\n"
-            f"Бонуси діють протягом <b>{BONUS_VALID_DAYS} днів</b>."
+            "🎉 <b>Ваше замовлення успішно завершено!</b>\n\n"
+            f"🎁 Вам нараховано <b>{bonus_amount} бонусів</b>.\n"
+            f"Зараз доступно: <b>{new_balance} бонусів</b>.\n\n"
+            "1 бонус = 1 грн.\n"
+            f"Бонусами можна оплатити до <b>{int(BONUS_MAX_USE_PERCENT)}%</b> суми неакційних товарів.\n"
+            f"Бонуси діють протягом <b>{BONUS_VALID_DAYS} днів</b> 💛"
         )
+        print(f"purchase bonus added: chat_id={chat_id}, order_row={order_row_index}, bonus={bonus_amount}")
         return True
 
     except Exception as e:
-        print("process_purchase_bonus_for_order error:", e)
+        print("process_purchase_bonus_for_order error:", e, "order:", order)
         return False
 
 
@@ -5479,14 +5524,19 @@ def set_order_status(chat_id, row_index, status, callback_message=None):
         target_row = rows[int(row_index) - 1] if len(rows) >= int(row_index) else []
         status_col = 12 if len(target_row) >= 12 else 10
         update_cell("Замовлення", int(row_index), status_col, status)
+        clear_cache("Замовлення")
+
+        purchase_bonus_added = None
+        referral_bonus_added = None
 
         if status == "Відправлено" and target_order:
             target_order["Статус"] = status
             notify_client_order_sent(target_order)
         elif status == "Завершено" and target_order:
             target_order["Статус"] = status
-            process_purchase_bonus_for_order(target_order)
-            process_referral_bonus_for_order(target_order)
+            # Важливо: передаємо рядок замовлення та суму саме з вибраного замовлення.
+            purchase_bonus_added = process_purchase_bonus_for_order(target_order)
+            referral_bonus_added = process_referral_bonus_for_order(target_order)
             notify_client_status_change(client_chat_id, status)
         elif status in ["Скасовано", "Повернення"] and target_order:
             target_order["Статус"] = status
@@ -5502,6 +5552,20 @@ def set_order_status(chat_id, row_index, status, callback_message=None):
             f"Клієнту надіслано сповіщення ✅"
         )
 
+        if status == "Завершено":
+            if purchase_bonus_added is True:
+                bonus_amount_for_order = get_purchase_bonus_amount_for_order(row_index)
+                if bonus_amount_for_order:
+                    text += f"\n🎁 Бонус за покупку: <b>нараховано {bonus_amount_for_order} бонусів</b> ✅"
+                else:
+                    text += "\n🎁 Бонус за покупку: <b>нараховано</b> ✅"
+            else:
+                text += "\n🎁 Бонус за покупку: <b>не нараховано</b> ⚠️"
+                text += "\n<i>Можливі причини: бонус уже був нарахований, сума замовлення 0 грн або немає Telegram ID.</i>"
+
+            if referral_bonus_added is True:
+                text += "\n👥 Реферальний бонус: <b>нараховано</b> ✅"
+
         keyboard = {
             "inline_keyboard": [
                 [inline_button("🔄 Оновити цей статус", f"admin_status_{ORDER_STATUS_TO_CODE.get(status, status)}")],
@@ -5514,7 +5578,8 @@ def set_order_status(chat_id, row_index, status, callback_message=None):
         else:
             send_message(chat_id, text, keyboard)
 
-    except Exception:
+    except Exception as e:
+        print("set_order_status error:", e, "row_index:", row_index, "status:", status)
         send_message(chat_id, "Не вдалося змінити статус. Спробуйте ще раз.", main_menu(True))
 
 
@@ -6271,6 +6336,33 @@ def mark_order_processed(chat_id, row_index, callback_message=None):
 # =========================
 # WEBHOOK
 # =========================
+
+
+def process_completed_orders_without_bonus():
+    """
+    Службова перевірка: проходить по всіх замовленнях зі статусом Завершено
+    і нараховує бонус за покупку, якщо його ще не було.
+    Корисно, якщо статус випадково змінили вручну або попередній запуск не встиг нарахувати бонус.
+    """
+    try:
+        orders = get_orders_with_rows()
+        count = 0
+        for order in orders:
+            if str(order.get("Статус", "")).strip() == "Завершено":
+                if process_purchase_bonus_for_order(order):
+                    count += 1
+        return count
+    except Exception as e:
+        print("process_completed_orders_without_bonus error:", e)
+        return 0
+
+@app.route("/process-completed-orders", methods=["GET", "HEAD"])
+def process_completed_orders_route():
+    if request.method == "HEAD":
+        return "", 200
+    count = process_completed_orders_without_bonus()
+    return f"Completed orders bonuses processed: {count}", 200
+
 
 @app.route("/", methods=["GET"])
 def home():
