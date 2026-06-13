@@ -678,6 +678,54 @@ def get_orders_with_rows():
 
 
 
+
+
+def get_fresh_order_by_row_index(row_index):
+    """
+    Завжди перечитує конкретний рядок замовлення напряму з Google Sheets,
+    без кешу get_values(). Це потрібно для бонусів після зміни статусу,
+    щоб бот точно бачив актуальні Telegram ID, Суму і Статус.
+    """
+    try:
+        ws = get_cached_worksheet("Замовлення")
+        rows = google_call_with_retry(lambda: ws.get_all_values())
+        if not rows:
+            return None
+
+        row_number = int(row_index)
+        if row_number <= 1 or len(rows) < row_number:
+            print("get_fresh_order_by_row_index: row not found", row_index)
+            return None
+
+        headers = rows[0]
+        row = rows[row_number - 1]
+        headers_map = {
+            str(header).strip().lower(): idx
+            for idx, header in enumerate(headers)
+            if str(header).strip()
+        }
+
+        return {
+            "row_index": row_number,
+            "Дата": get_order_cell(row, headers_map, "Дата", 0),
+            "Telegram ID": get_order_cell(row, headers_map, "Telegram ID", 1),
+            "ПІБ": get_order_cell(row, headers_map, "ПІБ", 2),
+            "Телефон": get_order_cell(row, headers_map, "Телефон", 3),
+            "Адреса доставки": get_order_cell(row, headers_map, "Адреса доставки", 4),
+            "Спосіб доставки": get_order_cell(row, headers_map, "Спосіб доставки", 5),
+            "Спосіб оплати": get_order_cell(row, headers_map, "Спосіб оплати", 6),
+            "Товари": get_order_cell(row, headers_map, "Товари", 7),
+            "Сума": get_order_cell(row, headers_map, "Сума", 8),
+            "Потрібно зв’язатись": get_order_cell(row, headers_map, "Потрібно зв’язатись", 9),
+            "Коментар": get_order_cell(row, headers_map, "Коментар", 10),
+            "Статус": get_order_cell(row, headers_map, "Статус", 11),
+            "Статус оплати": get_order_cell(row, headers_map, "Статус оплати", 12),
+            "_raw_row": row
+        }
+    except Exception as e:
+        print("get_fresh_order_by_row_index error:", e, "row_index:", row_index)
+        return None
+
 def get_pending_payment_order(chat_id):
     orders = get_orders_with_rows()
     pending_statuses = ["Очікується оплата", "Очікує оплати"]
@@ -2466,27 +2514,33 @@ def process_purchase_bonus_for_order(order):
     Нараховує клієнту бонус за покупку після статусу "Завершено".
     Повторно за те саме замовлення бонус не нараховується.
 
-    Важливо: повертає True, якщо бонус реально нараховано,
-    і False, якщо бонус уже був / немає суми / немає Telegram ID / сталася помилка.
+    Важливо: перед нарахуванням перечитуємо конкретний рядок замовлення
+    напряму з Google Sheets по row_index, щоб не ловити стару суму з кешу.
     """
     try:
         if not order:
             print("purchase bonus skipped: empty order")
             return False
 
-        chat_id = str(order.get("Telegram ID", "")).strip()
         order_row_index = str(order.get("row_index", "")).strip()
 
-        # Сума має братися з колонки "Сума" листа "Замовлення".
-        # Додаємо запасні варіанти, бо структура таблиці змінювалась,
-        # а іноді рядок може прийти зі старого кешу.
+        # Головна правка: якщо є номер рядка — беремо свіже замовлення напряму з таблиці.
+        fresh_order = get_fresh_order_by_row_index(order_row_index) if order_row_index else None
+        if fresh_order:
+            order = fresh_order
+
+        chat_id = str(order.get("Telegram ID", "")).strip()
+        order_row_index = str(order.get("row_index", "")).strip()
         total = safe_float(order.get("Сума"))
+
+        # Додатковий запасний пошук суми по сирому рядку, якщо назва колонки не спрацювала.
         if total <= 0:
             raw_row = order.get("_raw_row") or []
-            if len(raw_row) > 8:
-                total = safe_float(raw_row[8])  # нова структура: I = Сума
-            elif len(raw_row) > 6:
-                total = safe_float(raw_row[6])  # стара структура
+            for idx in [8, 6, 7, 9]:
+                if len(raw_row) > idx and safe_float(raw_row[idx]) > 0:
+                    total = safe_float(raw_row[idx])
+                    order["Сума"] = raw_row[idx]
+                    break
 
         if not chat_id:
             print("purchase bonus skipped: empty Telegram ID", order)
@@ -2498,8 +2552,6 @@ def process_purchase_bonus_for_order(order):
             print("purchase bonus skipped: empty/zero order total", order)
             return False
 
-        # Перед перевіркою чистимо кеш бонусів, щоб після зміни статусу
-        # не спиратися на старі дані з кешу.
         clear_cache("Бонуси")
 
         if bonus_already_added_for_order(order_row_index, "Бонус за покупку"):
@@ -2515,7 +2567,7 @@ def process_purchase_bonus_for_order(order):
             chat_id=chat_id,
             amount=bonus_amount,
             transaction_type="Бонус за покупку",
-            comment=f"{int(PURCHASE_BONUS_PERCENT)}% від завершеного замовлення",
+            comment=f"{int(PURCHASE_BONUS_PERCENT)}% від завершеного замовлення на {total} грн",
             order_row_index=order_row_index,
             status="Активний",
             expires_at=bonus_expiry_date()
@@ -2537,13 +2589,12 @@ def process_purchase_bonus_for_order(order):
             f"Бонусами можна оплатити до <b>{int(BONUS_MAX_USE_PERCENT)}%</b> суми неакційних товарів.\n"
             f"Бонуси діють протягом <b>{BONUS_VALID_DAYS} днів</b> 💛"
         )
-        print(f"purchase bonus added: chat_id={chat_id}, order_row={order_row_index}, bonus={bonus_amount}")
+        print(f"purchase bonus added: chat_id={chat_id}, order_row={order_row_index}, total={total}, bonus={bonus_amount}")
         return True
 
     except Exception as e:
         print("process_purchase_bonus_for_order error:", e, "order:", order)
         return False
-
 
 def cancel_purchase_bonus_for_order(order):
     """
@@ -5576,6 +5627,12 @@ def set_order_status(chat_id, row_index, status, callback_message=None):
         update_cell("Замовлення", int(row_index), status_col, status)
         clear_cache("Замовлення")
 
+        # Після оновлення статусу перечитуємо саме цей рядок без кешу.
+        fresh_target_order = get_fresh_order_by_row_index(row_index)
+        if fresh_target_order:
+            target_order = fresh_target_order
+            client_chat_id = target_order.get("Telegram ID")
+
         purchase_bonus_added = None
         referral_bonus_added = None
 
@@ -6103,6 +6160,15 @@ def handle_admin_state(chat_id, text):
     if not is_admin(chat_id):
         return False
 
+    admin_cancel_texts = [
+        "📦 Каталог", "🔥 Акції", "🛒 Кошик", "📦 Мої замовлення",
+        "🎁 Мої бонуси", "👥 Реферальна програма", "📞 Зв’язатися з менеджером",
+        "📞 Оформити через менеджера", "🚚 Доставка і оплата", "👑 Кабінет", "⬅️ Назад"
+    ]
+    if state.get("step", "").startswith("admin_order_") and str(text).strip() in admin_cancel_texts:
+        USER_STATES.pop(str(chat_id), None)
+        # Повертаємо False, щоб основний webhook обробив натиснуту кнопку меню як звичайну дію.
+        return False
 
     if state.get("step") == "admin_order_client_id":
         client_id = "".join(ch for ch in str(text).strip() if ch.isdigit() or ch == "-")
