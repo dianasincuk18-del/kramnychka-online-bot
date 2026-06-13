@@ -595,46 +595,87 @@ def process_cart_reminders():
 
     return sent_count
 
+def get_order_cell(row, headers_map, header_name, fallback_index=None, default=""):
+    """
+    Дістає значення з рядка замовлення по назві колонки.
+    Якщо колонки немає — використовує старий індекс як запасний варіант.
+    Це потрібно, бо структура листа "Замовлення" змінювалась.
+    """
+    try:
+        idx = headers_map.get(str(header_name).strip().lower())
+        if idx is not None and len(row) > idx:
+            return row[idx]
+    except Exception:
+        pass
+
+    if fallback_index is not None and len(row) > fallback_index:
+        return row[fallback_index]
+
+    return default
+
+
+def get_order_status_col_index():
+    """
+    Повертає номер колонки статусу в Google Sheets, починаючи з 1.
+    У новій структурі це колонка "Статус", але якщо раптом заголовки старі —
+    залишаємо запасний варіант.
+    """
+    try:
+        rows = get_values("Замовлення")
+        headers = rows[0] if rows else []
+        for idx, header in enumerate(headers, start=1):
+            if str(header).strip().lower() == "статус":
+                return idx
+    except Exception as e:
+        print("get_order_status_col_index error:", e)
+
+    return 12
+
+
 def get_orders_with_rows():
     rows = get_values("Замовлення")
     result = []
 
+    headers = rows[0] if rows else []
+    headers_map = {
+        str(header).strip().lower(): idx
+        for idx, header in enumerate(headers)
+        if str(header).strip()
+    }
+
     for i, row in enumerate(rows[1:], start=2):
-        if len(row) >= 12:
-            item = {
-                "row_index": i,
-                "Дата": row[0] if len(row) > 0 else "",
-                "Telegram ID": row[1] if len(row) > 1 else "",
-                "ПІБ": row[2] if len(row) > 2 else "",
-                "Телефон": row[3] if len(row) > 3 else "",
-                "Адреса доставки": row[4] if len(row) > 4 else "",
-                "Спосіб доставки": row[5] if len(row) > 5 else "",
-                "Спосіб оплати": row[6] if len(row) > 6 else "",
-                "Товари": row[7] if len(row) > 7 else "",
-                "Сума": row[8] if len(row) > 8 else "",
-                "Потрібно зв’язатись": row[9] if len(row) > 9 else "",
-                "Коментар": row[10] if len(row) > 10 else "",
-                "Статус": row[11] if len(row) > 11 else ""
-            }
-        else:
-            item = {
-                "row_index": i,
-                "Дата": row[0] if len(row) > 0 else "",
-                "Telegram ID": row[1] if len(row) > 1 else "",
-                "ПІБ": row[2] if len(row) > 2 else "",
-                "Телефон": row[3] if len(row) > 3 else "",
-                "Адреса доставки": row[4] if len(row) > 4 else "",
-                "Спосіб доставки": "",
-                "Спосіб оплати": "",
-                "Товари": row[5] if len(row) > 5 else "",
-                "Сума": row[6] if len(row) > 6 else "",
-                "Потрібно зв’язатись": row[7] if len(row) > 7 else "",
-                "Коментар": row[8] if len(row) > 8 else "",
-                "Статус": row[9] if len(row) > 9 else ""
-            }
+        if not row or not any(str(cell).strip() for cell in row):
+            continue
+
+        item = {
+            "row_index": i,
+            "Дата": get_order_cell(row, headers_map, "Дата", 0),
+            "Telegram ID": get_order_cell(row, headers_map, "Telegram ID", 1),
+            "ПІБ": get_order_cell(row, headers_map, "ПІБ", 2),
+            "Телефон": get_order_cell(row, headers_map, "Телефон", 3),
+            "Адреса доставки": get_order_cell(row, headers_map, "Адреса доставки", 4),
+            "Спосіб доставки": get_order_cell(row, headers_map, "Спосіб доставки", 5),
+            "Спосіб оплати": get_order_cell(row, headers_map, "Спосіб оплати", 6),
+            "Товари": get_order_cell(row, headers_map, "Товари", 7),
+            "Сума": get_order_cell(row, headers_map, "Сума", 8),
+            "Потрібно зв’язатись": get_order_cell(row, headers_map, "Потрібно зв’язатись", 9),
+            "Коментар": get_order_cell(row, headers_map, "Коментар", 10),
+            "Статус": get_order_cell(row, headers_map, "Статус", 11),
+            "Статус оплати": get_order_cell(row, headers_map, "Статус оплати", 12),
+            "_raw_row": row
+        }
+
+        # Запасний варіант для дуже старої структури:
+        # Дата, Telegram ID, ПІБ, Телефон, Адреса, Товари, Сума, ...
+        if not str(item.get("Сума", "")).strip() and len(row) > 6:
+            possible_old_sum = row[6]
+            if safe_float(possible_old_sum) > 0:
+                item["Сума"] = possible_old_sum
+
         result.append(item)
 
     return result
+
 
 
 def get_pending_payment_order(chat_id):
@@ -2435,7 +2476,17 @@ def process_purchase_bonus_for_order(order):
 
         chat_id = str(order.get("Telegram ID", "")).strip()
         order_row_index = str(order.get("row_index", "")).strip()
+
+        # Сума має братися з колонки "Сума" листа "Замовлення".
+        # Додаємо запасні варіанти, бо структура таблиці змінювалась,
+        # а іноді рядок може прийти зі старого кешу.
         total = safe_float(order.get("Сума"))
+        if total <= 0:
+            raw_row = order.get("_raw_row") or []
+            if len(raw_row) > 8:
+                total = safe_float(raw_row[8])  # нова структура: I = Сума
+            elif len(raw_row) > 6:
+                total = safe_float(raw_row[6])  # стара структура
 
         if not chat_id:
             print("purchase bonus skipped: empty Telegram ID", order)
@@ -5521,8 +5572,7 @@ def set_order_status(chat_id, row_index, status, callback_message=None):
         client_chat_id = target_order.get("Telegram ID") if target_order else ""
 
         rows = get_values("Замовлення")
-        target_row = rows[int(row_index) - 1] if len(rows) >= int(row_index) else []
-        status_col = 12 if len(target_row) >= 12 else 10
+        status_col = get_order_status_col_index()
         update_cell("Замовлення", int(row_index), status_col, status)
         clear_cache("Замовлення")
 
@@ -5534,6 +5584,24 @@ def set_order_status(chat_id, row_index, status, callback_message=None):
             notify_client_order_sent(target_order)
         elif status == "Завершено" and target_order:
             target_order["Статус"] = status
+
+            # Якщо через кеш/зміну структури сума не підтягнулась,
+            # беремо її напряму з рядка таблиці після оновлення статусу.
+            if safe_float(target_order.get("Сума")) <= 0:
+                try:
+                    fresh_rows = get_values("Замовлення")
+                    fresh_headers = fresh_rows[0] if fresh_rows else []
+                    fresh_map = {
+                        str(header).strip().lower(): idx
+                        for idx, header in enumerate(fresh_headers)
+                        if str(header).strip()
+                    }
+                    fresh_row = fresh_rows[int(row_index) - 1] if len(fresh_rows) >= int(row_index) else []
+                    target_order["Сума"] = get_order_cell(fresh_row, fresh_map, "Сума", 8)
+                    target_order["_raw_row"] = fresh_row
+                except Exception as e:
+                    print("refresh target_order sum error:", e)
+
             # Важливо: передаємо рядок замовлення та суму саме з вибраного замовлення.
             purchase_bonus_added = process_purchase_bonus_for_order(target_order)
             referral_bonus_added = process_referral_bonus_for_order(target_order)
@@ -5561,6 +5629,10 @@ def set_order_status(chat_id, row_index, status, callback_message=None):
                     text += "\n🎁 Бонус за покупку: <b>нараховано</b> ✅"
             else:
                 text += "\n🎁 Бонус за покупку: <b>не нараховано</b> ⚠️"
+                text += (
+                    f"\n<i>Перевірка: Telegram ID = {safe_text(target_order.get('Telegram ID') if target_order else '')}, "
+                    f"сума = {safe_text(target_order.get('Сума') if target_order else '')} грн.</i>"
+                )
                 text += "\n<i>Можливі причини: бонус уже був нарахований, сума замовлення 0 грн або немає Telegram ID.</i>"
 
             if referral_bonus_added is True:
