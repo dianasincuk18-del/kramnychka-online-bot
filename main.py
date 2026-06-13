@@ -2763,6 +2763,25 @@ INACTIVE_CLIENT_DAYS = int(os.environ.get("INACTIVE_CLIENT_DAYS", "30"))
 SALE_BROADCAST_LIMIT_PER_RUN = int(os.environ.get("SALE_BROADCAST_LIMIT_PER_RUN", "1"))
 
 
+# Загальне "тихе вікно" для автоматичних розсилок.
+# Щоб товар дня, акції та маркетингові повідомлення не йшли клієнтам вночі.
+BROADCAST_MIN_HOUR = int(os.environ.get("BROADCAST_MIN_HOUR", "10"))
+BROADCAST_MAX_HOUR = int(os.environ.get("BROADCAST_MAX_HOUR", "21"))
+
+AUTO_PRODUCT_BROADCAST_LOCK = {
+    "date": "",
+    "running": False
+}
+
+
+def broadcasts_allowed_now(name="broadcast"):
+    now = current_time()
+    if now.hour < BROADCAST_MIN_HOUR or now.hour >= BROADCAST_MAX_HOUR:
+        print(f"{name} skipped by Kyiv send window: {now_str()}")
+        return False
+    return True
+
+
 # =========================
 # DAILY SOFT REMINDERS
 # =========================
@@ -3330,6 +3349,9 @@ def process_marketing_broadcasts():
     Надсилає заплановані рядки з листа "Розсилки".
     За один запуск бере обмежену кількість розсилок, щоб не було спаму.
     """
+    if not broadcasts_allowed_now("marketing broadcasts"):
+        return 0
+
     ws = get_marketing_worksheet()
     rows = google_call_with_retry(lambda: ws.get_all_values())
     if not rows:
@@ -3483,6 +3505,9 @@ def process_sale_broadcasts():
     2) за 3 дні до завершення — нагадування один раз;
     3) в останній день — нагадування один раз.
     """
+    if not broadcasts_allowed_now("sale broadcasts"):
+        return 0
+
     sale_products = get_sale_products()
     sent_count = 0
 
@@ -3639,6 +3664,7 @@ def mark_auto_product_broadcasted(product):
             name,
             "Надіслано"
         ], value_input_option="USER_ENTERED")
+        clear_cache("Надіслані товари дня")
     except Exception as e:
         print("mark_auto_product_broadcasted error:", e)
 
@@ -3672,32 +3698,52 @@ def process_auto_product_day_broadcast():
     UptimeRobot може запускати її часто, але код відправить не більше 1 товару на день.
     Товари йдуть по черзі з листа "Товари".
     """
+    if not broadcasts_allowed_now("auto product broadcast"):
+        return 0
+
+    today_key = current_time().strftime("%d.%m.%Y")
+    if AUTO_PRODUCT_BROADCAST_LOCK.get("running") and AUTO_PRODUCT_BROADCAST_LOCK.get("date") == today_key:
+        print("auto product broadcast skipped: already running")
+        return 0
+
     if auto_product_broadcast_sent_today():
         return 0
 
-    product = get_next_auto_product_for_broadcast()
-    if not product:
+    AUTO_PRODUCT_BROADCAST_LOCK["running"] = True
+    AUTO_PRODUCT_BROADCAST_LOCK["date"] = today_key
+
+    try:
+        # Повторна перевірка всередині lock, щоб не було дублювання при одночасних запусках UptimeRobot.
+        if auto_product_broadcast_sent_today():
+            return 0
+
+        product = get_next_auto_product_for_broadcast()
+
+        if not product:
+            return 0
+
+        product_id = str(product.get("ID товару", "")).strip()
+        photos = get_product_photos(product)
+        photo_url = photos[0] if photos else None
+
+        text = marketing_message_text(
+            "Товар дня",
+            "✨ Товар дня у нашій крамничці",
+            "Сьогодні хочемо звернути Вашу увагу на цей товар:",
+            product
+        )
+        keyboard = product_marketing_keyboard(product_id, "🛍 Переглянути товар")
+        sent, failed = send_marketing_to_all(text, keyboard, photo_url)
+
+        if sent > 0:
+            mark_auto_product_broadcasted(product)
+            print(f"auto product broadcast sent product={product_id}, sent={sent}, failed={failed}")
+            return 1
+
         return 0
 
-    product_id = str(product.get("ID товару", "")).strip()
-    photos = get_product_photos(product)
-    photo_url = photos[0] if photos else None
-
-    text = marketing_message_text(
-        "Товар дня",
-        "✨ Товар дня у нашій крамничці",
-        "Сьогодні хочемо звернути Вашу увагу на цей товар:",
-        product
-    )
-    keyboard = product_marketing_keyboard(product_id, "🛍 Переглянути товар")
-    sent, failed = send_marketing_to_all(text, keyboard, photo_url)
-
-    if sent > 0:
-        mark_auto_product_broadcasted(product)
-        print(f"auto product broadcast sent product={product_id}, sent={sent}, failed={failed}")
-        return 1
-
-    return 0
+    finally:
+        AUTO_PRODUCT_BROADCAST_LOCK["running"] = False
 
 def show_product_by_id(chat_id, product_id, callback_message=None):
     product = get_product_by_id(product_id)
