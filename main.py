@@ -1921,7 +1921,7 @@ def calculate_bonus_to_use(chat_id, bonus_eligible_amount):
 def add_bonus_transaction(chat_id, amount, transaction_type, comment="", order_row_index="", status="Активний", expires_at=None):
     try:
         ws = get_bonus_worksheet()
-        ws.append_row([
+        google_call_with_retry(lambda: ws.append_row([
             now_str(),
             chat_id,
             transaction_type,
@@ -1931,10 +1931,12 @@ def add_bonus_transaction(chat_id, amount, transaction_type, comment="", order_r
             status,
             comment,
             order_row_index
-        ], value_input_option="USER_ENTERED")
+        ], value_input_option="USER_ENTERED"))
         clear_cache("Бонуси")
+        return True
     except Exception as e:
         print("add_bonus_transaction error:", e)
+        return False
 
 
 def spend_bonuses(chat_id, amount, order_row_index="", comment="Списання бонусів за замовлення (тільки з неакційних товарів)"):
@@ -2477,17 +2479,46 @@ def process_referral_bonus_for_order(order):
 
 
 
-def bonus_already_added_for_order(order_row_index, transaction_type="Бонус за покупку"):
+def bonus_already_added_for_order(order_row_index, transaction_type="Бонус за покупку", chat_id=None):
+    """
+    Перевіряє дубль бонусу саме за конкретне замовлення.
+
+    Важливо:
+    - не використовує кеш;
+    - не плутає бонус за перший вхід з бонусом за покупку;
+    - якщо передано chat_id, перевіряє ще й Telegram ID клієнта.
+    """
     try:
-        rows = get_values("Бонуси")
+        ws = get_bonus_worksheet()
+        rows = google_call_with_retry(lambda: ws.get_all_values())
+
+        target_order = str(order_row_index or "").strip()
+        target_type = str(transaction_type or "").strip().lower()
+        target_chat = str(chat_id or "").strip()
+
         for row in rows[1:]:
-            row_type = str(row[2] if len(row) > 2 else "").strip()
-            row_order = str(row[8] if len(row) > 8 else "").strip()
+            row_chat = str(row[1] if len(row) > 1 else "").strip()
+            row_type = str(row[2] if len(row) > 2 else "").strip().lower()
+            row_amount = safe_float(row[3] if len(row) > 3 else 0)
             row_status = str(row[6] if len(row) > 6 else "").strip().lower()
-            if row_type == transaction_type and row_order == str(order_row_index).strip() and row_status == "активний":
-                return True
+            row_order = str(row[8] if len(row) > 8 else "").strip()
+
+            if row_type != target_type:
+                continue
+            if row_order != target_order:
+                continue
+            if row_status != "активний":
+                continue
+            if row_amount <= 0:
+                continue
+            if target_chat and row_chat != target_chat:
+                continue
+
+            return True
+
     except Exception as e:
         print("bonus_already_added_for_order error:", e)
+
     return False
 
 
@@ -2554,8 +2585,8 @@ def process_purchase_bonus_for_order(order):
 
         clear_cache("Бонуси")
 
-        if bonus_already_added_for_order(order_row_index, "Бонус за покупку"):
-            print(f"purchase bonus skipped: already added for order row {order_row_index}")
+        if bonus_already_added_for_order(order_row_index, "Бонус за покупку", chat_id):
+            print(f"purchase bonus skipped: already added for order row {order_row_index}, chat_id={chat_id}")
             return False
 
         bonus_amount = round(total * PURCHASE_BONUS_PERCENT / 100, 2)
@@ -2563,7 +2594,7 @@ def process_purchase_bonus_for_order(order):
             print("purchase bonus skipped: calculated bonus is zero", total, PURCHASE_BONUS_PERCENT)
             return False
 
-        add_bonus_transaction(
+        added_ok = add_bonus_transaction(
             chat_id=chat_id,
             amount=bonus_amount,
             transaction_type="Бонус за покупку",
@@ -2572,6 +2603,10 @@ def process_purchase_bonus_for_order(order):
             status="Активний",
             expires_at=bonus_expiry_date()
         )
+
+        if not added_ok:
+            print("purchase bonus skipped: bonus row was not written to sheet", chat_id, order_row_index, bonus_amount)
+            return False
 
         clear_cache("Бонуси")
 
