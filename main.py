@@ -2002,6 +2002,7 @@ def show_clients_stats(chat_id, callback_message=None):
 BONUS_RATE_UAH = 1
 WELCOME_BONUS_AMOUNT = float(os.environ.get("WELCOME_BONUS_AMOUNT", "100"))
 WELCOME_BONUS_BROADCAST_LIMIT_PER_RUN = int(os.environ.get("WELCOME_BONUS_BROADCAST_LIMIT_PER_RUN", "30"))
+MENU_UPDATE_LIMIT_PER_RUN = int(os.environ.get("MENU_UPDATE_LIMIT_PER_RUN", "30"))
 REFERRAL_BONUS_AMOUNT = int(os.environ.get("REFERRAL_BONUS_AMOUNT", "50"))
 REFERRAL_MIN_ORDER_SUM = float(os.environ.get("REFERRAL_MIN_ORDER_SUM", "500"))
 BONUS_MAX_USE_PERCENT = float(os.environ.get("BONUS_MAX_USE_PERCENT", "30"))
@@ -6961,6 +6962,110 @@ def process_completed_orders_without_bonus():
         print("process_completed_orders_without_bonus error:", e)
         return 0
 
+
+
+# =========================
+# MENU UPDATE BROADCAST
+# =========================
+
+def ensure_users_menu_update_column():
+    """
+    Додає у лист "Користувачі" службову колонку "Меню оновлено",
+    щоб не надсилати оновлення одним і тим самим клієнтам повторно.
+    """
+    try:
+        ws = get_users_worksheet()
+        rows = google_call_with_retry(lambda: ws.get_all_values())
+        headers = rows[0] if rows else []
+
+        for idx, header in enumerate(headers, start=1):
+            if str(header).strip().lower() == "меню оновлено":
+                return ws, idx
+
+        new_col = len(headers) + 1 if headers else 8
+        google_call_with_retry(lambda: ws.update_cell(1, new_col, "Меню оновлено"))
+        clear_cache("Користувачі")
+        return ws, new_col
+
+    except Exception as e:
+        print("ensure_users_menu_update_column error:", e)
+        return None, None
+
+
+def send_updated_inline_menu_to_user(chat_id, is_admin_user=False):
+    """
+    Прибирає стару нижню клавіатуру і надсилає нове inline-меню.
+    Службове повідомлення з remove_keyboard одразу видаляється.
+    """
+    try:
+        remove_reply_keyboard(chat_id)
+
+        text = (
+            "🏠 <b>Меню крамнички оновлено</b>\n\n"
+            "Тепер усе зручніше: каталог, кошик, бонуси, замовлення та зв’язок з менеджером "
+            "доступні через кнопки нижче 👇"
+        )
+
+        message_id = send_message(chat_id, text, main_menu_inline(is_admin_user))
+        return bool(message_id)
+
+    except Exception as e:
+        print("send_updated_inline_menu_to_user error:", e, "chat_id:", chat_id)
+        return False
+
+
+def process_user_menu_updates():
+    """
+    Оновлює меню старим користувачам з листа "Користувачі".
+    За один запуск обробляє MENU_UPDATE_LIMIT_PER_RUN клієнтів.
+    Успішно оновлених позначає в колонці "Меню оновлено".
+    """
+    try:
+        ws, menu_col = ensure_users_menu_update_column()
+        if not ws or not menu_col:
+            return 0
+
+        rows = google_call_with_retry(lambda: ws.get_all_values())
+        if len(rows) <= 1:
+            return 0
+
+        admin_ids = set(str(x).strip() for x in get_admin_ids())
+        processed_count = 0
+
+        for row_index, row in enumerate(rows[1:], start=2):
+            if processed_count >= MENU_UPDATE_LIMIT_PER_RUN:
+                break
+
+            chat_id = str(row[0] if len(row) > 0 else "").strip()
+            if not chat_id:
+                continue
+
+            already_updated = str(row[menu_col - 1] if len(row) >= menu_col else "").strip()
+            if already_updated:
+                continue
+
+            ok = send_updated_inline_menu_to_user(
+                chat_id=chat_id,
+                is_admin_user=chat_id in admin_ids
+            )
+
+            if ok:
+                google_call_with_retry(lambda row_index=row_index: ws.update_cell(row_index, menu_col, now_str()))
+                processed_count += 1
+                time.sleep(0.12)
+            else:
+                # Не ставимо позначку, щоб можна було повторити пізніше.
+                time.sleep(0.12)
+
+        if processed_count:
+            clear_cache("Користувачі")
+
+        return processed_count
+
+    except Exception as e:
+        print("process_user_menu_updates error:", e)
+        return 0
+
 @app.route("/process-completed-orders", methods=["GET", "HEAD"])
 def process_completed_orders_route():
     if request.method == "HEAD":
@@ -7410,6 +7515,24 @@ def webhook():
     return "ok"
 
 
+
+
+
+@app.route("/update-user-menus", methods=["GET", "POST", "HEAD"])
+def update_user_menus_endpoint():
+    if request.method == "HEAD":
+        return "", 200
+
+    token = request.args.get("token", "")
+    if CRON_SECRET and token != CRON_SECRET:
+        return "Forbidden", 403
+
+    try:
+        sent_count = process_user_menu_updates()
+        return f"User menus updated: {sent_count}", 200
+    except Exception as e:
+        print("update_user_menus_endpoint error:", e)
+        return "User menu update error", 500
 
 @app.route("/welcome-bonus-broadcast", methods=["GET", "POST"])
 def welcome_bonus_broadcast_endpoint():
