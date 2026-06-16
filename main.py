@@ -3,6 +3,7 @@ import json
 import requests
 import gspread
 import time
+import threading
 from flask import Flask, request
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
@@ -19,6 +20,78 @@ CRON_SECRET = os.environ.get("CRON_SECRET", "")
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 USER_STATES = {}
+
+# =========================
+# AUTO DELETE / CLEAN CHAT
+# =========================
+# Автоматично видаляємо товарні картки через 20 хвилин.
+# Можна змінити в Render Environment:
+# PRODUCT_CARD_AUTO_DELETE_SECONDS = 1200
+PRODUCT_CARD_AUTO_DELETE_SECONDS = int(os.environ.get("PRODUCT_CARD_AUTO_DELETE_SECONDS", "1200"))
+
+# Запамʼятовуємо товарні повідомлення, щоб прибирати старі картки при переходах.
+USER_PRODUCT_MESSAGES = {}
+
+
+def schedule_delete_message(chat_id, message_id, delay_seconds=None):
+    """
+    Планує видалення повідомлення бота через delay_seconds.
+    Telegram дозволяє боту видаляти тільки свої повідомлення.
+    """
+    try:
+        if not message_id:
+            return
+
+        delay_seconds = int(delay_seconds or PRODUCT_CARD_AUTO_DELETE_SECONDS)
+        if delay_seconds <= 0:
+            return
+
+        timer = threading.Timer(delay_seconds, delete_message, args=(chat_id, message_id))
+        timer.daemon = True
+        timer.start()
+
+    except Exception as e:
+        print("schedule_delete_message error:", e)
+
+
+def register_product_message(chat_id, message_id, auto_delete_after=None):
+    """
+    Зберігаємо message_id товарної картки, щоб:
+    1) видалити її при переході на інший розділ;
+    2) автоматично прибрати через 10–20 хвилин.
+    """
+    try:
+        if not message_id:
+            return
+
+        key = str(chat_id)
+        USER_PRODUCT_MESSAGES.setdefault(key, [])
+        if message_id not in USER_PRODUCT_MESSAGES[key]:
+            USER_PRODUCT_MESSAGES[key].append(message_id)
+
+        schedule_delete_message(chat_id, message_id, auto_delete_after)
+
+    except Exception as e:
+        print("register_product_message error:", e)
+
+
+def clear_product_messages(chat_id):
+    """
+    При новому кліку/переході прибираємо попередні товарні картки,
+    щоб чат не засмічувався старими товарами.
+    """
+    try:
+        key = str(chat_id)
+        message_ids = USER_PRODUCT_MESSAGES.get(key, [])
+
+        for message_id in message_ids:
+            delete_message(chat_id, message_id)
+
+        USER_PRODUCT_MESSAGES[key] = []
+
+    except Exception as e:
+        print("clear_product_messages error:", e)
+
 
 # =========================
 # TIMEZONE
@@ -904,7 +977,8 @@ def send_photo(chat_id, photo_url, caption, keyboard=None):
             print("send_photo telegram error:", response.text)
             return False
 
-        return True
+        data = response.json()
+        return data.get("result", {}).get("message_id") or True
 
     except Exception as e:
         print("send_photo error:", e)
@@ -930,7 +1004,8 @@ def send_document(chat_id, document_url, caption="", keyboard=None):
             print("send_document telegram error:", response.text)
             return False
 
-        return True
+        data = response.json()
+        return data.get("result", {}).get("message_id") or True
 
     except Exception as e:
         print("send_document error:", e)
@@ -3928,6 +4003,7 @@ def process_auto_product_day_broadcast():
         AUTO_PRODUCT_BROADCAST_LOCK["running"] = False
 
 def show_product_by_id(chat_id, product_id, callback_message=None):
+    clear_product_messages(chat_id)
     product = get_product_by_id(product_id)
     if not product:
         send_message(chat_id, "На жаль, товар уже не знайдено або він недоступний 😔", main_menu(is_admin(chat_id)))
@@ -4232,13 +4308,18 @@ def show_more_product_photos(chat_id, product_index):
         send_message(chat_id, "Додаткових фото для цього товару немає 😔")
         return
 
-    send_message(chat_id, "📸 Додаткові фото товару:")
+    header_message_id = send_message(chat_id, "📸 Додаткові фото товару:")
+    register_product_message(chat_id, header_message_id, PRODUCT_CARD_AUTO_DELETE_SECONDS)
 
     for photo_url in extra_photos:
         ok = send_photo(chat_id, photo_url, "")
 
-        if not ok:
-            send_document(chat_id, photo_url, "")
+        if ok:
+            register_product_message(chat_id, ok, PRODUCT_CARD_AUTO_DELETE_SECONDS)
+        else:
+            doc_ok = send_document(chat_id, photo_url, "")
+            if doc_ok:
+                register_product_message(chat_id, doc_ok, PRODUCT_CARD_AUTO_DELETE_SECONDS)
 
 
 
@@ -4253,16 +4334,19 @@ def product_short_caption(product, index=None, total=None):
     return caption[:1000]
 
 
-def send_product_text(chat_id, text, keyboard=None):
+def send_product_text(chat_id, text, keyboard=None, auto_delete_after=None, track_product=False):
     """
     Telegram дозволяє довгий текст окремим повідомленням, але не дозволяє
     дуже довгий підпис під фото. Тому опис товару відправляємо окремо.
+    Якщо це товарна картка — запамʼятовуємо message_id і видаляємо автоматично.
     """
     max_len = 3900
 
     if len(text) <= max_len:
-        send_message(chat_id, text, keyboard)
-        return
+        message_id = send_message(chat_id, text, keyboard)
+        if track_product:
+            register_product_message(chat_id, message_id, auto_delete_after)
+        return [message_id] if message_id else []
 
     parts = []
     current = ""
@@ -4280,9 +4364,16 @@ def send_product_text(chat_id, text, keyboard=None):
     if current:
         parts.append(current)
 
+    message_ids = []
     for idx, part in enumerate(parts):
         part_keyboard = keyboard if idx == len(parts) - 1 else None
-        send_message(chat_id, part, part_keyboard)
+        message_id = send_message(chat_id, part, part_keyboard)
+        if message_id:
+            message_ids.append(message_id)
+            if track_product:
+                register_product_message(chat_id, message_id, auto_delete_after)
+
+    return message_ids
 
 
 def show_product_card(chat_id, products, index=0, mode="category", category_id="", photo_index=0):
@@ -4313,14 +4404,30 @@ def show_product_card(chat_id, products, index=0, mode="category", category_id="
         short_caption = product_short_caption(product, index, total)
         ok = send_photo(chat_id, photos[0], short_caption)
 
-        if not ok:
+        if ok:
+            register_product_message(chat_id, ok, PRODUCT_CARD_AUTO_DELETE_SECONDS)
+        else:
             doc_ok = send_document(chat_id, photos[0], short_caption)
-            if not doc_ok:
+            if doc_ok:
+                register_product_message(chat_id, doc_ok, PRODUCT_CARD_AUTO_DELETE_SECONDS)
+            else:
                 print("product photo failed, sending text only")
 
-        send_product_text(chat_id, text, keyboard)
+        send_product_text(
+            chat_id,
+            text,
+            keyboard,
+            auto_delete_after=PRODUCT_CARD_AUTO_DELETE_SECONDS,
+            track_product=True
+        )
     else:
-        send_product_text(chat_id, text, keyboard)
+        send_product_text(
+            chat_id,
+            text,
+            keyboard,
+            auto_delete_after=PRODUCT_CARD_AUTO_DELETE_SECONDS,
+            track_product=True
+        )
 
 
 
@@ -4341,6 +4448,9 @@ def build_products_page_keyboard(page, total_pages):
 
 
 def show_products_page(chat_id, products, page=0, mode="category", category_id="", callback_message=None):
+    # При переході на нову сторінку/розділ прибираємо старі товарні картки.
+    clear_product_messages(chat_id)
+
     if not products:
         text = "Товарів поки немає 😔"
         keyboard = back_to_main_inline()
@@ -4389,11 +4499,12 @@ def show_products_page(chat_id, products, page=0, mode="category", category_id="
         )
 
     # Додаємо кнопки навігації ще раз після товарів, щоб користувачу не треба було скролити вгору.
-    send_message(
+    nav_message_id = send_message(
         chat_id,
         f"📄 Сторінка <b>{page + 1}</b> з <b>{total_pages}</b>",
         build_products_page_keyboard(page, total_pages)
     )
+    register_product_message(chat_id, nav_message_id, PRODUCT_CARD_AUTO_DELETE_SECONDS)
 
 
 def update_product_card(chat_id, message_id, products, index=0, mode="category", category_id="", photo_index=0, callback_message=None):
@@ -6586,6 +6697,7 @@ def webhook():
             else:
                 show_main_menu(chat_id)
         elif text == "📦 Каталог":
+            clear_product_messages(chat_id)
             with_loading(chat_id, "🛍️ Зачекайте, будь ласка...\n\nПідбираємо для Вас товари ✨", show_catalog_menu, chat_id)
         elif category:
             with_loading(chat_id, "📂 Завантажуємо розділи...", show_subcategories_reply, chat_id, category.get("ID категорії"))
@@ -6596,12 +6708,16 @@ def webhook():
             subsection = get_subsection_by_button_text(text, USER_STATES.get(str(chat_id), {}).get("subcategory_id"))
             with_loading(chat_id, "📦 Завантажуємо товари...", show_products_by_subsection, chat_id, subsection.get("ID підрозділу"))
         elif text == "🔥 Акції":
+            clear_product_messages(chat_id)
             with_loading(chat_id, "🔥 Шукаємо найвигідніші пропозиції для Вас...\n\nЗачекайте декілька секунд ⏳", show_sales, chat_id)
         elif text == "🛒 Кошик":
+            clear_product_messages(chat_id)
             with_loading(chat_id, "🛒 Формуємо Ваш кошик...\n\nЗачекайте, будь ласка ⏳", show_cart, chat_id)
         elif text == "📦 Мої замовлення":
+            clear_product_messages(chat_id)
             with_loading(chat_id, "📦 Завантажуємо інформацію про Ваші замовлення...\n\nЗачекайте, будь ласка ⏳", show_my_orders, chat_id)
         elif text == "🎁 Мої бонуси":
+            clear_product_messages(chat_id)
             with_loading(chat_id, "🎁 Завантажуємо Ваші бонуси...", show_bonus_cabinet, chat_id)
         elif text == "👥 Реферальна програма":
             with_loading(chat_id, "👥 Завантажуємо умови реферальної програми...", show_referral_program, chat_id)
@@ -6706,9 +6822,11 @@ def webhook():
             with_loading(chat_id, "🛍 Завантажуємо товар...", show_product_by_id, chat_id, product_id, callback_message)
 
         elif data_value == "open_catalog":
+            clear_product_messages(chat_id)
             with_loading(chat_id, "📦 Відкриваємо каталог...", show_catalog_menu, chat_id)
 
         elif data_value == "open_cart":
+            clear_product_messages(chat_id)
             with_loading(chat_id, "🛒 Формуємо Ваш кошик...", show_cart, chat_id, callback_message)
 
         elif data_value == "bonus_use":
