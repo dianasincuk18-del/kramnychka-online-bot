@@ -4400,6 +4400,14 @@ def product_short_caption(product, index=None, total=None):
     return caption[:1000]
 
 
+def can_send_as_photo_caption(text):
+    """
+    Telegram дозволяє caption до 1024 символів.
+    Ставимо запас 1000 символів, бо HTML-теги/емодзі іноді можуть давати помилку.
+    """
+    return len(str(text or "")) <= 1000
+
+
 def send_product_text(chat_id, text, keyboard=None, auto_delete_after=None, track_product=False):
     """
     Telegram дозволяє довгий текст окремим повідомленням, але не дозволяє
@@ -4465,27 +4473,46 @@ def show_product_card(chat_id, products, index=0, mode="category", category_id="
     keyboard = build_product_keyboard(product_id, products, index, mode, category_id, 0)
 
     if photos:
-        # ВАЖЛИВО: не ставимо весь опис у caption, бо Telegram має ліміт ~1024 символи.
-        # Фото надсилаємо з коротким підписом, а повний опис + кнопки окремим повідомленням.
-        short_caption = product_short_caption(product, index, total)
-        ok = send_photo(chat_id, photos[0], short_caption)
+        # Якщо опис короткий — надсилаємо фото + весь опис + кнопки одним повідомленням.
+        # Якщо опис раптом довший за ліміт Telegram, залишаємо безпечний запасний варіант:
+        # фото з короткою назвою + повний опис окремим повідомленням.
+        if can_send_as_photo_caption(text):
+            ok = send_photo(chat_id, photos[0], text, keyboard)
 
-        if ok:
-            register_product_message(chat_id, ok, PRODUCT_CARD_AUTO_DELETE_SECONDS)
-        else:
-            doc_ok = send_document(chat_id, photos[0], short_caption)
-            if doc_ok:
-                register_product_message(chat_id, doc_ok, PRODUCT_CARD_AUTO_DELETE_SECONDS)
+            if ok:
+                register_product_message(chat_id, ok, PRODUCT_CARD_AUTO_DELETE_SECONDS)
             else:
-                print("product photo failed, sending text only")
+                doc_ok = send_document(chat_id, photos[0], text, keyboard)
+                if doc_ok:
+                    register_product_message(chat_id, doc_ok, PRODUCT_CARD_AUTO_DELETE_SECONDS)
+                else:
+                    send_product_text(
+                        chat_id,
+                        text,
+                        keyboard,
+                        auto_delete_after=PRODUCT_CARD_AUTO_DELETE_SECONDS,
+                        track_product=True
+                    )
+        else:
+            short_caption = product_short_caption(product, index, total)
+            ok = send_photo(chat_id, photos[0], short_caption)
 
-        send_product_text(
-            chat_id,
-            text,
-            keyboard,
-            auto_delete_after=PRODUCT_CARD_AUTO_DELETE_SECONDS,
-            track_product=True
-        )
+            if ok:
+                register_product_message(chat_id, ok, PRODUCT_CARD_AUTO_DELETE_SECONDS)
+            else:
+                doc_ok = send_document(chat_id, photos[0], short_caption)
+                if doc_ok:
+                    register_product_message(chat_id, doc_ok, PRODUCT_CARD_AUTO_DELETE_SECONDS)
+                else:
+                    print("product photo failed, sending text only")
+
+            send_product_text(
+                chat_id,
+                text,
+                keyboard,
+                auto_delete_after=PRODUCT_CARD_AUTO_DELETE_SECONDS,
+                track_product=True
+            )
     else:
         send_product_text(
             chat_id,
@@ -4604,12 +4631,15 @@ def update_product_card(chat_id, message_id, products, index=0, mode="category",
     keyboard = build_product_keyboard(product_id, products, index, mode, category_id, photo_index)
 
     if photos:
-        # Для редагування теж не використовуємо довгий caption.
-        short_caption = product_short_caption(product, index, total)
-        edit_media_photo(chat_id, message_id, photos[photo_index], short_caption)
-        send_product_text(chat_id, text, keyboard)
+        # Якщо опис влазить у caption — редагуємо фото так, щоб опис і кнопки були разом.
+        if can_send_as_photo_caption(text):
+            edit_media_photo(chat_id, message_id, photos[photo_index], text, keyboard)
+        else:
+            short_caption = product_short_caption(product, index, total)
+            edit_media_photo(chat_id, message_id, photos[photo_index], short_caption)
+            send_product_text(chat_id, text, keyboard, auto_delete_after=PRODUCT_CARD_AUTO_DELETE_SECONDS, track_product=True)
     else:
-        send_product_text(chat_id, text, keyboard)
+        send_product_text(chat_id, text, keyboard, auto_delete_after=PRODUCT_CARD_AUTO_DELETE_SECONDS, track_product=True)
 
 def show_subcategories_reply(chat_id, category_id):
     subcategories = get_active_subcategories(category_id)
