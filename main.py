@@ -1172,6 +1172,14 @@ def callback_loading_text(data_value):
         return "📞 Готуємо заявку менеджеру..."
     if data_value in ["open_catalog", "add_more_products"]:
         return "📦 Відкриваємо каталог..."
+    if data_value == "open_orders":
+        return "📦 Завантажуємо замовлення..."
+    if data_value == "open_delivery_payment":
+        return "🚚 Завантажуємо доставку та оплату..."
+    if data_value in ["contact_manager_general", "manager_order"]:
+        return "📞 Готуємо заявку менеджеру..."
+    if data_value == "open_admin":
+        return "👑 Відкриваємо кабінет..."
     if data_value in ["open_cart", "continue_checkout"]:
         return "🛒 Завантажуємо кошик..."
     if data_value in ["bonus_use", "bonus_disable", "open_bonus_cabinet"]:
@@ -1189,21 +1197,41 @@ def callback_loading_text(data_value):
 
 
 def main_menu(is_admin=False):
-    keyboard = [
-        [{"text": "📦 Каталог"}, {"text": "🔥 Акції"}],
-        [{"text": "🛒 Кошик"}, {"text": "📦 Мої замовлення"}],
-        [{"text": "🎁 Мої бонуси"}, {"text": "👥 Реферальна програма"}],
-        [{"text": "📞 Зв’язатися з менеджером"}, {"text": "🚚 Доставка і оплата"}],
-        [{"text": "📞 Оформити через менеджера"}]
+    """
+    Старе нижнє меню більше не показуємо.
+    Цю функцію залишаємо як безпечний fallback: вона прибирає Reply Keyboard,
+    якщо він залишився у клієнта після попередніх версій бота.
+    """
+    return {"remove_keyboard": True}
+
+
+def main_menu_inline(is_admin=False):
+    buttons = [
+        [inline_button("📦 Каталог", "open_catalog"), inline_button("🔥 Акції", "open_sales")],
+        [inline_button("🛒 Кошик", "open_cart"), inline_button("📦 Мої замовлення", "open_orders")],
+        [inline_button("🎁 Мої бонуси", "open_bonus_cabinet"), inline_button("👥 Реферальна програма", "open_referral_program")],
+        [inline_button("📞 Зв’язатися з менеджером", "contact_manager_general")],
+        [inline_button("📞 Оформити через менеджера", "manager_order")],
+        [inline_button("🚚 Доставка і оплата", "open_delivery_payment")]
     ]
 
     if is_admin:
-        keyboard.append([{"text": "👑 Кабінет"}])
+        buttons.append([inline_button("👑 Кабінет", "open_admin")])
 
-    return {
-        "keyboard": keyboard,
-        "resize_keyboard": True
-    }
+    return {"inline_keyboard": buttons}
+
+
+def remove_reply_keyboard(chat_id):
+    """
+    Акуратно прибирає старі нижні кнопки. Службове повідомлення одразу видаляється,
+    щоб не засмічувати чат.
+    """
+    try:
+        message_id = send_message(chat_id, "Оновлюємо меню…", {"remove_keyboard": True})
+        if message_id:
+            delete_message(chat_id, message_id)
+    except Exception as e:
+        print("remove_reply_keyboard error:", e)
 
 
 def categories_menu():
@@ -4344,6 +4372,9 @@ def build_product_keyboard(product_id, products, index, mode="category", categor
 
 def start(chat_id):
     USER_STATES.pop(str(chat_id), None)
+    clear_product_messages(chat_id)
+    clear_service_messages(chat_id)
+    remove_reply_keyboard(chat_id)
 
     text = (
         "Привіт 👋\n\n"
@@ -4353,20 +4384,24 @@ def start(chat_id):
         "Бажаємо приємних покупок та гарного настрою 🌸\n\n"
         "Оберіть, будь ласка, що хочете переглянути:"
     )
-    send_message(chat_id, text, main_menu(is_admin(chat_id)))
+    send_service_message(chat_id, text, main_menu_inline(is_admin(chat_id)), clear_products=False)
 
 
-def show_main_menu(chat_id):
+def show_main_menu(chat_id, callback_message=None):
     USER_STATES.pop(str(chat_id), None)
-    send_message(
-        chat_id,
-        "🏠 <b>Головне меню</b>\n\nОберіть, будь ласка, що хочете переглянути:",
-        main_menu(is_admin(chat_id))
-    )
+    clear_product_messages(chat_id)
+    text = "🏠 <b>Головне меню</b>\n\nОберіть, будь ласка, що хочете переглянути:"
+    keyboard = main_menu_inline(is_admin(chat_id))
+
+    if callback_message:
+        update_service_message(chat_id, callback_message, text, keyboard, clear_products=False)
+    else:
+        remove_reply_keyboard(chat_id)
+        send_service_message(chat_id, text, keyboard, clear_products=False)
 
 
 def show_my_id(chat_id):
-    send_message(chat_id, f"Ваш Telegram ID:\n<code>{chat_id}</code>", main_menu(is_admin(chat_id)))
+    send_service_message(chat_id, f"Ваш Telegram ID:\n<code>{chat_id}</code>", back_to_main_inline())
 
 
 def show_catalog_menu(chat_id, callback_message=None):
@@ -5581,7 +5616,7 @@ def get_setting_value(param_name):
 
 
 
-def show_my_orders(chat_id):
+def show_my_orders(chat_id, callback_message=None):
     orders = get_orders_with_rows()
 
     my_orders = [
@@ -5590,10 +5625,11 @@ def show_my_orders(chat_id):
     ]
 
     if not my_orders:
-        send_service_message(
+        update_service_message(
             chat_id,
+            callback_message,
             "📦 У Вас поки немає замовлень.",
-            main_menu(is_admin(chat_id))
+            back_to_main_inline()
         )
         return
 
@@ -5609,7 +5645,8 @@ def show_my_orders(chat_id):
             f"📌 Статус: <b>{safe_text(order.get('Статус'), 'Нове')}</b>\n\n"
         )
 
-    send_service_message(chat_id, text, main_menu(is_admin(chat_id)))
+    keyboard = {"inline_keyboard": [[inline_button("⬅️ Назад у меню", "back_main")]]}
+    update_service_message(chat_id, callback_message, text, keyboard)
 
 
 
@@ -5721,10 +5758,10 @@ def finish_contact_request(chat_id, user, state):
         "Нова"
     ])
 
-    send_message(
+    send_service_message(
         chat_id,
         "✅ Дякуємо! Заявку передано менеджеру. Ми скоро зв’яжемося з Вами 💛",
-        main_menu(is_admin(chat_id))
+        main_menu_inline(is_admin(chat_id))
     )
 
     source = state.get("contact_source", "manual")
@@ -5762,11 +5799,11 @@ def finish_contact_request(chat_id, user, state):
     for admin_id in get_admin_ids():
         send_message(admin_id, admin_text)
 
-def show_delivery_payment(chat_id):
+def show_delivery_payment(chat_id, callback_message=None):
     settings = get_cached_records("Налаштування")
 
     if not settings:
-        send_service_message(chat_id, "Інформацію про доставку й оплату ще не додано.", main_menu(is_admin(chat_id)))
+        update_service_message(chat_id, callback_message, "Інформацію про доставку й оплату ще не додано.", back_to_main_inline())
         return
 
     text = "🚚 <b>Доставка і оплата</b>\n\n"
@@ -5776,7 +5813,7 @@ def show_delivery_payment(chat_id):
         value = row.get("Значення")
         text += f"<b>{param}:</b>\n{value}\n\n"
 
-    send_service_message(chat_id, text, back_to_main_inline())
+    update_service_message(chat_id, callback_message, text, back_to_main_inline())
 
 
 # =========================
@@ -6963,7 +7000,7 @@ def webhook():
         elif text == "👑 Кабінет":
             with_loading(chat_id, "👑 Завантажуємо кабінет...\n\nОтримуємо актуальні дані ⏳", show_admin_cabinet, chat_id)
         else:
-            send_message(chat_id, "Оберіть, будь ласка, дію з меню 👇", main_menu(is_admin(chat_id)))
+            send_service_message(chat_id, "Оберіть, будь ласка, дію в меню 👇", main_menu_inline(is_admin(chat_id)))
 
     if "callback_query" in data:
         callback = data["callback_query"]
@@ -7107,6 +7144,27 @@ def webhook():
             clear_product_messages(chat_id)
             with_loading(chat_id, "🔥 Завантажуємо акційні пропозиції...", show_sales, chat_id, callback_message)
 
+        elif data_value == "open_orders":
+            clear_product_messages(chat_id)
+            with_loading(chat_id, "📦 Завантажуємо інформацію про Ваші замовлення...", show_my_orders, chat_id, callback_message)
+
+        elif data_value == "open_delivery_payment":
+            clear_product_messages(chat_id)
+            with_loading(chat_id, "🚚 Завантажуємо інформацію про доставку та оплату...", show_delivery_payment, chat_id, callback_message)
+
+        elif data_value == "contact_manager_general":
+            clear_service_messages(chat_id)
+            clear_product_messages(chat_id)
+            with_loading(chat_id, "📞 Відкриваємо форму звернення до менеджера...", contact_manager, chat_id, user)
+
+        elif data_value == "manager_order":
+            clear_service_messages(chat_id)
+            clear_product_messages(chat_id)
+            with_loading(chat_id, "📞 Передаємо заявку менеджеру...", contact_manager, chat_id, user, "manager_order")
+
+        elif data_value == "open_admin":
+            with_loading(chat_id, "👑 Завантажуємо кабінет...", show_admin_cabinet, chat_id, callback_message)
+
         elif data_value == "back_main":
             clear_product_messages(chat_id)
             clear_service_messages(chat_id, except_message_id=message_id)
@@ -7114,7 +7172,8 @@ def webhook():
             edit_message(
                 chat_id,
                 message_id,
-                "🏠 <b>Головне меню</b>\n\nОберіть дію в нижньому меню 👇"
+                "🏠 <b>Головне меню</b>\n\nОберіть, будь ласка, що хочете переглянути:",
+                main_menu_inline(is_admin(chat_id))
             )
 
         elif data_value == "order_now":
