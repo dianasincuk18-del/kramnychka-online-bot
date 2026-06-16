@@ -32,6 +32,71 @@ PRODUCT_CARD_AUTO_DELETE_SECONDS = int(os.environ.get("PRODUCT_CARD_AUTO_DELETE_
 # Запамʼятовуємо товарні повідомлення, щоб прибирати старі картки при переходах.
 USER_PRODUCT_MESSAGES = {}
 
+# Запамʼятовуємо останні сервісні повідомлення меню/кошика/бонусів/акцій.
+# Коли клієнт відкриває новий пункт меню, попереднє сервісне повідомлення видаляється.
+USER_SERVICE_MESSAGES = {}
+
+
+def register_service_message(chat_id, message_id):
+    try:
+        if not message_id:
+            return
+
+        key = str(chat_id)
+        USER_SERVICE_MESSAGES.setdefault(key, [])
+        if message_id not in USER_SERVICE_MESSAGES[key]:
+            USER_SERVICE_MESSAGES[key].append(message_id)
+    except Exception as e:
+        print("register_service_message error:", e)
+
+
+def clear_service_messages(chat_id, except_message_id=None):
+    try:
+        key = str(chat_id)
+        message_ids = USER_SERVICE_MESSAGES.get(key, [])
+        keep = []
+
+        for message_id in message_ids:
+            if except_message_id and str(message_id) == str(except_message_id):
+                keep.append(message_id)
+                continue
+            delete_message(chat_id, message_id)
+
+        USER_SERVICE_MESSAGES[key] = keep
+    except Exception as e:
+        print("clear_service_messages error:", e)
+
+
+def send_service_message(chat_id, text, keyboard=None, clear_products=True):
+    """
+    Надсилає сервісне повідомлення та прибирає попереднє сервісне повідомлення цього клієнта.
+    Це тримає чат чистим при переходах: каталог → акції → бонуси → кошик.
+    """
+    if clear_products:
+        clear_product_messages(chat_id)
+    clear_service_messages(chat_id)
+    message_id = send_message(chat_id, text, keyboard)
+    register_service_message(chat_id, message_id)
+    return message_id
+
+
+def update_service_message(chat_id, callback_message, text, keyboard=None, clear_products=True):
+    """
+    Якщо є callback_message — редагуємо його і запамʼятовуємо як поточне сервісне.
+    Якщо немає — надсилаємо нове сервісне повідомлення.
+    """
+    if clear_products:
+        clear_product_messages(chat_id)
+
+    if callback_message:
+        message_id = callback_message.get("message_id")
+        clear_service_messages(chat_id, except_message_id=message_id)
+        edit_message(chat_id, message_id, text, keyboard)
+        register_service_message(chat_id, message_id)
+        return message_id
+
+    return send_service_message(chat_id, text, keyboard, clear_products=False)
+
 
 def schedule_delete_message(chat_id, message_id, delay_seconds=None):
     """
@@ -2210,10 +2275,7 @@ def show_bonus_cabinet(chat_id, callback_message=None):
 
     keyboard = {"inline_keyboard": [[inline_button("🛒 Перейти до кошика", "open_cart")]]}
 
-    if callback_message:
-        edit_message(chat_id, callback_message["message_id"], text, keyboard)
-    else:
-        send_message(chat_id, text, keyboard)
+    update_service_message(chat_id, callback_message, text, keyboard)
 
 
 def show_referral_program(chat_id, callback_message=None):
@@ -2261,10 +2323,7 @@ def show_referral_program(chat_id, callback_message=None):
         ]
     }
 
-    if callback_message:
-        edit_message(chat_id, callback_message["message_id"], text, keyboard)
-    else:
-        send_message(chat_id, text, keyboard)
+    update_service_message(chat_id, callback_message, text, keyboard)
 
 
 
@@ -4003,6 +4062,7 @@ def process_auto_product_day_broadcast():
         AUTO_PRODUCT_BROADCAST_LOCK["running"] = False
 
 def show_product_by_id(chat_id, product_id, callback_message=None):
+    clear_service_messages(chat_id)
     clear_product_messages(chat_id)
     product = get_product_by_id(product_id)
     if not product:
@@ -4315,10 +4375,7 @@ def show_catalog_menu(chat_id, callback_message=None):
 
     if not active_categories:
         text = "Поки немає активних категорій 😔"
-        if callback_message:
-            edit_message(chat_id, callback_message["message_id"], text, back_to_main_inline())
-        else:
-            send_message(chat_id, text, main_menu(is_admin(chat_id)))
+        update_service_message(chat_id, callback_message, text, back_to_main_inline())
         return
 
     buttons = []
@@ -4345,10 +4402,7 @@ def show_catalog_menu(chat_id, callback_message=None):
 
     USER_STATES[str(chat_id)] = {"step": "catalog_inline"}
 
-    if callback_message:
-        edit_message(chat_id, callback_message["message_id"], text, keyboard)
-    else:
-        send_message(chat_id, text, keyboard)
+    update_service_message(chat_id, callback_message, text, keyboard)
 
 
 
@@ -4451,6 +4505,7 @@ def send_product_text(chat_id, text, keyboard=None, auto_delete_after=None, trac
 
 
 def show_product_card(chat_id, products, index=0, mode="category", category_id="", photo_index=0):
+    clear_service_messages(chat_id)
     if not products:
         send_message(chat_id, "Товарів поки немає 😔", main_menu(is_admin(chat_id)))
         return
@@ -4548,10 +4603,7 @@ def show_products_page(chat_id, products, page=0, mode="category", category_id="
     if not products:
         text = "Товарів поки немає 😔"
         keyboard = back_to_main_inline()
-        if callback_message:
-            edit_message(chat_id, callback_message["message_id"], text, keyboard)
-        else:
-            send_message(chat_id, text, main_menu(is_admin(chat_id)))
+        update_service_message(chat_id, callback_message, text, keyboard)
         return
 
     total = len(products)
@@ -4577,10 +4629,7 @@ def show_products_page(chat_id, products, page=0, mode="category", category_id="
         f"Сторінка: <b>{page + 1}</b> з <b>{total_pages}</b>"
     )
 
-    if callback_message:
-        edit_message(chat_id, callback_message["message_id"], header, build_products_page_keyboard(page, total_pages))
-    else:
-        send_message(chat_id, header, build_products_page_keyboard(page, total_pages))
+    update_service_message(chat_id, callback_message, header, build_products_page_keyboard(page, total_pages), clear_products=False)
 
     for idx in range(start_index, end_index):
         show_product_card(
@@ -4716,10 +4765,7 @@ def show_subcategories(chat_id, category_id, callback_message=None):
     keyboard = {"inline_keyboard": buttons}
     text = f"📂 <b>{category_name}</b>\n\nОберіть розділ нижче 👇"
 
-    if callback_message:
-        edit_message(chat_id, callback_message["message_id"], text, keyboard)
-    else:
-        send_message(chat_id, text, keyboard)
+    update_service_message(chat_id, callback_message, text, keyboard)
 
 
 def show_subsections(chat_id, subcategory_id, callback_message=None):
@@ -4760,10 +4806,7 @@ def show_subsections(chat_id, subcategory_id, callback_message=None):
     keyboard = {"inline_keyboard": buttons}
     text = f"▫️ <b>{subcategory_name}</b>\n\nОберіть підрозділ нижче 👇"
 
-    if callback_message:
-        edit_message(chat_id, callback_message["message_id"], text, keyboard)
-    else:
-        send_message(chat_id, text, keyboard)
+    update_service_message(chat_id, callback_message, text, keyboard)
 
 
 
@@ -4876,11 +4919,11 @@ def show_products_by_category(chat_id, category_id, callback_message=None):
     show_products_page(chat_id, products, 0, "category", str(category_id), callback_message)
 
 
-def show_sales(chat_id):
+def show_sales(chat_id, callback_message=None):
     sale_products = get_sale_products()
 
     if not sale_products:
-        send_message(chat_id, "Поки немає активних акцій 😔", main_menu(is_admin(chat_id)))
+        send_service_message(chat_id, "Поки немає активних акцій 😔", main_menu(is_admin(chat_id)))
         return
 
     show_products_page(
@@ -4888,7 +4931,8 @@ def show_sales(chat_id):
         products=sale_products,
         page=0,
         mode="sale",
-        category_id=""
+        category_id="",
+        callback_message=callback_message
     )
 
 def add_to_cart(chat_id, product_id, callback_message=None):
@@ -5546,7 +5590,7 @@ def show_my_orders(chat_id):
     ]
 
     if not my_orders:
-        send_message(
+        send_service_message(
             chat_id,
             "📦 У Вас поки немає замовлень.",
             main_menu(is_admin(chat_id))
@@ -5565,7 +5609,7 @@ def show_my_orders(chat_id):
             f"📌 Статус: <b>{safe_text(order.get('Статус'), 'Нове')}</b>\n\n"
         )
 
-    send_message(chat_id, text, main_menu(is_admin(chat_id)))
+    send_service_message(chat_id, text, main_menu(is_admin(chat_id)))
 
 
 
@@ -5722,7 +5766,7 @@ def show_delivery_payment(chat_id):
     settings = get_cached_records("Налаштування")
 
     if not settings:
-        send_message(chat_id, "Інформацію про доставку й оплату ще не додано.", main_menu(is_admin(chat_id)))
+        send_service_message(chat_id, "Інформацію про доставку й оплату ще не додано.", main_menu(is_admin(chat_id)))
         return
 
     text = "🚚 <b>Доставка і оплата</b>\n\n"
@@ -5732,7 +5776,7 @@ def show_delivery_payment(chat_id):
         value = row.get("Значення")
         text += f"<b>{param}:</b>\n{value}\n\n"
 
-    send_message(chat_id, text, back_to_main_inline())
+    send_service_message(chat_id, text, back_to_main_inline())
 
 
 # =========================
@@ -6904,10 +6948,15 @@ def webhook():
             clear_product_messages(chat_id)
             with_loading(chat_id, "🎁 Завантажуємо Ваші бонуси...", show_bonus_cabinet, chat_id)
         elif text == "👥 Реферальна програма":
+            clear_product_messages(chat_id)
             with_loading(chat_id, "👥 Завантажуємо умови реферальної програми...", show_referral_program, chat_id)
         elif text == "📞 Зв’язатися з менеджером":
+            clear_service_messages(chat_id)
+            clear_product_messages(chat_id)
             with_loading(chat_id, "📞 Відкриваємо форму звернення до менеджера...", contact_manager, chat_id, user)
         elif text == "📞 Оформити через менеджера":
+            clear_service_messages(chat_id)
+            clear_product_messages(chat_id)
             with_loading(chat_id, "📞 Передаємо заявку менеджеру...", contact_manager, chat_id, user, "manager_order")
         elif text == "🚚 Доставка і оплата":
             with_loading(chat_id, "🚚 Завантажуємо інформацію про доставку та оплату...", show_delivery_payment, chat_id)
@@ -7055,10 +7104,12 @@ def webhook():
             with_loading(chat_id, "👥 Завантажуємо умови реферальної програми...", show_referral_program, chat_id, callback_message)
 
         elif data_value == "open_sales":
-            with_loading(chat_id, "🔥 Завантажуємо акційні пропозиції...", show_sales, chat_id)
+            clear_product_messages(chat_id)
+            with_loading(chat_id, "🔥 Завантажуємо акційні пропозиції...", show_sales, chat_id, callback_message)
 
         elif data_value == "back_main":
             clear_product_messages(chat_id)
+            clear_service_messages(chat_id, except_message_id=message_id)
             USER_STATES.pop(str(chat_id), None)
             edit_message(
                 chat_id,
