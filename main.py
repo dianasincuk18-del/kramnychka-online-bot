@@ -961,6 +961,59 @@ def handle_payment_receipt(chat_id, message):
 # TELEGRAM HELPERS
 # =========================
 
+def normalize_inline_keyboard(keyboard):
+    """
+    Додає кнопку 🏠 На головну майже до всіх inline-клавіатур.
+    Не чіпає Reply Keyboard/remove_keyboard і саме головне меню.
+    """
+    try:
+        if not isinstance(keyboard, dict):
+            return keyboard
+
+        if "inline_keyboard" not in keyboard:
+            return keyboard
+
+        rows = keyboard.get("inline_keyboard") or []
+
+        # Збираємо всі callback_data, щоб не дублювати кнопку.
+        callbacks = []
+        for row in rows:
+            for button in row:
+                if isinstance(button, dict):
+                    callbacks.append(str(button.get("callback_data", "")))
+
+        if "back_main" in callbacks:
+            return keyboard
+
+        # Якщо це саме головне меню — кнопку На головну не додаємо.
+        main_callbacks = {
+            "open_catalog",
+            "open_sales",
+            "open_cart",
+            "open_orders",
+            "open_bonus_cabinet",
+            "open_referral_program",
+            "contact_manager_general",
+            "manager_order",
+            "open_delivery_payment"
+        }
+        if main_callbacks.issubset(set(callbacks)):
+            return keyboard
+
+        rows_copy = []
+        for row in rows:
+            rows_copy.append([dict(button) for button in row])
+
+        rows_copy.append([{"text": "🏠 На головну", "callback_data": "back_main"}])
+        new_keyboard = dict(keyboard)
+        new_keyboard["inline_keyboard"] = rows_copy
+        return new_keyboard
+
+    except Exception as e:
+        print("normalize_inline_keyboard error:", e)
+        return keyboard
+
+
 def send_message(chat_id, text, keyboard=None):
     payload = {
         "chat_id": chat_id,
@@ -969,6 +1022,7 @@ def send_message(chat_id, text, keyboard=None):
     }
 
     if keyboard:
+        keyboard = normalize_inline_keyboard(keyboard)
         payload["reply_markup"] = json.dumps(keyboard, ensure_ascii=False)
 
     try:
@@ -1033,6 +1087,7 @@ def send_photo(chat_id, photo_url, caption, keyboard=None):
     }
 
     if keyboard:
+        keyboard = normalize_inline_keyboard(keyboard)
         payload["reply_markup"] = json.dumps(keyboard, ensure_ascii=False)
 
     try:
@@ -1060,6 +1115,7 @@ def send_document(chat_id, document_url, caption="", keyboard=None):
     }
 
     if keyboard:
+        keyboard = normalize_inline_keyboard(keyboard)
         payload["reply_markup"] = json.dumps(keyboard, ensure_ascii=False)
 
     try:
@@ -1087,6 +1143,7 @@ def edit_message(chat_id, message_id, text, keyboard=None):
     }
 
     if keyboard:
+        keyboard = normalize_inline_keyboard(keyboard)
         payload["reply_markup"] = json.dumps(keyboard, ensure_ascii=False)
 
     try:
@@ -1104,6 +1161,7 @@ def edit_caption(chat_id, message_id, caption, keyboard=None):
     }
 
     if keyboard:
+        keyboard = normalize_inline_keyboard(keyboard)
         payload["reply_markup"] = json.dumps(keyboard, ensure_ascii=False)
 
     try:
@@ -1126,6 +1184,7 @@ def edit_media_photo(chat_id, message_id, photo_url, caption, keyboard=None):
     }
 
     if keyboard:
+        keyboard = normalize_inline_keyboard(keyboard)
         payload["reply_markup"] = json.dumps(keyboard, ensure_ascii=False)
 
     try:
@@ -1674,12 +1733,9 @@ def format_cart_item_for_order(item):
     return f"{name} x{qty}"
 
 
-def back_to_main_inline():
-    return {
-        "inline_keyboard": [
-            [inline_button("⬅️ Назад у меню", "back_main")]
-        ]
-    }
+def back_to_main_inline(is_admin_user=False):
+    """Повернення на головну через повне inline-меню."""
+    return main_menu_inline(is_admin_user)
 
 
 def get_admins():
