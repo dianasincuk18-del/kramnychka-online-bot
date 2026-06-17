@@ -6972,6 +6972,10 @@ def ensure_users_menu_update_column():
     """
     Додає у лист "Користувачі" службову колонку "Меню оновлено",
     щоб не надсилати оновлення одним і тим самим клієнтам повторно.
+
+    Важливо: якщо в Google Sheets фізично є тільки 8 колонок,
+    перед записом у I1 потрібно спочатку додати колонку через add_cols(),
+    інакше буде помилка: Range exceeds grid limits.
     """
     try:
         ws = get_users_worksheet()
@@ -6982,9 +6986,19 @@ def ensure_users_menu_update_column():
             if str(header).strip().lower() == "меню оновлено":
                 return ws, idx
 
-        new_col = len(headers) + 1 if headers else 8
+        new_col = len(headers) + 1 if headers else 1
+
+        # Якщо в аркуші фізично не вистачає колонок — додаємо їх перед update_cell.
+        try:
+            current_cols = int(getattr(ws, "col_count", 0) or 0)
+            if current_cols < new_col:
+                google_call_with_retry(lambda: ws.add_cols(new_col - current_cols))
+        except Exception as e:
+            print("ensure_users_menu_update_column add_cols error:", e)
+
         google_call_with_retry(lambda: ws.update_cell(1, new_col, "Меню оновлено"))
         clear_cache("Користувачі")
+        clear_sheet_connection_cache("Користувачі")
         return ws, new_col
 
     except Exception as e:
