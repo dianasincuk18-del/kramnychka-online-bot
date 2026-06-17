@@ -1039,10 +1039,12 @@ def handle_payment_receipt(chat_id, message):
 
     notify_admin_payment_receipt(chat_id, order, file_id, file_type, caption)
 
-    send_message(
+    send_service_message(
         chat_id,
         "✅ Дякуємо! Квитанцію отримано та передано менеджеру на перевірку 💛\n\n"
-        "Після перевірки ми оновимо статус Вашого замовлення."
+        "Після перевірки ми оновимо статус Вашого замовлення.\n\n"
+        "🏠 Оберіть, будь ласка, що хочете зробити далі:",
+        main_menu_inline(is_admin(chat_id))
     )
     return True
 
@@ -4712,7 +4714,7 @@ def show_product_by_id(chat_id, product_id, callback_message=None):
     clear_product_messages(chat_id)
     product = get_product_by_id(product_id)
     if not product:
-        send_message(chat_id, "На жаль, товар уже не знайдено або він недоступний 😔", main_menu(is_admin(chat_id)))
+        show_main_options(chat_id, "На жаль, товар уже не знайдено або він недоступний 😔", callback_message)
         return
 
     show_product_card(
@@ -5019,6 +5021,38 @@ def show_main_menu(chat_id, callback_message=None):
         send_service_message(chat_id, text, keyboard, clear_products=False)
 
 
+
+
+def show_main_options(chat_id, text, callback_message=None, clear_products=True):
+    """
+    Показує клієнту повідомлення + повне головне меню,
+    щоб після помилки/порожнього кошика/очищення не було тупика.
+    """
+    try:
+        clear_flow_messages(chat_id)
+        keyboard = main_menu_inline(is_admin(chat_id))
+        full_text = f"{text}\n\n🏠 Оберіть, будь ласка, що хочете зробити далі:"
+
+        if callback_message:
+            return update_service_message(
+                chat_id,
+                callback_message,
+                full_text,
+                keyboard,
+                clear_products=clear_products
+            )
+
+        return send_service_message(
+            chat_id,
+            full_text,
+            keyboard,
+            clear_products=clear_products
+        )
+    except Exception as e:
+        print("show_main_options error:", e)
+        return send_message(chat_id, text, main_menu_inline(is_admin(chat_id)))
+
+
 def show_my_id(chat_id):
     send_service_message(chat_id, f"Ваш Telegram ID:\n<code>{chat_id}</code>", back_to_main_inline())
 
@@ -5207,7 +5241,7 @@ def send_product_text(chat_id, text, keyboard=None, auto_delete_after=None, trac
 def show_product_card(chat_id, products, index=0, mode="category", category_id="", photo_index=0):
     clear_service_messages(chat_id)
     if not products:
-        send_message(chat_id, "Товарів поки немає 😔", main_menu(is_admin(chat_id)))
+        show_main_options(chat_id, "Товарів поки немає 😔")
         return
 
     total = len(products)
@@ -5601,7 +5635,7 @@ def show_sales(chat_id, callback_message=None):
     sale_products = get_sale_products()
 
     if not sale_products:
-        send_service_message(chat_id, "Поки немає активних акцій 😔", main_menu(is_admin(chat_id)))
+        show_main_options(chat_id, "Поки немає активних акцій 😔", callback_message)
         return
 
     show_products_page(
@@ -5623,13 +5657,13 @@ def add_to_cart(chat_id, product_id, callback_message=None):
             break
 
     if not product:
-        send_message(chat_id, "Товар не знайдено 😔", main_menu(is_admin(chat_id)))
+        show_main_options(chat_id, "Товар не знайдено 😔", callback_message)
         return
 
     availability = str(product.get("Наявність", "") or "").strip().lower()
 
     if availability == "немає":
-        send_message(chat_id, "❌ Цього товару зараз немає в наявності.", main_menu(is_admin(chat_id)))
+        show_main_options(chat_id, "❌ Цього товару зараз немає в наявності.", callback_message)
         return
 
     name = safe_text(product.get("Назва товару"), "Товар")
@@ -5705,13 +5739,12 @@ def show_cart(chat_id, callback_message=None):
     items = find_user_cart_rows(chat_id)
 
     if not items:
-        text = "Ваш кошик поки порожній 🛒"
-        keyboard = {"inline_keyboard": [[inline_button("🔄 Оновити кошик", "open_cart")]]}
-
-        if callback_message:
-            edit_message(chat_id, callback_message["message_id"], text, keyboard)
-        else:
-            send_message(chat_id, text, keyboard)
+        show_main_options(
+            chat_id,
+            "Ваш кошик поки порожній 🛒",
+            callback_message,
+            clear_products=False
+        )
         return
 
     subtotal = 0
@@ -5806,11 +5839,11 @@ def change_cart_qty(chat_id, row_index, delta, callback_message=None):
         row_index = int(row_index)
         row = rows[row_index - 1]
     except:
-        send_message(chat_id, "Не вдалося змінити кількість. Спробуйте ще раз.", main_menu(is_admin(chat_id)))
+        show_main_options(chat_id, "Не вдалося змінити кількість. Спробуйте ще раз.", callback_message)
         return
 
     if len(row) < 6 or str(row[0]) != str(chat_id):
-        send_message(chat_id, "Цей товар не знайдено у Вашому кошику.", main_menu(is_admin(chat_id)))
+        show_main_options(chat_id, "Цей товар не знайдено у Вашому кошику.", callback_message)
         return
 
     try:
@@ -5855,14 +5888,14 @@ def delete_cart_item(chat_id, row_index, callback_message=None):
         sync_cart_promo_gifts(chat_id)
         show_cart(chat_id, callback_message)
     except Exception:
-        send_message(chat_id, "Не вдалося видалити товар. Спробуйте ще раз.", main_menu(is_admin(chat_id)))
+        show_main_options(chat_id, "Не вдалося видалити товар. Спробуйте ще раз.", callback_message)
 
 
 def start_order(chat_id):
     cart = get_user_cart(chat_id)
 
     if not cart:
-        send_message(chat_id, "Ваш кошик порожній, немає що замовляти 😔", main_menu(is_admin(chat_id)))
+        show_main_options(chat_id, "Ваш кошик порожній, немає що замовляти 😔")
         return
 
     USER_STATES[str(chat_id)] = {
@@ -6087,7 +6120,7 @@ def finish_order(chat_id, user, need_contact, callback_message=None):
 
     if not cart:
         USER_STATES.pop(str(chat_id), None)
-        send_message(chat_id, "Кошик порожній, немає що замовляти 😔", main_menu(is_admin(chat_id)))
+        show_main_options(chat_id, "Кошик порожній, немає що замовляти 😔", callback_message)
         return
 
     state = USER_STATES.get(str(chat_id), {})
@@ -6212,16 +6245,12 @@ def finish_order(chat_id, user, need_contact, callback_message=None):
     if payment_method == "Оплата за реквізитами IBAN":
         USER_STATES[str(chat_id)] = {"step": "waiting_payment_receipt"}
 
-    keyboard = {
-        "inline_keyboard": [
-            [inline_button("🔥 Переглянути акції", "open_sales")]
-        ]
-    }
+    keyboard = main_menu_inline(is_admin(chat_id))
 
     if callback_message:
-        edit_message(chat_id, callback_message["message_id"], final_text, keyboard)
+        update_service_message(chat_id, callback_message, final_text, keyboard, clear_products=True)
     else:
-        send_message(chat_id, final_text, keyboard)
+        send_service_message(chat_id, final_text, keyboard, clear_products=True)
 
 def notify_admin(full_name, phone, address, delivery_method, payment_method, comment, products, total, need_contact, telegram_id):
     text = (
@@ -7965,7 +7994,12 @@ def webhook():
         elif data_value == "clear_cart":
             clear_user_cart(chat_id)
             USER_STATES.pop(str(chat_id), None)
-            edit_message(chat_id, message_id, "🗑 Кошик очищено.")
+            show_main_options(
+                chat_id,
+                "🗑 Кошик очищено.",
+                callback_message,
+                clear_products=True
+            )
 
         elif data_value.startswith("delete_cart_row_"):
             row_index = data_value.replace("delete_cart_row_", "")
