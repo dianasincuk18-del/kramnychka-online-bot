@@ -43,6 +43,15 @@ USER_FLOW_MESSAGES = {}
 # Кеш для оновлення статусу бота у листі "Користувачі", щоб не писати в Sheets при кожному повідомленні.
 USER_BOT_STATUS_CACHE = {}
 USER_BOT_STATUS_THROTTLE_SECONDS = int(os.environ.get("USER_BOT_STATUS_THROTTLE_SECONDS", "21600"))
+# =========================
+# BROADCAST ANTI-DUPLICATE PROTECTION
+# =========================
+# Не даємо одному клієнту отримувати кілька маркетингових/акційних повідомлень за день.
+BROADCAST_DAILY_LIMIT_PER_USER = int(os.environ.get("BROADCAST_DAILY_LIMIT_PER_USER", "1"))
+
+# Захист від паралельних запусків одного й того ж endpoint через UptimeRobot/Render.
+BROADCAST_LOCK_TTL_SECONDS = int(os.environ.get("BROADCAST_LOCK_TTL_SECONDS", "900"))
+BROADCAST_RUN_LOCKS = {}
 
 
 def register_service_message(chat_id, message_id):
@@ -3602,35 +3611,44 @@ def process_daily_soft_reminders():
     if not daily_reminders_allowed_today():
         return 0
 
-    if daily_reminder_sent_today():
+    if not acquire_broadcast_lock("daily-reminders"):
         return 0
 
-    ws, headers, message = get_next_daily_message()
-    if not message:
-        return 0
+    try:
+        if daily_reminder_sent_today():
+            return 0
 
-    sent, failed = send_marketing_to_all(
-        message["text"],
-        daily_reminder_keyboard(),
-        None
-    )
+        ws, headers, message = get_next_daily_message()
+        if not message:
+            return 0
 
-    update_cell_by_header(ws, message["row_index"], headers, "Останнє надсилання", now_str())
+        campaign_key = f"daily|{current_time().strftime('%d.%m.%Y')}|{message['id']}"
+        sent, failed = send_marketing_to_all(
+            message["text"],
+            daily_reminder_keyboard(),
+            None,
+            campaign_key=campaign_key,
+            campaign_type="Повідомлення дня"
+        )
 
-    log_ws = get_daily_log_worksheet()
-    google_call_with_retry(lambda: log_ws.append_row([
-        now_str(),
-        message["id"],
-        message["category"],
-        sent,
-        "Надіслано"
-    ], value_input_option="USER_ENTERED"))
-    clear_cache("Надіслані повідомлення дня")
-    clear_cache("Повідомлення дня")
+        update_cell_by_header(ws, message["row_index"], headers, "Останнє надсилання", now_str())
 
-    print(f"daily soft reminder sent id={message['id']}, sent={sent}, failed={failed}")
-    return 1 if sent > 0 else 0
+        log_ws = get_daily_log_worksheet()
+        google_call_with_retry(lambda: log_ws.append_row([
+            now_str(),
+            message["id"],
+            message["category"],
+            sent,
+            "Надіслано"
+        ], value_input_option="USER_ENTERED"))
+        clear_cache("Надіслані повідомлення дня")
+        clear_cache("Повідомлення дня")
 
+        print(f"daily soft reminder sent id={message['id']}, sent={sent}, failed={failed}")
+        return 1 if sent > 0 else 0
+
+    finally:
+        release_broadcast_lock("daily-reminders")
 
 
 def ensure_headers(ws, headers):
@@ -3794,6 +3812,132 @@ def sale_broadcast_key(product):
 
 
 
+def acquire_broadcast_lock(name):
+    """
+    Простий lock у памʼяті процесу, щоб один і той самий endpoint не запускався паралельно.
+    """
+    try:
+        key = str(name)
+        now_ts = time.time()
+        lock = BROADCAST_RUN_LOCKS.get(key)
+
+        if lock and lock.get("running") and now_ts - float(lock.get("started_at", 0)) < BROADCAST_LOCK_TTL_SECONDS:
+            print(f"{key} skipped: already running")
+            return False
+
+        BROADCAST_RUN_LOCKS[key] = {
+            "running": True,
+            "started_at": now_ts
+        }
+        return True
+    except Exception as e:
+        print("acquire_broadcast_lock error:", e)
+        return True
+
+
+def release_broadcast_lock(name):
+    try:
+        key = str(name)
+        if key in BROADCAST_RUN_LOCKS:
+            BROADCAST_RUN_LOCKS[key]["running"] = False
+    except Exception as e:
+        print("release_broadcast_lock error:", e)
+
+
+def get_broadcast_recipient_log_worksheet():
+    headers = [
+        "Дата",
+        "Telegram ID",
+        "Тип розсилки",
+        "Ключ розсилки",
+        "Статус"
+    ]
+    ws = get_or_create_worksheet("Надіслані розсилки клієнтам", headers)
+    ensure_headers(ws, headers)
+    return ws
+
+
+def broadcast_recipient_already_sent_today(telegram_id):
+    """
+    Перевіряє, чи клієнт вже отримував будь-яку маркетингову/акційну розсилку сьогодні.
+    Це прибирає ситуацію, коли одному клієнту прилітає і товар дня, і акція, і маркетингова розсилка.
+    """
+    if BROADCAST_DAILY_LIMIT_PER_USER <= 0:
+        return False
+
+    try:
+        rows = get_values("Надіслані розсилки клієнтам")
+        if not rows:
+            return False
+
+        headers = rows[0]
+        today_prefix = current_time().strftime("%d.%m.%Y")
+        count = 0
+
+        for row in rows[1:]:
+            row_date = str(get_cell_by_header(row, headers, "Дата", row[0] if len(row) > 0 else "")).strip()
+            row_user = str(get_cell_by_header(row, headers, "Telegram ID", row[1] if len(row) > 1 else "")).strip()
+            row_status = str(get_cell_by_header(row, headers, "Статус", "")).strip().lower()
+
+            if (
+                row_user == str(telegram_id).strip()
+                and row_date.startswith(today_prefix)
+                and row_status in ["надіслано", "sent", "так"]
+            ):
+                count += 1
+
+        return count >= BROADCAST_DAILY_LIMIT_PER_USER
+
+    except Exception as e:
+        print("broadcast_recipient_already_sent_today error:", e)
+        return False
+
+
+def broadcast_recipient_key_sent(telegram_id, campaign_key):
+    """
+    Перевіряє, чи конкретну розсилку вже відправляли конкретному клієнту.
+    """
+    try:
+        if not campaign_key:
+            return False
+
+        rows = get_values("Надіслані розсилки клієнтам")
+        if not rows:
+            return False
+
+        headers = rows[0]
+        for row in rows[1:]:
+            row_user = str(get_cell_by_header(row, headers, "Telegram ID", row[1] if len(row) > 1 else "")).strip()
+            row_key = str(get_cell_by_header(row, headers, "Ключ розсилки", "")).strip()
+            row_status = str(get_cell_by_header(row, headers, "Статус", "")).strip().lower()
+
+            if (
+                row_user == str(telegram_id).strip()
+                and row_key == str(campaign_key).strip()
+                and row_status in ["надіслано", "sent", "так"]
+            ):
+                return True
+
+    except Exception as e:
+        print("broadcast_recipient_key_sent error:", e)
+
+    return False
+
+
+def mark_broadcast_recipient_sent(telegram_id, campaign_type, campaign_key):
+    try:
+        ws = get_broadcast_recipient_log_worksheet()
+        google_call_with_retry(lambda: ws.append_row([
+            now_str(),
+            str(telegram_id).strip(),
+            str(campaign_type or "").strip(),
+            str(campaign_key or "").strip(),
+            "Надіслано"
+        ], value_input_option="USER_ENTERED"))
+        clear_cache("Надіслані розсилки клієнтам")
+    except Exception as e:
+        print("mark_broadcast_recipient_sent error:", e)
+
 def get_marketing_worksheet():
     headers = [
         "ID розсилки",
@@ -3913,12 +4057,24 @@ def marketing_message_text(row_type, title, body, product=None):
     return text
 
 
-def send_marketing_to_all(text, keyboard=None, photo_url=None):
+def send_marketing_to_all(text, keyboard=None, photo_url=None, campaign_key=None, campaign_type="Маркетинг"):
     sent = 0
     failed = 0
+    skipped = 0
+
+    if not campaign_key:
+        campaign_key = f"{campaign_type}|{current_time().strftime('%d.%m.%Y')}|{str(text)[:80]}"
 
     for client_id in get_broadcast_client_ids():
         try:
+            if broadcast_recipient_key_sent(client_id, campaign_key):
+                skipped += 1
+                continue
+
+            if broadcast_recipient_already_sent_today(client_id):
+                skipped += 1
+                continue
+
             ok = False
             if photo_url:
                 ok = send_photo(client_id, photo_url, text, keyboard)
@@ -3926,6 +4082,7 @@ def send_marketing_to_all(text, keyboard=None, photo_url=None):
                 ok = bool(send_message(client_id, text, keyboard))
 
             if ok:
+                mark_broadcast_recipient_sent(client_id, campaign_type, campaign_key)
                 sent += 1
             else:
                 failed += 1
@@ -3933,8 +4090,8 @@ def send_marketing_to_all(text, keyboard=None, photo_url=None):
             print("send_marketing_to_all user error:", client_id, e)
             failed += 1
 
+    print(f"send_marketing_to_all type={campaign_type}, key={campaign_key}, sent={sent}, failed={failed}, skipped={skipped}")
     return sent, failed
-
 
 def process_marketing_broadcasts():
     """
@@ -3945,57 +4102,71 @@ def process_marketing_broadcasts():
     if not broadcasts_allowed_now("marketing broadcasts"):
         return 0
 
-    ws = get_marketing_worksheet()
-    rows = google_call_with_retry(lambda: ws.get_all_values())
-    if not rows:
+    if not acquire_broadcast_lock("marketing-broadcasts"):
         return 0
 
-    headers = rows[0]
-    today = current_time().date()
-    sent_campaigns = 0
+    try:
+        ws = get_marketing_worksheet()
+        rows = google_call_with_retry(lambda: ws.get_all_values())
+        if not rows:
+            return 0
 
-    for row_index, row in enumerate(rows[1:], start=2):
-        if sent_campaigns >= MARKETING_BROADCAST_LIMIT_PER_RUN:
-            break
+        headers = rows[0]
+        today = current_time().date()
+        sent_campaigns = 0
 
-        active = str(get_cell_by_header(row, headers, "Активна", "")).strip().lower()
-        sent_flag = str(get_cell_by_header(row, headers, "Надіслано", "")).strip().lower()
-        date_raw = get_cell_by_header(row, headers, "Дата", "")
-        scheduled_date = parse_sheet_date(date_raw)
+        for row_index, row in enumerate(rows[1:], start=2):
+            if sent_campaigns >= MARKETING_BROADCAST_LIMIT_PER_RUN:
+                break
 
-        if active not in ["так", "yes", "1", "true", "активна"]:
-            continue
-        if sent_flag in ["так", "yes", "1", "true", "надіслано"]:
-            continue
-        if scheduled_date and scheduled_date > today:
-            continue
+            active = str(get_cell_by_header(row, headers, "Активна", "")).strip().lower()
+            sent_flag = str(get_cell_by_header(row, headers, "Надіслано", "")).strip().lower()
+            date_raw = get_cell_by_header(row, headers, "Дата", "")
+            scheduled_date = parse_sheet_date(date_raw)
 
-        row_type = get_cell_by_header(row, headers, "Тип", "")
-        product_id = get_cell_by_header(row, headers, "ID товару", "")
-        title = get_cell_by_header(row, headers, "Заголовок", "")
-        body = get_cell_by_header(row, headers, "Текст", "")
-        button_text = get_cell_by_header(row, headers, "Текст кнопки", "🛍 Переглянути товар")
+            if active not in ["так", "yes", "1", "true", "активна"]:
+                continue
+            if sent_flag in ["так", "yes", "1", "true", "надіслано"]:
+                continue
+            if scheduled_date and scheduled_date > today:
+                continue
 
-        product = get_product_by_id(product_id) if product_id else None
-        photos = get_product_photos(product) if product else []
-        photo_url = photos[0] if photos else None
+            row_type = get_cell_by_header(row, headers, "Тип", "")
+            product_id = get_cell_by_header(row, headers, "ID товару", "")
+            title = get_cell_by_header(row, headers, "Заголовок", "")
+            body = get_cell_by_header(row, headers, "Текст", "")
+            button_text = get_cell_by_header(row, headers, "Текст кнопки", "🛍 Переглянути товар")
+            campaign_id = get_cell_by_header(row, headers, "ID розсилки", row_index)
 
-        text = marketing_message_text(row_type, title, body, product)
-        keyboard = product_marketing_keyboard(product_id if product else None, button_text)
-        sent, failed = send_marketing_to_all(text, keyboard, photo_url)
+            product = get_product_by_id(product_id) if product_id else None
+            photos = get_product_photos(product) if product else []
+            photo_url = photos[0] if photos else None
 
-        update_cell_by_header(ws, row_index, headers, "Надіслано", "Так")
-        update_cell_by_header(ws, row_index, headers, "Дата надсилання", now_str())
-        sent_campaigns += 1
+            text = marketing_message_text(row_type, title, body, product)
+            keyboard = product_marketing_keyboard(product_id if product else None, button_text)
+            campaign_key = f"marketing|{campaign_id}|{product_id}|{date_raw}|{title}"
+            sent, failed = send_marketing_to_all(
+                text,
+                keyboard,
+                photo_url,
+                campaign_key=campaign_key,
+                campaign_type="Маркетинг"
+            )
 
-        print(f"marketing campaign sent row={row_index}, sent={sent}, failed={failed}")
+            update_cell_by_header(ws, row_index, headers, "Надіслано", "Так")
+            update_cell_by_header(ws, row_index, headers, "Дата надсилання", now_str())
+            sent_campaigns += 1
 
-    if sent_campaigns == 0:
-        # Якщо ручних розсилок на сьогодні немає — автоматично надсилаємо "товар дня".
-        sent_campaigns += process_auto_product_day_broadcast()
+            print(f"marketing campaign sent row={row_index}, sent={sent}, failed={failed}")
 
-    return sent_campaigns
+        if sent_campaigns == 0:
+            # Якщо ручних розсилок на сьогодні немає — автоматично надсилаємо "товар дня".
+            sent_campaigns += process_auto_product_day_broadcast()
 
+        return sent_campaigns
+
+    finally:
+        release_broadcast_lock("marketing-broadcasts")
 
 def sale_product_already_broadcasted(product, broadcast_type="Старт"):
     """
@@ -4101,39 +4272,58 @@ def process_sale_broadcasts():
     if not broadcasts_allowed_now("sale broadcasts"):
         return 0
 
-    sale_products = get_sale_products()
-    sent_count = 0
+    if not acquire_broadcast_lock("sale-broadcasts"):
+        return 0
 
-    for product in sale_products:
-        if sent_count >= SALE_BROADCAST_LIMIT_PER_RUN:
-            break
+    try:
+        sale_products = get_sale_products()
+        sent_count = 0
 
-        product_id = str(product.get("ID товару", "")).strip()
-        if not product_id:
-            continue
+        for product in sale_products:
+            if sent_count >= SALE_BROADCAST_LIMIT_PER_RUN:
+                break
 
-        days_left = sale_days_left(product)
+            product_id = str(product.get("ID товару", "")).strip()
+            if not product_id:
+                continue
 
-        broadcast_type = None
-        if days_left == 0 and not sale_product_already_broadcasted(product, "Останній день"):
-            broadcast_type = "Останній день"
-        elif days_left == 3 and not sale_product_already_broadcasted(product, "3 дні"):
-            broadcast_type = "3 дні"
-        elif not sale_product_already_broadcasted(product, "Старт"):
-            broadcast_type = "Старт"
+            days_left = sale_days_left(product)
 
-        if not broadcast_type:
-            continue
+            broadcast_type = None
+            if days_left == 0 and not sale_product_already_broadcasted(product, "Останній день"):
+                broadcast_type = "Останній день"
+            elif days_left == 3 and not sale_product_already_broadcasted(product, "3 дні"):
+                broadcast_type = "3 дні"
+            elif not sale_product_already_broadcasted(product, "Старт"):
+                broadcast_type = "Старт"
 
-        photos = get_product_photos(product)
-        photo_url = photos[0] if photos else None
-        text = sale_broadcast_text(product, broadcast_type)
-        keyboard = product_marketing_keyboard(product_id, "🔥 Переглянути товар")
-        send_marketing_to_all(text, keyboard, photo_url)
-        mark_sale_product_broadcasted(product, broadcast_type)
-        sent_count += 1
+            if not broadcast_type:
+                continue
 
-    return sent_count
+            photos = get_product_photos(product)
+            photo_url = photos[0] if photos else None
+            text = sale_broadcast_text(product, broadcast_type)
+            keyboard = product_marketing_keyboard(product_id, "🔥 Переглянути товар")
+            campaign_key = f"sale|{broadcast_type}|{sale_broadcast_key(product)}"
+
+            sent, failed = send_marketing_to_all(
+                text,
+                keyboard,
+                photo_url,
+                campaign_key=campaign_key,
+                campaign_type=f"Акція: {broadcast_type}"
+            )
+
+            # Позначаємо акцію як оброблену, щоб повторний запуск endpoint не дублював її.
+            mark_sale_product_broadcasted(product, broadcast_type)
+            sent_count += 1
+
+            print(f"sale broadcast type={broadcast_type}, product={product_id}, sent={sent}, failed={failed}")
+
+        return sent_count
+
+    finally:
+        release_broadcast_lock("sale-broadcasts")
 
 
 def inactive_client_text():
@@ -4326,7 +4516,14 @@ def process_auto_product_day_broadcast():
             product
         )
         keyboard = product_marketing_keyboard(product_id, "🛍 Переглянути товар")
-        sent, failed = send_marketing_to_all(text, keyboard, photo_url)
+        campaign_key = f"auto_product|{current_time().strftime('%d.%m.%Y')}|{product_id}"
+        sent, failed = send_marketing_to_all(
+            text,
+            keyboard,
+            photo_url,
+            campaign_key=campaign_key,
+            campaign_type="Товар дня"
+        )
 
         if sent > 0:
             mark_auto_product_broadcasted(product)
