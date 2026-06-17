@@ -156,20 +156,34 @@ def send_service_message(chat_id, text, keyboard=None, clear_products=True):
     return message_id
 
 
+def can_edit_as_text(callback_message):
+    """
+    Telegram не дозволяє editMessageText для повідомлень із фото/медіа.
+    Якщо кнопка натиснута під фото товару, треба надсилати нове текстове повідомлення,
+    а не намагатися перетворити фото на текст.
+    """
+    try:
+        return bool(callback_message and callback_message.get("text") is not None)
+    except Exception:
+        return False
+
+
 def update_service_message(chat_id, callback_message, text, keyboard=None, clear_products=True):
     """
-    Якщо є callback_message — редагуємо його і запамʼятовуємо як поточне сервісне.
-    Якщо немає — надсилаємо нове сервісне повідомлення.
+    Якщо callback був під текстовим повідомленням — редагуємо його.
+    Якщо callback був під фото/медіа — надсилаємо нове сервісне повідомлення.
+    Це виправляє кнопки типу «Перейти в кошик» під карткою товару.
     """
     if clear_products:
         clear_product_messages(chat_id)
 
-    if callback_message:
+    if callback_message and can_edit_as_text(callback_message):
         message_id = callback_message.get("message_id")
         clear_service_messages(chat_id, except_message_id=message_id)
-        edit_message(chat_id, message_id, text, keyboard)
-        register_service_message(chat_id, message_id)
-        return message_id
+        ok = edit_message(chat_id, message_id, text, keyboard)
+        if ok:
+            register_service_message(chat_id, message_id)
+            return message_id
 
     return send_service_message(chat_id, text, keyboard, clear_products=False)
 
@@ -1329,9 +1343,14 @@ def edit_message(chat_id, message_id, text, keyboard=None):
         payload["reply_markup"] = json.dumps(keyboard, ensure_ascii=False)
 
     try:
-        requests.post(f"{BASE_URL}/editMessageText", json=payload, timeout=15)
+        response = requests.post(f"{BASE_URL}/editMessageText", json=payload, timeout=15)
+        if not response.ok:
+            print("edit_message telegram error:", response.text)
+            return False
+        return True
     except Exception as e:
         print("edit_message error:", e)
+        return False
 
 
 def edit_caption(chat_id, message_id, caption, keyboard=None):
@@ -1898,10 +1917,11 @@ def format_cart_item_line(item):
 def format_cart_item_for_order(item):
     name = item.get("Назва товару") or item.get("name") or "Товар"
     product_id = item.get("ID товару") or item.get("product_id") or ""
+
     if is_promo_gift_cart_id(product_id):
-        send_message(chat_id, "🎁 Акційний товар автоматично змінюється разом з основним товаром.")
-        show_cart(chat_id, callback_message)
-        return
+        qty = safe_int(item.get("Кількість") or item.get("qty") or 1, 1)
+        summa = safe_float(item.get("Сума") or item.get("sum") or 0)
+        return f"{name} x{qty} шт. = {summa} грн"
 
     product = get_product_by_id(product_id) if product_id else None
     promo = get_product_promo_deal(product)
@@ -5483,10 +5503,10 @@ def show_products_by_subcategory(chat_id, subcategory_id, callback_message=None)
             ]
         }
 
-        if callback_message:
+        if callback_message and can_edit_as_text(callback_message):
             edit_message(chat_id, callback_message["message_id"], text, keyboard)
         else:
-            send_message(chat_id, text, keyboard)
+            send_service_message(chat_id, text, keyboard, clear_products=False)
         return
 
     state = USER_STATES.get(str(chat_id), {})
@@ -5774,10 +5794,10 @@ def show_cart(chat_id, callback_message=None):
 
     keyboard = {"inline_keyboard": buttons}
 
-    if callback_message:
+    if callback_message and can_edit_as_text(callback_message):
         edit_message(chat_id, callback_message["message_id"], text, keyboard)
     else:
-        send_message(chat_id, text, keyboard)
+        send_service_message(chat_id, text, keyboard, clear_products=False)
 
 def change_cart_qty(chat_id, row_index, delta, callback_message=None):
     rows = get_values("Кошик")
