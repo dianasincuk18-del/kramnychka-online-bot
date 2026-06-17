@@ -36,6 +36,14 @@ USER_PRODUCT_MESSAGES = {}
 # Коли клієнт відкриває новий пункт меню, попереднє сервісне повідомлення видаляється.
 USER_SERVICE_MESSAGES = {}
 
+# Запамʼятовуємо службові питання під час оформлення/заявок,
+# щоб попереднє питання бота прибиралось і чат залишався чистим.
+USER_FLOW_MESSAGES = {}
+
+# Кеш для оновлення статусу бота у листі "Користувачі", щоб не писати в Sheets при кожному повідомленні.
+USER_BOT_STATUS_CACHE = {}
+USER_BOT_STATUS_THROTTLE_SECONDS = int(os.environ.get("USER_BOT_STATUS_THROTTLE_SECONDS", "21600"))
+
 
 def register_service_message(chat_id, message_id):
     try:
@@ -66,6 +74,62 @@ def clear_service_messages(chat_id, except_message_id=None):
     except Exception as e:
         print("clear_service_messages error:", e)
 
+
+
+
+def register_flow_message(chat_id, message_id):
+    try:
+        if not message_id:
+            return
+        key = str(chat_id)
+        USER_FLOW_MESSAGES.setdefault(key, [])
+        if message_id not in USER_FLOW_MESSAGES[key]:
+            USER_FLOW_MESSAGES[key].append(message_id)
+    except Exception as e:
+        print("register_flow_message error:", e)
+
+
+def clear_flow_messages(chat_id, except_message_id=None):
+    """
+    Видаляє попередні службові питання бота під час оформлення замовлення або заявки.
+    Відповіді клієнта Telegram видалити не дозволяє, але питання бота можна прибирати.
+    """
+    try:
+        key = str(chat_id)
+        message_ids = USER_FLOW_MESSAGES.get(key, [])
+        keep = []
+        for message_id in message_ids:
+            if except_message_id and str(message_id) == str(except_message_id):
+                keep.append(message_id)
+                continue
+            delete_message(chat_id, message_id)
+        USER_FLOW_MESSAGES[key] = keep
+    except Exception as e:
+        print("clear_flow_messages error:", e)
+
+
+def send_flow_message(chat_id, text, keyboard=None, auto_delete_after=None):
+    """
+    Надсилає наступне питання в сценарії оформлення і прибирає попереднє питання бота.
+    Використовуємо для ПІБ → телефон → місто → відділення → оплата → коментар.
+    """
+    clear_flow_messages(chat_id)
+    message_id = send_message(chat_id, text, keyboard)
+    register_flow_message(chat_id, message_id)
+    if auto_delete_after:
+        schedule_delete_message(chat_id, message_id, auto_delete_after)
+    return message_id
+
+
+def edit_flow_message(chat_id, message_id, text, keyboard=None):
+    try:
+        clear_flow_messages(chat_id, except_message_id=message_id)
+        edit_message(chat_id, message_id, text, keyboard)
+        register_flow_message(chat_id, message_id)
+        return message_id
+    except Exception as e:
+        print("edit_flow_message error:", e)
+        return None
 
 def send_service_message(chat_id, text, keyboard=None, clear_products=True):
     """
@@ -1014,6 +1078,101 @@ def normalize_inline_keyboard(keyboard):
         return keyboard
 
 
+
+
+def ensure_user_columns(column_names):
+    """Гарантує, що в листі Користувачі є потрібні колонки, і повертає map назва→номер колонки."""
+    result = {}
+    try:
+        ws = get_users_worksheet()
+        rows = google_call_with_retry(lambda: ws.get_all_values())
+        headers = rows[0] if rows else []
+
+        normalized = {str(h).strip().lower(): idx for idx, h in enumerate(headers, start=1) if str(h).strip()}
+        changed = False
+
+        for column_name in column_names:
+            key = str(column_name).strip().lower()
+            if key in normalized:
+                result[column_name] = normalized[key]
+                continue
+
+            new_col = len(headers) + 1
+            try:
+                current_cols = int(getattr(ws, "col_count", 0) or 0)
+                if current_cols < new_col:
+                    google_call_with_retry(lambda new_col=new_col, current_cols=current_cols: ws.add_cols(new_col - current_cols))
+            except Exception as e:
+                print("ensure_user_columns add_cols error:", e)
+
+            google_call_with_retry(lambda new_col=new_col, column_name=column_name: ws.update_cell(1, new_col, column_name))
+            headers.append(column_name)
+            normalized[key] = new_col
+            result[column_name] = new_col
+            changed = True
+
+        if changed:
+            clear_cache("Користувачі")
+            clear_sheet_connection_cache("Користувачі")
+
+        return ws, result
+    except Exception as e:
+        print("ensure_user_columns error:", e)
+        return None, result
+
+
+def classify_telegram_send_error(response_text):
+    text = str(response_text or "").lower()
+    if "bot was blocked" in text or "blocked by the user" in text:
+        return "Заблокував бота"
+    if "user is deactivated" in text:
+        return "Неактивний акаунт"
+    if "chat not found" in text:
+        return "Чат не знайдено"
+    if "forbidden" in text:
+        return "Недоступний"
+    return "Помилка відправки"
+
+
+def update_user_bot_status(chat_id, status, error_text="", force=False):
+    """
+    Записує в лист Користувачі, чи бот може писати користувачу.
+    Колонки створюються автоматично: Статус бота, Дата перевірки статусу, Остання помилка бота.
+    """
+    try:
+        telegram_id = str(chat_id).strip()
+        if not telegram_id:
+            return False
+
+        cache_key = f"{telegram_id}:{status}:{str(error_text)[:60]}"
+        last = USER_BOT_STATUS_CACHE.get(cache_key)
+        if not force and last and (current_time() - last).total_seconds() < USER_BOT_STATUS_THROTTLE_SECONDS:
+            return False
+
+        ws, cols = ensure_user_columns(["Статус бота", "Дата перевірки статусу", "Остання помилка бота"])
+        if not ws or not cols:
+            return False
+
+        rows = google_call_with_retry(lambda: ws.get_all_values())
+        row_index = None
+        for i, row in enumerate(rows[1:], start=2):
+            if len(row) > 0 and str(row[0]).strip() == telegram_id:
+                row_index = i
+                break
+
+        if not row_index:
+            return False
+
+        google_call_with_retry(lambda: ws.update_cell(row_index, cols["Статус бота"], status))
+        google_call_with_retry(lambda: ws.update_cell(row_index, cols["Дата перевірки статусу"], now_str()))
+        google_call_with_retry(lambda: ws.update_cell(row_index, cols["Остання помилка бота"], str(error_text or "")[:500]))
+        USER_BOT_STATUS_CACHE[cache_key] = current_time()
+        clear_cache("Користувачі")
+        return True
+    except Exception as e:
+        print("update_user_bot_status error:", e)
+        return False
+
 def send_message(chat_id, text, keyboard=None):
     payload = {
         "chat_id": chat_id,
@@ -1030,9 +1189,12 @@ def send_message(chat_id, text, keyboard=None):
 
         if response.ok:
             data = response.json()
+            # Якщо Telegram прийняв повідомлення — бот активний для цього користувача.
+            update_user_bot_status(chat_id, "Активний", "")
             return data.get("result", {}).get("message_id")
 
         print("send_message telegram error:", response.text)
+        update_user_bot_status(chat_id, classify_telegram_send_error(response.text), response.text, force=True)
         return None
 
     except Exception as e:
@@ -1095,9 +1257,11 @@ def send_photo(chat_id, photo_url, caption, keyboard=None):
 
         if not response.ok:
             print("send_photo telegram error:", response.text)
+            update_user_bot_status(chat_id, classify_telegram_send_error(response.text), response.text, force=True)
             return False
 
         data = response.json()
+        update_user_bot_status(chat_id, "Активний", "")
         return data.get("result", {}).get("message_id") or True
 
     except Exception as e:
@@ -1123,9 +1287,11 @@ def send_document(chat_id, document_url, caption="", keyboard=None):
 
         if not response.ok:
             print("send_document telegram error:", response.text)
+            update_user_bot_status(chat_id, classify_telegram_send_error(response.text), response.text, force=True)
             return False
 
         data = response.json()
+        update_user_bot_status(chat_id, "Активний", "")
         return data.get("result", {}).get("message_id") or True
 
     except Exception as e:
@@ -1932,6 +2098,21 @@ def get_clients_monitoring_stats():
     total_users = 0
     new_today = 0
     new_month = 0
+    active_users = 0
+    blocked_users = 0
+    inactive_users = 0
+
+    headers = []
+    try:
+        all_users_values = get_values("Користувачі")
+        headers = all_users_values[0] if all_users_values else []
+    except Exception:
+        headers = []
+    status_col_idx = None
+    for idx, header in enumerate(headers):
+        if str(header).strip().lower() == "статус бота":
+            status_col_idx = idx
+            break
 
     for row in users_rows:
         if not row or not str(row[0]).strip():
@@ -1945,6 +2126,14 @@ def get_clients_monitoring_stats():
 
         if month_part in str(first_seen):
             new_month += 1
+
+        bot_status = str(row[status_col_idx] if status_col_idx is not None and len(row) > status_col_idx else "").strip().lower()
+        if bot_status == "активний":
+            active_users += 1
+        elif "заблок" in bot_status:
+            blocked_users += 1
+        elif bot_status:
+            inactive_users += 1
 
     order_count = len(orders)
 
@@ -1962,7 +2151,10 @@ def get_clients_monitoring_stats():
         "new_today": new_today,
         "new_month": new_month,
         "order_count": order_count,
-        "repeat_clients": repeat_clients
+        "repeat_clients": repeat_clients,
+        "active_users": active_users,
+        "blocked_users": blocked_users,
+        "inactive_users": inactive_users
     }
 
 
@@ -3142,7 +3334,7 @@ def ask_free_delivery_offer(chat_id):
         ]
     }
 
-    send_message(chat_id, text, keyboard)
+    send_flow_message(chat_id, text, keyboard)
 
 def continue_order_after_adding(chat_id):
     state = USER_STATES.get(str(chat_id), {})
@@ -4447,6 +4639,7 @@ def start(chat_id):
 def show_main_menu(chat_id, callback_message=None):
     USER_STATES.pop(str(chat_id), None)
     clear_product_messages(chat_id)
+    clear_flow_messages(chat_id)
     text = "🏠 <b>Головне меню</b>\n\nОберіть, будь ласка, що хочете переглянути:"
     keyboard = main_menu_inline(is_admin(chat_id))
 
@@ -5292,7 +5485,7 @@ def start_order(chat_id):
         "comment": ""
     }
 
-    send_message(chat_id, "Введіть, будь ласка, Ваше ПІБ:")
+    send_flow_message(chat_id, "Введіть, будь ласка, Ваше ПІБ:")
 
 def is_menu_or_catalog_text(text):
     text = str(text or "").strip()
@@ -5359,18 +5552,18 @@ def handle_contact_state(chat_id, text, user):
 
     if step == "contact_waiting_full_name":
         if not looks_like_name(text):
-            send_message(chat_id, "Введіть, будь ласка, Ваше ПІБ текстом. Наприклад: Іваненко Іван")
+            send_flow_message(chat_id, "Введіть, будь ласка, Ваше ПІБ текстом. Наприклад: Іваненко Іван")
             return True
 
         state["contact_full_name"] = text.strip()
         state["step"] = "contact_waiting_phone"
         USER_STATES[str(chat_id)] = state
-        send_message(chat_id, "Введіть, будь ласка, Ваш номер телефону:")
+        send_flow_message(chat_id, "Введіть, будь ласка, Ваш номер телефону:")
         return True
 
     if step == "contact_waiting_phone":
         if not looks_like_phone(text):
-            send_message(chat_id, "Введіть, будь ласка, коректний номер телефону. Наприклад: +380XXXXXXXXX")
+            send_flow_message(chat_id, "Введіть, будь ласка, коректний номер телефону. Наприклад: +380XXXXXXXXX")
             return True
 
         state["contact_phone"] = text.strip()
@@ -5393,7 +5586,7 @@ def handle_order_state(chat_id, text, user):
         state["full_name"] = text.strip()
         state["step"] = "waiting_phone"
         USER_STATES[str(chat_id)] = state
-        send_message(chat_id, "Введіть, будь ласка, Ваш номер телефону:")
+        send_flow_message(chat_id, "Введіть, будь ласка, Ваш номер телефону:")
         return True
 
     if step == "waiting_phone":
@@ -5407,7 +5600,7 @@ def handle_order_state(chat_id, text, user):
                 [inline_button("📦 Укрпошта", "delivery_ukr")]
             ]
         }
-        send_message(chat_id, "Оберіть, будь ласка, спосіб доставки:", keyboard)
+        send_flow_message(chat_id, "Оберіть, будь ласка, спосіб доставки:", keyboard)
         return True
 
     if step == "waiting_city":
@@ -5416,10 +5609,10 @@ def handle_order_state(chat_id, text, user):
 
         if delivery_method == "Нова пошта":
             state["step"] = "waiting_np_branch"
-            send_message(chat_id, "Введіть, будь ласка, номер або адресу відділення Нової пошти:")
+            send_flow_message(chat_id, "Введіть, будь ласка, номер або адресу відділення Нової пошти:")
         elif delivery_method == "Укрпошта":
             state["step"] = "waiting_ukrposhta_index"
-            send_message(chat_id, "Введіть, будь ласка, індекс Укрпошти:")
+            send_flow_message(chat_id, "Введіть, будь ласка, індекс Укрпошти:")
         else:
             state["step"] = "waiting_delivery"
             keyboard = {
@@ -5428,7 +5621,7 @@ def handle_order_state(chat_id, text, user):
                     [inline_button("📦 Укрпошта", "delivery_ukr")]
                 ]
             }
-            send_message(chat_id, "Оберіть, будь ласка, спосіб доставки:", keyboard)
+            send_flow_message(chat_id, "Оберіть, будь ласка, спосіб доставки:", keyboard)
 
         USER_STATES[str(chat_id)] = state
         return True
@@ -5471,9 +5664,9 @@ def ask_payment_method(chat_id, callback_message=None):
     text = "Оберіть, будь ласка, спосіб оплати:"
 
     if callback_message:
-        edit_message(chat_id, callback_message["message_id"], text, keyboard)
+        edit_flow_message(chat_id, callback_message["message_id"], text, keyboard)
     else:
-        send_message(chat_id, text, keyboard)
+        send_flow_message(chat_id, text, keyboard)
 
 
 def ask_need_contact(chat_id, callback_message=None):
@@ -5490,12 +5683,13 @@ def ask_need_contact(chat_id, callback_message=None):
     }
 
     if callback_message:
-        edit_message(chat_id, callback_message["message_id"], text, keyboard)
+        edit_flow_message(chat_id, callback_message["message_id"], text, keyboard)
     else:
-        send_message(chat_id, text, keyboard)
+        send_flow_message(chat_id, text, keyboard)
 
 
 def finish_order(chat_id, user, need_contact, callback_message=None):
+    clear_flow_messages(chat_id)
     cart = get_user_cart(chat_id)
 
     if not cart:
@@ -5783,26 +5977,27 @@ def contact_manager(chat_id, user, source="manual", product_id=""):
     }
 
     if source == "cart_reminder":
-        send_message(
+        send_flow_message(
             chat_id,
             "📞 Залиште, будь ласка, Ваше ПІБ — менеджер зв’яжеться з Вами та допоможе з товарами у кошику:"
         )
     elif source == "product_card":
         product_part = f" щодо товару <b>{product_name}</b>" if product_name else " щодо цього товару"
-        send_message(
+        send_flow_message(
             chat_id,
             f"📞 Залиште, будь ласка, Ваше ПІБ — менеджер зв’яжеться з Вами{product_part} та допоможе оформити замовлення:"
         )
     elif source == "manager_order":
-        send_message(
+        send_flow_message(
             chat_id,
             "📞 Залиште, будь ласка, Ваше ПІБ — менеджер зв’яжеться з Вами та оформить замовлення:"
         )
     else:
-        send_message(chat_id, "Введіть, будь ласка, Ваше ПІБ:")
+        send_flow_message(chat_id, "Введіть, будь ласка, Ваше ПІБ:")
 
 
 def finish_contact_request(chat_id, user, state):
+    clear_flow_messages(chat_id)
     request_date = current_time().strftime("%d.%m.%Y %H:%M")
     full_name = state.get("contact_full_name", "")
     phone = state.get("contact_phone", "")
@@ -7416,7 +7611,8 @@ def webhook():
             state["step"] = "waiting_free_delivery_decision"
             USER_STATES[str(chat_id)] = state
 
-            edit_message(chat_id, message_id, "Коментар пропущено ✅")
+            edit_flow_message(chat_id, message_id, "Коментар пропущено ✅")
+            schedule_delete_message(chat_id, message_id, 4)
             ask_free_delivery_offer(chat_id)
 
         elif data_value.startswith("contact_product_"):
