@@ -4057,38 +4057,183 @@ def marketing_message_text(row_type, title, body, product=None):
     return text
 
 
+
+def get_broadcast_recipient_log_snapshot():
+    """
+    Один раз читаємо лист "Надіслані розсилки клієнтам" перед масовою розсилкою.
+    ВАЖЛИВО: раніше код перечитував цей лист для кожного клієнта окремо — це сильно
+    вантажило памʼять і могло валити Render з SIGKILL / out of memory.
+    """
+    sent_keys = set()
+    today_counts = {}
+
+    try:
+        rows = get_values("Надіслані розсилки клієнтам")
+        if not rows:
+            return sent_keys, today_counts
+
+        headers = rows[0]
+        today_prefix = current_time().strftime("%d.%m.%Y")
+
+        for row in rows[1:]:
+            row_date = str(get_cell_by_header(row, headers, "Дата", row[0] if len(row) > 0 else "")).strip()
+            row_user = str(get_cell_by_header(row, headers, "Telegram ID", row[1] if len(row) > 1 else "")).strip()
+            row_key = str(get_cell_by_header(row, headers, "Ключ розсилки", "")).strip()
+            row_status = str(get_cell_by_header(row, headers, "Статус", "")).strip().lower()
+
+            if not row_user or row_status not in ["надіслано", "sent", "так"]:
+                continue
+
+            if row_key:
+                sent_keys.add(f"{row_user}|{row_key}")
+
+            if row_date.startswith(today_prefix):
+                today_counts[row_user] = today_counts.get(row_user, 0) + 1
+
+    except Exception as e:
+        print("get_broadcast_recipient_log_snapshot error:", e)
+
+    return sent_keys, today_counts
+
+
+def append_broadcast_recipient_logs(rows_to_append):
+    """
+    Записуємо логи розсилки пачкою, а не append_row для кожного клієнта.
+    Це значно зменшує кількість запитів до Google Sheets і навантаження на Render.
+    """
+    if not rows_to_append:
+        return
+
+    try:
+        ws = get_broadcast_recipient_log_worksheet()
+        google_call_with_retry(lambda: ws.append_rows(rows_to_append, value_input_option="USER_ENTERED"))
+        clear_cache("Надіслані розсилки клієнтам")
+    except Exception as e:
+        print("append_broadcast_recipient_logs error:", e)
+        # запасний варіант, якщо append_rows недоступний
+        try:
+            ws = get_broadcast_recipient_log_worksheet()
+            for row in rows_to_append:
+                google_call_with_retry(lambda row=row: ws.append_row(row, value_input_option="USER_ENTERED"))
+            clear_cache("Надіслані розсилки клієнтам")
+        except Exception as e2:
+            print("append_broadcast_recipient_logs fallback error:", e2)
+
+
+def send_broadcast_telegram_message(chat_id, text, keyboard=None, photo_url=None):
+    """
+    Легка відправка саме для масових розсилок.
+    На успішній відправці НЕ пишемо статус "Активний" у Google Sheets для кожного клієнта,
+    бо це створює сотні записів під час однієї розсилки і може вибити Render по памʼяті/часу.
+    Якщо Telegram повертає помилку — тоді статус користувача оновлюємо.
+    """
+    reply_markup = None
+    if keyboard:
+        keyboard = normalize_inline_keyboard(keyboard)
+        reply_markup = json.dumps(keyboard, ensure_ascii=False)
+
+    try:
+        if photo_url:
+            payload = {
+                "chat_id": chat_id,
+                "photo": photo_url,
+                "caption": text,
+                "parse_mode": "HTML"
+            }
+            if reply_markup:
+                payload["reply_markup"] = reply_markup
+
+            response = requests.post(f"{BASE_URL}/sendPhoto", json=payload, timeout=15)
+
+            if response.ok:
+                return True
+
+            print("send_broadcast photo telegram error:", response.text)
+            # Якщо фото не пройшло через довгий caption або іншу нефатальну причину — пробуємо текстом.
+            # Але якщо користувач заблокував бота/чат недоступний — одразу фіксуємо статус.
+            error_text = str(response.text or "").lower()
+            if "forbidden" in error_text or "chat not found" in error_text or "blocked" in error_text:
+                update_user_bot_status(chat_id, classify_telegram_send_error(response.text), response.text, force=True)
+                return False
+
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML"
+        }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+
+        response = requests.post(f"{BASE_URL}/sendMessage", json=payload, timeout=15)
+
+        if response.ok:
+            return True
+
+        print("send_broadcast message telegram error:", response.text)
+        update_user_bot_status(chat_id, classify_telegram_send_error(response.text), response.text, force=True)
+        return False
+
+    except Exception as e:
+        print("send_broadcast_telegram_message error:", e)
+        return False
+
+
 def send_marketing_to_all(text, keyboard=None, photo_url=None, campaign_key=None, campaign_type="Маркетинг"):
     sent = 0
     failed = 0
     skipped = 0
+    log_rows = []
 
     if not campaign_key:
         campaign_key = f"{campaign_type}|{current_time().strftime('%d.%m.%Y')}|{str(text)[:80]}"
 
-    for client_id in get_broadcast_client_ids():
+    client_ids = get_broadcast_client_ids()
+    sent_keys, today_counts = get_broadcast_recipient_log_snapshot()
+
+    sent_at = now_str()
+
+    for client_id in client_ids:
         try:
-            if broadcast_recipient_key_sent(client_id, campaign_key):
+            client_id = str(client_id).strip()
+            if not client_id:
+                continue
+
+            unique_key = f"{client_id}|{campaign_key}"
+
+            if unique_key in sent_keys:
                 skipped += 1
                 continue
 
-            if broadcast_recipient_already_sent_today(client_id):
+            if BROADCAST_DAILY_LIMIT_PER_USER > 0 and today_counts.get(client_id, 0) >= BROADCAST_DAILY_LIMIT_PER_USER:
                 skipped += 1
                 continue
 
-            ok = False
-            if photo_url:
-                ok = send_photo(client_id, photo_url, text, keyboard)
-            if not ok:
-                ok = bool(send_message(client_id, text, keyboard))
+            ok = send_broadcast_telegram_message(
+                chat_id=client_id,
+                text=text,
+                keyboard=keyboard,
+                photo_url=photo_url
+            )
 
             if ok:
-                mark_broadcast_recipient_sent(client_id, campaign_type, campaign_key)
                 sent += 1
+                sent_keys.add(unique_key)
+                today_counts[client_id] = today_counts.get(client_id, 0) + 1
+                log_rows.append([
+                    sent_at,
+                    client_id,
+                    str(campaign_type or "").strip(),
+                    str(campaign_key or "").strip(),
+                    "Надіслано"
+                ])
             else:
                 failed += 1
+
         except Exception as e:
             print("send_marketing_to_all user error:", client_id, e)
             failed += 1
+
+    append_broadcast_recipient_logs(log_rows)
 
     print(f"send_marketing_to_all type={campaign_type}, key={campaign_key}, sent={sent}, failed={failed}, skipped={skipped}")
     return sent, failed
