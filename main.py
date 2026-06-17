@@ -4813,46 +4813,27 @@ def show_product_card(chat_id, products, index=0, mode="category", category_id="
     keyboard = build_product_keyboard(product_id, products, index, mode, category_id, 0)
 
     if photos:
-        # Якщо опис короткий — надсилаємо фото + весь опис + кнопки одним повідомленням.
-        # Якщо опис раптом довший за ліміт Telegram, залишаємо безпечний запасний варіант:
-        # фото з короткою назвою + повний опис окремим повідомленням.
-        if can_send_as_photo_caption(text):
-            ok = send_photo(chat_id, photos[0], text, keyboard)
+        # Надсилаємо товар ОДНИМ повідомленням: фото + caption + кнопки.
+        # Якщо повний опис довший за ліміт Telegram для caption, не дублюємо його
+        # другим повідомленням, а показуємо короткий caption з кнопками.
+        # Коли опис у таблиці буде скорочений до ~1000 символів — він піде повністю під фото.
+        caption = text if can_send_as_photo_caption(text) else product_short_caption(product, index, total)
+        ok = send_photo(chat_id, photos[0], caption, keyboard)
 
-            if ok:
-                register_product_message(chat_id, ok, PRODUCT_CARD_AUTO_DELETE_SECONDS)
-            else:
-                doc_ok = send_document(chat_id, photos[0], text, keyboard)
-                if doc_ok:
-                    register_product_message(chat_id, doc_ok, PRODUCT_CARD_AUTO_DELETE_SECONDS)
-                else:
-                    send_product_text(
-                        chat_id,
-                        text,
-                        keyboard,
-                        auto_delete_after=PRODUCT_CARD_AUTO_DELETE_SECONDS,
-                        track_product=True
-                    )
+        if ok:
+            register_product_message(chat_id, ok, PRODUCT_CARD_AUTO_DELETE_SECONDS)
         else:
-            short_caption = product_short_caption(product, index, total)
-            ok = send_photo(chat_id, photos[0], short_caption)
-
-            if ok:
-                register_product_message(chat_id, ok, PRODUCT_CARD_AUTO_DELETE_SECONDS)
+            doc_ok = send_document(chat_id, photos[0], caption, keyboard)
+            if doc_ok:
+                register_product_message(chat_id, doc_ok, PRODUCT_CARD_AUTO_DELETE_SECONDS)
             else:
-                doc_ok = send_document(chat_id, photos[0], short_caption)
-                if doc_ok:
-                    register_product_message(chat_id, doc_ok, PRODUCT_CARD_AUTO_DELETE_SECONDS)
-                else:
-                    print("product photo failed, sending text only")
-
-            send_product_text(
-                chat_id,
-                text,
-                keyboard,
-                auto_delete_after=PRODUCT_CARD_AUTO_DELETE_SECONDS,
-                track_product=True
-            )
+                send_product_text(
+                    chat_id,
+                    text,
+                    keyboard,
+                    auto_delete_after=PRODUCT_CARD_AUTO_DELETE_SECONDS,
+                    track_product=True
+                )
     else:
         send_product_text(
             chat_id,
@@ -4965,13 +4946,10 @@ def update_product_card(chat_id, message_id, products, index=0, mode="category",
     keyboard = build_product_keyboard(product_id, products, index, mode, category_id, photo_index)
 
     if photos:
-        # Якщо опис влазить у caption — редагуємо фото так, щоб опис і кнопки були разом.
-        if can_send_as_photo_caption(text):
-            edit_media_photo(chat_id, message_id, photos[photo_index], text, keyboard)
-        else:
-            short_caption = product_short_caption(product, index, total)
-            edit_media_photo(chat_id, message_id, photos[photo_index], short_caption)
-            send_product_text(chat_id, text, keyboard, auto_delete_after=PRODUCT_CARD_AUTO_DELETE_SECONDS, track_product=True)
+        # Редагуємо одну товарну картку. Якщо caption довгий — показуємо короткий,
+        # але не надсилаємо друге повідомлення з описом, щоб не було дублювання.
+        caption = text if can_send_as_photo_caption(text) else product_short_caption(product, index, total)
+        edit_media_photo(chat_id, message_id, photos[photo_index], caption, keyboard)
     else:
         send_product_text(chat_id, text, keyboard, auto_delete_after=PRODUCT_CARD_AUTO_DELETE_SECONDS, track_product=True)
 
