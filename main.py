@@ -43,6 +43,9 @@ USER_FLOW_MESSAGES = {}
 # Кеш для оновлення статусу бота у листі "Користувачі", щоб не писати в Sheets при кожному повідомленні.
 USER_BOT_STATUS_CACHE = {}
 USER_BOT_STATUS_THROTTLE_SECONDS = int(os.environ.get("USER_BOT_STATUS_THROTTLE_SECONDS", "21600"))
+# Для швидкості не оновлюємо "Активний" у Google Sheets після кожного успішного sendMessage/sendPhoto.
+# Помилки відправки все одно записуються одразу: заблокував бота / чат не знайдено / недоступний.
+TRACK_ACTIVE_STATUS_ON_SUCCESS = os.environ.get("TRACK_ACTIVE_STATUS_ON_SUCCESS", "0").strip().lower() in ["1", "true", "yes", "так"]
 # =========================
 # BROADCAST ANTI-DUPLICATE PROTECTION
 # =========================
@@ -1198,8 +1201,10 @@ def send_message(chat_id, text, keyboard=None):
 
         if response.ok:
             data = response.json()
-            # Якщо Telegram прийняв повідомлення — бот активний для цього користувача.
-            update_user_bot_status(chat_id, "Активний", "")
+            # Для швидкості не пишемо в Google Sheets після кожної успішної відправки.
+            # Якщо потрібно повернути стару поведінку — поставте TRACK_ACTIVE_STATUS_ON_SUCCESS=1 у Render Environment.
+            if TRACK_ACTIVE_STATUS_ON_SUCCESS:
+                update_user_bot_status(chat_id, "Активний", "")
             return data.get("result", {}).get("message_id")
 
         print("send_message telegram error:", response.text)
@@ -1270,7 +1275,8 @@ def send_photo(chat_id, photo_url, caption, keyboard=None):
             return False
 
         data = response.json()
-        update_user_bot_status(chat_id, "Активний", "")
+        if TRACK_ACTIVE_STATUS_ON_SUCCESS:
+            update_user_bot_status(chat_id, "Активний", "")
         return data.get("result", {}).get("message_id") or True
 
     except Exception as e:
@@ -1300,7 +1306,8 @@ def send_document(chat_id, document_url, caption="", keyboard=None):
             return False
 
         data = response.json()
-        update_user_bot_status(chat_id, "Активний", "")
+        if TRACK_ACTIVE_STATUS_ON_SUCCESS:
+            update_user_bot_status(chat_id, "Активний", "")
         return data.get("result", {}).get("message_id") or True
 
     except Exception as e:
@@ -5070,21 +5077,67 @@ def show_more_product_photos(chat_id, product_index):
 
 
 
-def product_short_caption(product, index=None, total=None):
+def product_photo_caption(product, index=None, total=None, max_len=1000):
+    """
+    Caption для фото товару: обовʼязково показуємо опис і ціну в одному повідомленні з фото.
+    Якщо повний текст трохи більший за ліміт Telegram, скорочується тільки опис,
+    а назва/ціна/акція залишаються.
+    """
+    full_text = product_text(product, index, total)
+    if can_send_as_photo_caption(full_text):
+        return full_text
+
     name = safe_text(product.get("Назва товару"), "Товар без назви")
-    caption = ""
+    description = str(product.get("Опис") or "").strip()
+    price = safe_text(product.get("Ціна"), "0")
+    old_price = str(product.get("Стара ціна", "") or "").strip() if is_product_sale_active(product) else ""
+    sale_price = get_active_sale_price(product)
+    sale = get_product_sale_text(product)
 
+    header = ""
     if index is not None and total is not None:
-        caption += f"📦 Товар {index + 1} з {total}\n"
+        header += f"📦 Товар {index + 1} з {total}\n\n"
 
-    caption += f"<b>{name}</b>"
-    return caption[:1000]
+    header += f"<b>{name}</b>\n\n"
+
+    footer = ""
+    if old_price and sale_price:
+        footer += f"\n\n💸 Стара ціна: <s>{old_price} грн</s>\n🔥 Акційна ціна: <b>{sale_price} грн</b>"
+    elif sale_price:
+        footer += f"\n\n🔥 Акційна ціна: <b>{sale_price} грн</b>"
+    else:
+        footer += f"\n\n💰 Ціна: <b>{price} грн</b>"
+
+    if sale:
+        footer += f"\n🎁 Акція: <b>{sale}</b>"
+        period_info = sale_period_text(product)
+        if period_info:
+            footer += f"\n{period_info}"
+
+    gift_info = promo_gift_text_for_product(product)
+    if gift_info:
+        footer += f"\n\n{gift_info}"
+
+    available_for_description = max_len - len(header) - len(footer)
+    if available_for_description < 80:
+        # Якщо навіть з описом місця мало — лишаємо назву + ціну/акцію.
+        return (header.strip() + footer)[:max_len]
+
+    if len(description) > available_for_description:
+        description = description[:max(0, available_for_description - 3)].rstrip() + "..."
+
+    return (header + description + footer).strip()[:max_len]
+
+
+def product_short_caption(product, index=None, total=None):
+    # Залишено для сумісності зі старими викликами.
+    return product_photo_caption(product, index, total)
 
 
 def can_send_as_photo_caption(text):
     """
     Telegram дозволяє caption до 1024 символів.
-    Ставимо запас 1000 символів, бо HTML-теги/емодзі іноді можуть давати помилку.
+    Даємо запас до 1000 символів, щоб уникнути помилки через HTML/емодзі.
     """
     return len(str(text or "")) <= 1000
 
@@ -5159,7 +5212,7 @@ def show_product_card(chat_id, products, index=0, mode="category", category_id="
         # Якщо повний опис довший за ліміт Telegram для caption, не дублюємо його
         # другим повідомленням, а показуємо короткий caption з кнопками.
         # Коли опис у таблиці буде скорочений до ~1000 символів — він піде повністю під фото.
-        caption = text if can_send_as_photo_caption(text) else product_short_caption(product, index, total)
+        caption = product_photo_caption(product, index, total)
         ok = send_photo(chat_id, photos[0], caption, keyboard)
 
         if ok:
@@ -5290,7 +5343,7 @@ def update_product_card(chat_id, message_id, products, index=0, mode="category",
     if photos:
         # Редагуємо одну товарну картку. Якщо caption довгий — показуємо короткий,
         # але не надсилаємо друге повідомлення з описом, щоб не було дублювання.
-        caption = text if can_send_as_photo_caption(text) else product_short_caption(product, index, total)
+        caption = product_photo_caption(product, index, total)
         edit_media_photo(chat_id, message_id, photos[photo_index], caption, keyboard)
     else:
         send_product_text(chat_id, text, keyboard, auto_delete_after=PRODUCT_CARD_AUTO_DELETE_SECONDS, track_product=True)
@@ -7856,14 +7909,17 @@ def webhook():
             with_loading(chat_id, "👑 Завантажуємо кабінет...", show_admin_cabinet, chat_id, callback_message)
 
         elif data_value == "back_main":
-            clear_product_messages(chat_id)
-            clear_service_messages(chat_id, except_message_id=message_id)
+            # Кнопка може бути під фото товару. editMessageText для фото не працює,
+            # тому просто прибираємо старі товарні/сервісні повідомлення і надсилаємо нове головне меню.
             USER_STATES.pop(str(chat_id), None)
-            edit_message(
+            clear_flow_messages(chat_id)
+            clear_product_messages(chat_id)
+            clear_service_messages(chat_id)
+            send_service_message(
                 chat_id,
-                message_id,
                 "🏠 <b>Головне меню</b>\n\nОберіть, будь ласка, що хочете переглянути:",
-                main_menu_inline(is_admin(chat_id))
+                main_menu_inline(is_admin(chat_id)),
+                clear_products=False
             )
 
         elif data_value == "order_now":
