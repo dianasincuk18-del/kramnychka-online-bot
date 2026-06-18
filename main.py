@@ -6,7 +6,8 @@ import time
 import threading
 from flask import Flask, request
 from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime
+from datetime import datetime, timedelta
+import re
 from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
@@ -4006,15 +4007,53 @@ def update_cell_by_header(ws, row_index, headers, header_name, value):
 
 
 def parse_sheet_date(value):
-    value = str(value or "").strip()
-    if not value:
-        return None
+    """
+    Акуратно читає дати з Google Sheets.
+    Підтримує:
+    - 18.06.2026
+    - 18.06.2026 13:00
+    - 18.06 або 18.06. — автоматично підставляє поточний рік
+    - 2026-06-18
+    - 18/06/2026
+    - серійні дати Google Sheets/Excel
+    """
+    try:
+        if value is None:
+            return None
 
-    for fmt in ["%d.%m.%Y", "%d.%m.%Y %H:%M", "%Y-%m-%d", "%Y-%m-%d %H:%M"]:
-        try:
-            return datetime.strptime(value, fmt).date()
-        except:
-            pass
+        # Якщо gspread/Sheets раптом віддав число-серіал дати.
+        if isinstance(value, (int, float)) and float(value) > 0:
+            base = datetime(1899, 12, 30)
+            return (base + timedelta(days=float(value))).date()
+
+        value = str(value or "").strip()
+        if not value:
+            return None
+
+        value = value.replace("/", ".").replace("-", ".")
+        value = " ".join(value.split())
+
+        # 18.06 або 18.06. → поточний рік
+        short = value.split(" ")[0].strip()
+        if re.fullmatch(r"\d{1,2}\.\d{1,2}\.?$", short):
+            short = short.rstrip(".")
+            value = f"{short}.{current_time().year}"
+
+        for fmt in [
+            "%d.%m.%Y",
+            "%d.%m.%Y %H:%M",
+            "%d.%m.%Y %H:%M:%S",
+            "%Y.%m.%d",
+            "%Y.%m.%d %H:%M",
+            "%Y.%m.%d %H:%M:%S",
+        ]:
+            try:
+                return datetime.strptime(value, fmt).date()
+            except:
+                pass
+
+    except Exception as e:
+        print("parse_sheet_date error:", e, "value:", value)
 
     return None
 
@@ -4118,8 +4157,17 @@ def sale_period_text(product):
 def sale_broadcast_key(product):
     product_id = str(product.get("ID товару", "") or "").strip()
     sale = get_product_sale_text(product)
-    start = str(product.get("Акція від", "") or product.get("Акція з", "") or "").strip()
-    end = str(product.get("Акція до", "") or "").strip()
+
+    start_dt = get_product_sale_start(product)
+    end_dt = get_product_sale_end(product)
+
+    start = start_dt.strftime("%d.%m.%Y") if start_dt else str(product.get("Акція від", "") or product.get("Акція з", "") or "").strip()
+    end = end_dt.strftime("%d.%m.%Y") if end_dt else str(product.get("Акція до", "") or product.get("Дата завершення акції", "") or "").strip()
+
+    # Якщо текст акції порожній, але є акційна ціна/стара ціна — ключ все одно має бути унікальним.
+    if not sale:
+        sale = str(product.get("Акційна ціна", "") or product.get("Стара ціна", "") or "Акція").strip()
+
     return f"{product_id}|{sale}|{start}|{end}"
 
 
@@ -5025,7 +5073,11 @@ def process_sale_broadcasts():
         return 0
 
     try:
+        # Важливо: після ручного додавання акції в Google Sheets Render міг ще тримати старий кеш.
+        clear_cache("Товари")
+        clear_cache("Надіслані акції")
         sale_products = get_sale_products()
+        print(f"process_sale_broadcasts sale_products={len(sale_products)}")
         sent_count = 0
 
         for product in sale_products:
@@ -5465,13 +5517,46 @@ def get_active_products_by_category(category_id):
     ]
 
 
+def is_active_product_row(product):
+    """
+    Перевіряє, чи товар активний.
+    Підтримує різні назви колонки: Активний / Активна / Статус.
+    Якщо колонки активності немає взагалі — не блокуємо товар, щоб нові структури таблиці не ламали розсилку.
+    """
+    try:
+        active_raw = (
+            product.get("Активний")
+            or product.get("Активна")
+            or product.get("Статус")
+            or ""
+        )
+        active_text = str(active_raw or "").strip().lower()
+
+        if not active_text:
+            # Якщо в рядку немає жодної колонки активності — вважаємо товар доступним.
+            has_active_column = any(str(k).strip().lower() in ["активний", "активна", "статус"] for k in product.keys())
+            return not has_active_column
+
+        return active_text in ["так", "yes", "true", "1", "активний", "активна", "в наявності", "наявний"]
+    except Exception:
+        return False
+
+
 def get_sale_products():
-    products = get_cached_records("Товари")
-    return [
-        p for p in products
-        if is_product_sale_active(p)
-        and str(p.get("Активний")).strip().lower() in ["так", "yes", "true", "1", "активний"]
-    ]
+    # Примусово беремо свіжі товари, бо акції часто додаються прямо перед запуском.
+    clear_cache("Товари")
+    products = get_records("Товари")
+    result = []
+
+    for p in products:
+        try:
+            if is_product_sale_active(p) and is_active_product_row(p):
+                result.append(p)
+        except Exception as e:
+            print("get_sale_products row error:", e)
+
+    print(f"get_sale_products found={len(result)}")
+    return result
 
 
 def product_text(product, index=None, total=None):
