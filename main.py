@@ -56,6 +56,12 @@ BROADCAST_DAILY_LIMIT_PER_USER = int(os.environ.get("BROADCAST_DAILY_LIMIT_PER_U
 BROADCAST_LOCK_TTL_SECONDS = int(os.environ.get("BROADCAST_LOCK_TTL_SECONDS", "900"))
 BROADCAST_RUN_LOCKS = {}
 
+# Єдиний лист для фіксації ВСІХ розсилок по кожному клієнту.
+# Створюється автоматично при першому запуску будь-якої розсилки.
+BROADCAST_HISTORY_SHEET_NAME = os.environ.get("BROADCAST_HISTORY_SHEET_NAME", "Історія розсилок")
+BROADCAST_RUNS_SHEET_NAME = os.environ.get("BROADCAST_RUNS_SHEET_NAME", "Запуски розсилок")
+BROADCAST_LOG_FLUSH_EVERY = int(os.environ.get("BROADCAST_LOG_FLUSH_EVERY", "20"))
+
 
 def register_service_message(chat_id, message_id):
     try:
@@ -773,6 +779,9 @@ def process_cart_reminders():
 
     grouped = get_cart_rows_grouped_by_user()
     sent_count = 0
+    log_rows = []
+    sent_keys, today_counts = get_broadcast_recipient_log_snapshot()
+    sent_at = now_str()
 
     for telegram_id, data in grouped.items():
         dates = data.get("updated_dates") or []
@@ -799,6 +808,11 @@ def process_cart_reminders():
         if not reminder_number:
             continue
 
+        campaign_key = f"cart_reminder|{reminder_number}|{last_update.strftime('%Y%m%d%H%M')}"
+        unique_key = f"{telegram_id}|{campaign_key}"
+        if unique_key in sent_keys:
+            continue
+
         try:
             discount_percent = get_client_discount_percent(telegram_id)
         except:
@@ -810,17 +824,31 @@ def process_cart_reminders():
             discount_percent=discount_percent
         )
 
-        send_message(telegram_id, text, cart_reminder_keyboard(reminder_number))
+        ok = send_message(telegram_id, text, cart_reminder_keyboard(reminder_number))
 
-        sent_at = now_str()
-        for row_index in data.get("rows", []):
-            try:
-                google_call_with_retry(lambda row_index=row_index: get_cart_worksheet().update_cell(row_index, reminder_col, sent_at))
-            except Exception as e:
-                print("cart reminder mark error:", e)
+        if ok:
+            sent_keys.add(unique_key)
+            log_rows.append([
+                sent_at,
+                telegram_id,
+                f"Нагадування кошика {reminder_number}",
+                campaign_key,
+                "Надіслано"
+            ])
 
-        sent_count += 1
+            for row_index in data.get("rows", []):
+                try:
+                    google_call_with_retry(lambda row_index=row_index: get_cart_worksheet().update_cell(row_index, reminder_col, sent_at))
+                except Exception as e:
+                    print("cart reminder mark error:", e)
 
+            sent_count += 1
+
+            if len(log_rows) >= BROADCAST_LOG_FLUSH_EVERY:
+                append_broadcast_recipient_logs(log_rows)
+                log_rows = []
+
+    append_broadcast_recipient_logs(log_rows)
     return sent_count
 
 def get_order_cell(row, headers_map, header_name, fallback_index=None, default=""):
@@ -2672,8 +2700,7 @@ def grant_welcome_bonus(chat_id, only_if_new=True):
 def process_welcome_bonus_broadcast():
     """
     Одноразово нараховує 100 вітальних бонусів усім користувачам з листа "Користувачі".
-    Повторно одному й тому самому клієнту бонус не нараховується.
-    За один запуск обробляємо обмежену кількість клієнтів, щоб не впертися в ліміти Telegram/Google.
+    Повідомлення також фіксується в історії розсилок, щоб при повторному запуску не було дубля.
     """
     try:
         users_rows = get_values("Користувачі")[1:]
@@ -2682,6 +2709,9 @@ def process_welcome_bonus_broadcast():
         return 0
 
     sent_count = 0
+    log_rows = []
+    sent_keys, today_counts = get_broadcast_recipient_log_snapshot()
+    sent_at = now_str()
 
     for row in users_rows:
         if sent_count >= WELCOME_BONUS_BROADCAST_LIMIT_PER_RUN:
@@ -2689,6 +2719,11 @@ def process_welcome_bonus_broadcast():
 
         chat_id = str(row[0] if len(row) > 0 else "").strip()
         if not chat_id:
+            continue
+
+        campaign_key = f"welcome_bonus|{chat_id}"
+        unique_key = f"{chat_id}|{campaign_key}"
+        if unique_key in sent_keys:
             continue
 
         if welcome_bonus_already_added(chat_id):
@@ -2704,11 +2739,17 @@ def process_welcome_bonus_broadcast():
             expires_at=bonus_expiry_date()
         )
 
-        send_message(chat_id, welcome_bonus_message_text())
-        sent_count += 1
+        ok = send_message(chat_id, welcome_bonus_message_text())
+        if ok:
+            sent_keys.add(unique_key)
+            log_rows.append([sent_at, chat_id, "Вітальний бонус", campaign_key, "Надіслано"])
+            sent_count += 1
+            if len(log_rows) >= BROADCAST_LOG_FLUSH_EVERY:
+                append_broadcast_recipient_logs(log_rows)
+                log_rows = []
 
+    append_broadcast_recipient_logs(log_rows)
     return sent_count
-
 
 def register_referral_from_start(chat_id, referrer_id):
     """
@@ -3370,13 +3411,16 @@ def bonus_expiry_reminder_text(balance):
 def process_bonus_reminders():
     """
     М'яке нагадування про бонуси.
-    Щоб не створювати негатив — не пишемо, що бонуси згорять,
-    а просто нагадуємо про наявний бонусний рахунок.
+    Фіксується в листі історії, щоб один клієнт не отримав однакове нагадування кілька разів.
     """
     try:
         rows = get_values("Бонуси")
         notified = set()
         sent = 0
+        log_rows = []
+        sent_keys, today_counts = get_broadcast_recipient_log_snapshot()
+        sent_at = now_str()
+        today_key = current_time().strftime("%Y%m%d")
 
         for row in rows[1:]:
             if len(row) < 7:
@@ -3391,10 +3435,22 @@ def process_bonus_reminders():
             if balance <= 0:
                 continue
 
-            send_message(telegram_id, bonus_expiry_reminder_text(balance))
-            notified.add(telegram_id)
-            sent += 1
+            campaign_key = f"bonus_reminder|{today_key}"
+            unique_key = f"{telegram_id}|{campaign_key}"
+            if unique_key in sent_keys:
+                continue
 
+            ok = send_message(telegram_id, bonus_expiry_reminder_text(balance))
+            if ok:
+                sent_keys.add(unique_key)
+                log_rows.append([sent_at, telegram_id, "Нагадування про бонуси", campaign_key, "Надіслано"])
+                notified.add(telegram_id)
+                sent += 1
+                if len(log_rows) >= BROADCAST_LOG_FLUSH_EVERY:
+                    append_broadcast_recipient_logs(log_rows)
+                    log_rows = []
+
+        append_broadcast_recipient_logs(log_rows)
         return sent
 
     except Exception as e:
@@ -4034,6 +4090,7 @@ def sale_broadcast_key(product):
 def acquire_broadcast_lock(name):
     """
     Простий lock у памʼяті процесу, щоб один і той самий endpoint не запускався паралельно.
+    Додатково нижче є sheet-lock, який переживає рестарт Render/декілька worker-ів.
     """
     try:
         key = str(name)
@@ -4041,7 +4098,7 @@ def acquire_broadcast_lock(name):
         lock = BROADCAST_RUN_LOCKS.get(key)
 
         if lock and lock.get("running") and now_ts - float(lock.get("started_at", 0)) < BROADCAST_LOCK_TTL_SECONDS:
-            print(f"{key} skipped: already running")
+            print(f"{key} skipped: already running in memory")
             return False
 
         BROADCAST_RUN_LOCKS[key] = {
@@ -4063,6 +4120,91 @@ def release_broadcast_lock(name):
         print("release_broadcast_lock error:", e)
 
 
+def get_broadcast_runs_worksheet():
+    headers = [
+        "Дата",
+        "Назва",
+        "Ключ запуску",
+        "Статус",
+        "Надіслано",
+        "Помилок",
+        "Пропущено"
+    ]
+    ws = get_or_create_worksheet(BROADCAST_RUNS_SHEET_NAME, headers)
+    ensure_headers(ws, headers)
+    return ws
+
+
+def acquire_persistent_broadcast_lock(name, campaign_key):
+    """
+    Sheet-lock проти дублювання, коли UptimeRobot/Render запускає один endpoint кілька разів
+    або worker перезапускається. Якщо такий ключ уже розпочато/завершено — другий запуск не шле дубль.
+    """
+    try:
+        name = str(name or "Розсилка").strip()
+        campaign_key = str(campaign_key or "").strip()
+        if not campaign_key:
+            return True
+
+        ws = get_broadcast_runs_worksheet()
+        rows = google_call_with_retry(lambda: ws.get_all_values())
+        headers = rows[0] if rows else []
+        now_dt = current_time()
+
+        for row in rows[1:]:
+            row_key = str(get_cell_by_header(row, headers, "Ключ запуску", "")).strip()
+            row_status = str(get_cell_by_header(row, headers, "Статус", "")).strip().lower()
+            row_date_raw = str(get_cell_by_header(row, headers, "Дата", "")).strip()
+
+            if row_key != campaign_key:
+                continue
+
+            if row_status in ["завершено", "надіслано", "так", "sent"]:
+                print(f"broadcast skipped by sheet lock: already finished {campaign_key}")
+                return False
+
+            if row_status in ["розпочато", "в процесі", "running"]:
+                row_dt = parse_bot_datetime(row_date_raw)
+                if row_dt and (now_dt - row_dt).total_seconds() < BROADCAST_LOCK_TTL_SECONDS:
+                    print(f"broadcast skipped by sheet lock: already running {campaign_key}")
+                    return False
+
+        google_call_with_retry(lambda: ws.append_row([
+            now_str(),
+            name,
+            campaign_key,
+            "Розпочато",
+            "",
+            "",
+            ""
+        ], value_input_option="USER_ENTERED"))
+        clear_cache(BROADCAST_RUNS_SHEET_NAME)
+        return True
+    except Exception as e:
+        print("acquire_persistent_broadcast_lock error:", e)
+        # Якщо Google тимчасово недоступний — не валимо бота, але in-memory lock все одно працює.
+        return True
+
+
+def finish_persistent_broadcast_lock(name, campaign_key, sent=0, failed=0, skipped=0):
+    try:
+        if not campaign_key:
+            return
+        ws = get_broadcast_runs_worksheet()
+        google_call_with_retry(lambda: ws.append_row([
+            now_str(),
+            str(name or "Розсилка"),
+            str(campaign_key),
+            "Завершено",
+            int(sent or 0),
+            int(failed or 0),
+            int(skipped or 0)
+        ], value_input_option="USER_ENTERED"))
+        clear_cache(BROADCAST_RUNS_SHEET_NAME)
+    except Exception as e:
+        print("finish_persistent_broadcast_lock error:", e)
+
+
 def get_broadcast_recipient_log_worksheet():
     headers = [
         "Дата",
@@ -4071,91 +4213,180 @@ def get_broadcast_recipient_log_worksheet():
         "Ключ розсилки",
         "Статус"
     ]
-    ws = get_or_create_worksheet("Надіслані розсилки клієнтам", headers)
+    ws = get_or_create_worksheet(BROADCAST_HISTORY_SHEET_NAME, headers)
     ensure_headers(ws, headers)
     return ws
 
 
-def broadcast_recipient_already_sent_today(telegram_id):
+def _read_broadcast_history_rows():
     """
-    Перевіряє, чи клієнт вже отримував будь-яку маркетингову/акційну розсилку сьогодні.
-    Це прибирає ситуацію, коли одному клієнту прилітає і товар дня, і акція, і маркетингова розсилка.
+    Читаємо новий лист Історія розсилок і, якщо є, старий лист Надіслані розсилки клієнтам.
+    Це потрібно, щоб після деплою бот не забув уже надіслані сьогодні повідомлення.
     """
-    if BROADCAST_DAILY_LIMIT_PER_USER <= 0:
-        return False
+    all_rows = []
+    for sheet_name in [BROADCAST_HISTORY_SHEET_NAME, "Надіслані розсилки клієнтам"]:
+        try:
+            rows = get_values(sheet_name)
+            if rows:
+                all_rows.append(rows)
+        except Exception:
+            pass
+    return all_rows
+
+
+def get_broadcast_recipient_log_snapshot():
+    """
+    Один раз читаємо історію перед масовою розсилкою.
+    Повертає:
+    - sent_keys: user|campaign_key, які вже точно були надіслані;
+    - today_counts: скільки маркетингових/акційних повідомлень клієнт вже отримав сьогодні.
+    """
+    sent_keys = set()
+    today_counts = {}
 
     try:
-        rows = get_values("Надіслані розсилки клієнтам")
-        if not rows:
-            return False
+        # Гарантуємо створення нового листа навіть до першого запису.
+        get_broadcast_recipient_log_worksheet()
 
-        headers = rows[0]
         today_prefix = current_time().strftime("%d.%m.%Y")
-        count = 0
+        for rows in _read_broadcast_history_rows():
+            if not rows:
+                continue
+            headers = rows[0]
+            for row in rows[1:]:
+                row_date = str(get_cell_by_header(row, headers, "Дата", row[0] if len(row) > 0 else "")).strip()
+                row_user = str(get_cell_by_header(row, headers, "Telegram ID", row[1] if len(row) > 1 else "")).strip()
+                row_key = str(get_cell_by_header(row, headers, "Ключ розсилки", "")).strip()
+                row_status = str(get_cell_by_header(row, headers, "Статус", "")).strip().lower()
 
-        for row in rows[1:]:
-            row_date = str(get_cell_by_header(row, headers, "Дата", row[0] if len(row) > 0 else "")).strip()
-            row_user = str(get_cell_by_header(row, headers, "Telegram ID", row[1] if len(row) > 1 else "")).strip()
-            row_status = str(get_cell_by_header(row, headers, "Статус", "")).strip().lower()
+                if not row_user or row_status not in ["надіслано", "sent", "так"]:
+                    continue
 
-            if (
-                row_user == str(telegram_id).strip()
-                and row_date.startswith(today_prefix)
-                and row_status in ["надіслано", "sent", "так"]
-            ):
-                count += 1
+                if row_key:
+                    sent_keys.add(f"{row_user}|{row_key}")
 
-        return count >= BROADCAST_DAILY_LIMIT_PER_USER
+                if row_date.startswith(today_prefix):
+                    today_counts[row_user] = today_counts.get(row_user, 0) + 1
 
+    except Exception as e:
+        print("get_broadcast_recipient_log_snapshot error:", e)
+
+    return sent_keys, today_counts
+
+
+def broadcast_recipient_already_sent_today(telegram_id):
+    if BROADCAST_DAILY_LIMIT_PER_USER <= 0:
+        return False
+    try:
+        _, today_counts = get_broadcast_recipient_log_snapshot()
+        return today_counts.get(str(telegram_id).strip(), 0) >= BROADCAST_DAILY_LIMIT_PER_USER
     except Exception as e:
         print("broadcast_recipient_already_sent_today error:", e)
         return False
 
 
 def broadcast_recipient_key_sent(telegram_id, campaign_key):
-    """
-    Перевіряє, чи конкретну розсилку вже відправляли конкретному клієнту.
-    """
     try:
         if not campaign_key:
             return False
-
-        rows = get_values("Надіслані розсилки клієнтам")
-        if not rows:
-            return False
-
-        headers = rows[0]
-        for row in rows[1:]:
-            row_user = str(get_cell_by_header(row, headers, "Telegram ID", row[1] if len(row) > 1 else "")).strip()
-            row_key = str(get_cell_by_header(row, headers, "Ключ розсилки", "")).strip()
-            row_status = str(get_cell_by_header(row, headers, "Статус", "")).strip().lower()
-
-            if (
-                row_user == str(telegram_id).strip()
-                and row_key == str(campaign_key).strip()
-                and row_status in ["надіслано", "sent", "так"]
-            ):
-                return True
-
+        sent_keys, _ = get_broadcast_recipient_log_snapshot()
+        return f"{str(telegram_id).strip()}|{str(campaign_key).strip()}" in sent_keys
     except Exception as e:
         print("broadcast_recipient_key_sent error:", e)
+        return False
 
-    return False
+
+def append_broadcast_recipient_logs(rows_to_append):
+    """
+    Записуємо логи розсилки пачкою. Лист створюється автоматично.
+    """
+    if not rows_to_append:
+        return
+
+    try:
+        ws = get_broadcast_recipient_log_worksheet()
+        google_call_with_retry(lambda: ws.append_rows(rows_to_append, value_input_option="USER_ENTERED"))
+        clear_cache(BROADCAST_HISTORY_SHEET_NAME)
+        clear_cache("Надіслані розсилки клієнтам")
+    except Exception as e:
+        print("append_broadcast_recipient_logs error:", e)
+        try:
+            ws = get_broadcast_recipient_log_worksheet()
+            for row in rows_to_append:
+                google_call_with_retry(lambda row=row: ws.append_row(row, value_input_option="USER_ENTERED"))
+            clear_cache(BROADCAST_HISTORY_SHEET_NAME)
+            clear_cache("Надіслані розсилки клієнтам")
+        except Exception as e2:
+            print("append_broadcast_recipient_logs fallback error:", e2)
 
 
 def mark_broadcast_recipient_sent(telegram_id, campaign_type, campaign_key):
     try:
-        ws = get_broadcast_recipient_log_worksheet()
-        google_call_with_retry(lambda: ws.append_row([
+        append_broadcast_recipient_logs([[
             now_str(),
             str(telegram_id).strip(),
             str(campaign_type or "").strip(),
             str(campaign_key or "").strip(),
             "Надіслано"
-        ], value_input_option="USER_ENTERED"))
-        clear_cache("Надіслані розсилки клієнтам")
+        ]])
     except Exception as e:
         print("mark_broadcast_recipient_sent error:", e)
+
+
+def send_broadcast_telegram_message(chat_id, text, keyboard=None, photo_url=None):
+    """
+    Легка відправка саме для масових розсилок.
+    На успішній відправці НЕ пишемо статус Активний у Google Sheets для кожного клієнта.
+    Якщо Telegram повертає помилку — тоді статус користувача оновлюємо.
+    """
+    reply_markup = None
+    if keyboard:
+        keyboard = normalize_inline_keyboard(keyboard)
+        reply_markup = json.dumps(keyboard, ensure_ascii=False)
+
+    try:
+        if photo_url:
+            payload = {
+                "chat_id": chat_id,
+                "photo": photo_url,
+                "caption": text,
+                "parse_mode": "HTML"
+            }
+            if reply_markup:
+                payload["reply_markup"] = reply_markup
+
+            response = requests.post(f"{BASE_URL}/sendPhoto", json=payload, timeout=15)
+
+            if response.ok:
+                return True
+
+            print("send_broadcast photo telegram error:", response.text)
+            error_text = str(response.text or "").lower()
+            if "forbidden" in error_text or "chat not found" in error_text or "blocked" in error_text:
+                update_user_bot_status(chat_id, classify_telegram_send_error(response.text), response.text, force=True)
+                return False
+
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML"
+        }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+
+        response = requests.post(f"{BASE_URL}/sendMessage", json=payload, timeout=15)
+
+        if response.ok:
+            return True
+
+        print("send_broadcast message telegram error:", response.text)
+        update_user_bot_status(chat_id, classify_telegram_send_error(response.text), response.text, force=True)
+        return False
+
+    except Exception as e:
+        print("send_broadcast_telegram_message error:", e)
+        return False
+
 
 def get_marketing_worksheet():
     headers = [
@@ -4277,126 +4508,6 @@ def marketing_message_text(row_type, title, body, product=None):
 
 
 
-def get_broadcast_recipient_log_snapshot():
-    """
-    Один раз читаємо лист "Надіслані розсилки клієнтам" перед масовою розсилкою.
-    ВАЖЛИВО: раніше код перечитував цей лист для кожного клієнта окремо — це сильно
-    вантажило памʼять і могло валити Render з SIGKILL / out of memory.
-    """
-    sent_keys = set()
-    today_counts = {}
-
-    try:
-        rows = get_values("Надіслані розсилки клієнтам")
-        if not rows:
-            return sent_keys, today_counts
-
-        headers = rows[0]
-        today_prefix = current_time().strftime("%d.%m.%Y")
-
-        for row in rows[1:]:
-            row_date = str(get_cell_by_header(row, headers, "Дата", row[0] if len(row) > 0 else "")).strip()
-            row_user = str(get_cell_by_header(row, headers, "Telegram ID", row[1] if len(row) > 1 else "")).strip()
-            row_key = str(get_cell_by_header(row, headers, "Ключ розсилки", "")).strip()
-            row_status = str(get_cell_by_header(row, headers, "Статус", "")).strip().lower()
-
-            if not row_user or row_status not in ["надіслано", "sent", "так"]:
-                continue
-
-            if row_key:
-                sent_keys.add(f"{row_user}|{row_key}")
-
-            if row_date.startswith(today_prefix):
-                today_counts[row_user] = today_counts.get(row_user, 0) + 1
-
-    except Exception as e:
-        print("get_broadcast_recipient_log_snapshot error:", e)
-
-    return sent_keys, today_counts
-
-
-def append_broadcast_recipient_logs(rows_to_append):
-    """
-    Записуємо логи розсилки пачкою, а не append_row для кожного клієнта.
-    Це значно зменшує кількість запитів до Google Sheets і навантаження на Render.
-    """
-    if not rows_to_append:
-        return
-
-    try:
-        ws = get_broadcast_recipient_log_worksheet()
-        google_call_with_retry(lambda: ws.append_rows(rows_to_append, value_input_option="USER_ENTERED"))
-        clear_cache("Надіслані розсилки клієнтам")
-    except Exception as e:
-        print("append_broadcast_recipient_logs error:", e)
-        # запасний варіант, якщо append_rows недоступний
-        try:
-            ws = get_broadcast_recipient_log_worksheet()
-            for row in rows_to_append:
-                google_call_with_retry(lambda row=row: ws.append_row(row, value_input_option="USER_ENTERED"))
-            clear_cache("Надіслані розсилки клієнтам")
-        except Exception as e2:
-            print("append_broadcast_recipient_logs fallback error:", e2)
-
-
-def send_broadcast_telegram_message(chat_id, text, keyboard=None, photo_url=None):
-    """
-    Легка відправка саме для масових розсилок.
-    На успішній відправці НЕ пишемо статус "Активний" у Google Sheets для кожного клієнта,
-    бо це створює сотні записів під час однієї розсилки і може вибити Render по памʼяті/часу.
-    Якщо Telegram повертає помилку — тоді статус користувача оновлюємо.
-    """
-    reply_markup = None
-    if keyboard:
-        keyboard = normalize_inline_keyboard(keyboard)
-        reply_markup = json.dumps(keyboard, ensure_ascii=False)
-
-    try:
-        if photo_url:
-            payload = {
-                "chat_id": chat_id,
-                "photo": photo_url,
-                "caption": text,
-                "parse_mode": "HTML"
-            }
-            if reply_markup:
-                payload["reply_markup"] = reply_markup
-
-            response = requests.post(f"{BASE_URL}/sendPhoto", json=payload, timeout=15)
-
-            if response.ok:
-                return True
-
-            print("send_broadcast photo telegram error:", response.text)
-            # Якщо фото не пройшло через довгий caption або іншу нефатальну причину — пробуємо текстом.
-            # Але якщо користувач заблокував бота/чат недоступний — одразу фіксуємо статус.
-            error_text = str(response.text or "").lower()
-            if "forbidden" in error_text or "chat not found" in error_text or "blocked" in error_text:
-                update_user_bot_status(chat_id, classify_telegram_send_error(response.text), response.text, force=True)
-                return False
-
-        payload = {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML"
-        }
-        if reply_markup:
-            payload["reply_markup"] = reply_markup
-
-        response = requests.post(f"{BASE_URL}/sendMessage", json=payload, timeout=15)
-
-        if response.ok:
-            return True
-
-        print("send_broadcast message telegram error:", response.text)
-        update_user_bot_status(chat_id, classify_telegram_send_error(response.text), response.text, force=True)
-        return False
-
-    except Exception as e:
-        print("send_broadcast_telegram_message error:", e)
-        return False
-
-
 def send_marketing_to_all(text, keyboard=None, photo_url=None, campaign_key=None, campaign_type="Маркетинг"):
     sent = 0
     failed = 0
@@ -4405,57 +4516,78 @@ def send_marketing_to_all(text, keyboard=None, photo_url=None, campaign_key=None
 
     if not campaign_key:
         campaign_key = f"{campaign_type}|{current_time().strftime('%d.%m.%Y')}|{str(text)[:80]}"
+    campaign_key = str(campaign_key).strip()
 
-    client_ids = get_broadcast_client_ids()
-    sent_keys, today_counts = get_broadcast_recipient_log_snapshot()
+    # Головний захист від 2-3 однакових розсилок: фіксуємо запуск у Google Sheets ДО відправки.
+    # Це працює навіть якщо Render перезапустив worker або монітор відкрив URL кілька разів.
+    if not acquire_persistent_broadcast_lock(campaign_type, campaign_key):
+        return 0, 0
 
-    sent_at = now_str()
+    try:
+        # Створюємо лист історії одразу, навіть якщо клієнтів немає.
+        get_broadcast_recipient_log_worksheet()
 
-    for client_id in client_ids:
-        try:
-            client_id = str(client_id).strip()
-            if not client_id:
-                continue
+        client_ids = get_broadcast_client_ids()
+        sent_keys, today_counts = get_broadcast_recipient_log_snapshot()
+        sent_at = now_str()
 
-            unique_key = f"{client_id}|{campaign_key}"
+        for client_id in client_ids:
+            try:
+                client_id = str(client_id).strip()
+                if not client_id:
+                    continue
 
-            if unique_key in sent_keys:
-                skipped += 1
-                continue
+                unique_key = f"{client_id}|{campaign_key}"
 
-            if BROADCAST_DAILY_LIMIT_PER_USER > 0 and today_counts.get(client_id, 0) >= BROADCAST_DAILY_LIMIT_PER_USER:
-                skipped += 1
-                continue
+                if unique_key in sent_keys:
+                    skipped += 1
+                    continue
 
-            ok = send_broadcast_telegram_message(
-                chat_id=client_id,
-                text=text,
-                keyboard=keyboard,
-                photo_url=photo_url
-            )
+                if BROADCAST_DAILY_LIMIT_PER_USER > 0 and today_counts.get(client_id, 0) >= BROADCAST_DAILY_LIMIT_PER_USER:
+                    skipped += 1
+                    continue
 
-            if ok:
-                sent += 1
-                sent_keys.add(unique_key)
-                today_counts[client_id] = today_counts.get(client_id, 0) + 1
-                log_rows.append([
-                    sent_at,
-                    client_id,
-                    str(campaign_type or "").strip(),
-                    str(campaign_key or "").strip(),
-                    "Надіслано"
-                ])
-            else:
+                ok = send_broadcast_telegram_message(
+                    chat_id=client_id,
+                    text=text,
+                    keyboard=keyboard,
+                    photo_url=photo_url
+                )
+
+                if ok:
+                    sent += 1
+                    sent_keys.add(unique_key)
+                    today_counts[client_id] = today_counts.get(client_id, 0) + 1
+                    log_rows.append([
+                        sent_at,
+                        client_id,
+                        str(campaign_type or "").strip(),
+                        campaign_key,
+                        "Надіслано"
+                    ])
+
+                    # Не чекаємо завершення всієї бази: фіксуємо пачками.
+                    # Якщо Render впаде посередині — вже відправлені клієнти не отримають дубль.
+                    if len(log_rows) >= BROADCAST_LOG_FLUSH_EVERY:
+                        append_broadcast_recipient_logs(log_rows)
+                        log_rows = []
+                else:
+                    failed += 1
+
+            except Exception as e:
+                print("send_marketing_to_all user error:", client_id, e)
                 failed += 1
 
-        except Exception as e:
-            print("send_marketing_to_all user error:", client_id, e)
-            failed += 1
+        append_broadcast_recipient_logs(log_rows)
+        finish_persistent_broadcast_lock(campaign_type, campaign_key, sent=sent, failed=failed, skipped=skipped)
 
-    append_broadcast_recipient_logs(log_rows)
+        print(f"send_marketing_to_all type={campaign_type}, key={campaign_key}, sent={sent}, failed={failed}, skipped={skipped}")
+        return sent, failed
 
-    print(f"send_marketing_to_all type={campaign_type}, key={campaign_key}, sent={sent}, failed={failed}, skipped={skipped}")
-    return sent, failed
+    except Exception as e:
+        print("send_marketing_to_all error:", e)
+        finish_persistent_broadcast_lock(campaign_type, campaign_key, sent=sent, failed=failed, skipped=skipped)
+        return sent, failed
 
 def process_marketing_broadcasts():
     """
@@ -4724,6 +4856,9 @@ def process_inactive_clients_reminders():
     headers = rows[0]
     now_dt = current_time()
     sent = 0
+    log_rows = []
+    sent_keys, today_counts = get_broadcast_recipient_log_snapshot()
+    sent_at = now_str()
 
     for row_index, row in enumerate(rows[1:], start=2):
         telegram_id = str(get_cell_by_header(row, headers, "Telegram ID", "")).strip()
@@ -4745,6 +4880,11 @@ def process_inactive_clients_reminders():
         if last_reminder and (now_dt - last_reminder).days < INACTIVE_CLIENT_DAYS:
             continue
 
+        campaign_key = f"inactive_client|{INACTIVE_CLIENT_DAYS}|{now_dt.strftime('%Y%m%d')}"
+        unique_key = f"{telegram_id}|{campaign_key}"
+        if unique_key in sent_keys:
+            continue
+
         keyboard = {
             "inline_keyboard": [
                 [inline_button("📦 Переглянути каталог", "open_catalog")],
@@ -4754,9 +4894,15 @@ def process_inactive_clients_reminders():
 
         ok = send_message(telegram_id, inactive_client_text(), keyboard)
         if ok:
-            update_cell_by_header(ws, row_index, headers, "Останнє нагадування неактивним", now_str())
+            update_cell_by_header(ws, row_index, headers, "Останнє нагадування неактивним", sent_at)
+            sent_keys.add(unique_key)
+            log_rows.append([sent_at, telegram_id, "Неактивний клієнт", campaign_key, "Надіслано"])
             sent += 1
+            if len(log_rows) >= BROADCAST_LOG_FLUSH_EVERY:
+                append_broadcast_recipient_logs(log_rows)
+                log_rows = []
 
+    append_broadcast_recipient_logs(log_rows)
     return sent
 
 
