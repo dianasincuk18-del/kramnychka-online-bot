@@ -60,7 +60,10 @@ BROADCAST_RUN_LOCKS = {}
 # Створюється автоматично при першому запуску будь-якої розсилки.
 BROADCAST_HISTORY_SHEET_NAME = os.environ.get("BROADCAST_HISTORY_SHEET_NAME", "Історія розсилок")
 BROADCAST_RUNS_SHEET_NAME = os.environ.get("BROADCAST_RUNS_SHEET_NAME", "Запуски розсилок")
-BROADCAST_LOG_FLUSH_EVERY = int(os.environ.get("BROADCAST_LOG_FLUSH_EVERY", "20"))
+BROADCAST_LOG_FLUSH_EVERY = int(os.environ.get("BROADCAST_LOG_FLUSH_EVERY", "5"))
+# Скільки клієнтів обробляємо за один запуск розсилки.
+# Для Render Free краще 20–30, щоб worker не вбивало по памʼяті/timeout.
+BROADCAST_MAX_RECIPIENTS_PER_RUN = int(os.environ.get("BROADCAST_MAX_RECIPIENTS_PER_RUN", "25"))
 
 
 def register_service_message(chat_id, message_id):
@@ -3898,7 +3901,7 @@ def process_daily_soft_reminders():
             return 0
 
         campaign_key = f"daily|{current_time().strftime('%d.%m.%Y')}|{message['id']}"
-        sent, failed = send_marketing_to_all(
+        sent, failed, completed = send_marketing_to_all(
             message["text"],
             daily_reminder_keyboard(),
             None,
@@ -3906,21 +3909,22 @@ def process_daily_soft_reminders():
             campaign_type="Повідомлення дня"
         )
 
-        update_cell_by_header(ws, message["row_index"], headers, "Останнє надсилання", now_str())
+        if completed:
+            update_cell_by_header(ws, message["row_index"], headers, "Останнє надсилання", now_str())
 
-        log_ws = get_daily_log_worksheet()
-        google_call_with_retry(lambda: log_ws.append_row([
-            now_str(),
-            message["id"],
-            message["category"],
-            sent,
-            "Надіслано"
-        ], value_input_option="USER_ENTERED"))
-        clear_cache("Надіслані повідомлення дня")
-        clear_cache("Повідомлення дня")
+            log_ws = get_daily_log_worksheet()
+            google_call_with_retry(lambda: log_ws.append_row([
+                now_str(),
+                message["id"],
+                message["category"],
+                sent,
+                "Надіслано"
+            ], value_input_option="USER_ENTERED"))
+            clear_cache("Надіслані повідомлення дня")
+            clear_cache("Повідомлення дня")
 
-        print(f"daily soft reminder sent id={message['id']}, sent={sent}, failed={failed}")
-        return 1 if sent > 0 else 0
+        print(f"daily soft reminder sent id={message['id']}, sent={sent}, failed={failed}, completed={completed}")
+        return 1 if sent > 0 or not completed else 0
 
     finally:
         release_broadcast_lock("daily-reminders")
@@ -4186,7 +4190,7 @@ def acquire_persistent_broadcast_lock(name, campaign_key):
         return True
 
 
-def finish_persistent_broadcast_lock(name, campaign_key, sent=0, failed=0, skipped=0):
+def finish_persistent_broadcast_lock(name, campaign_key, sent=0, failed=0, skipped=0, status="Завершено"):
     try:
         if not campaign_key:
             return
@@ -4195,7 +4199,7 @@ def finish_persistent_broadcast_lock(name, campaign_key, sent=0, failed=0, skipp
             now_str(),
             str(name or "Розсилка"),
             str(campaign_key),
-            "Завершено",
+            str(status or "Завершено"),
             int(sent or 0),
             int(failed or 0),
             int(skipped or 0)
@@ -4509,9 +4513,19 @@ def marketing_message_text(row_type, title, body, product=None):
 
 
 def send_marketing_to_all(text, keyboard=None, photo_url=None, campaign_key=None, campaign_type="Маркетинг"):
+    """
+    Масова розсилка з безпечним продовженням.
+    За один запуск обробляє тільки BROADCAST_MAX_RECIPIENTS_PER_RUN клієнтів,
+    щоб Render не вбивав worker. Кожен успішний клієнт одразу фіксується в "Історія розсилок".
+
+    Повертає: sent, failed, completed
+    completed=True тільки коли по цій розсилці більше немає клієнтів для відправки.
+    """
     sent = 0
     failed = 0
     skipped = 0
+    processed_this_run = 0
+    paused = False
     log_rows = []
 
     if not campaign_key:
@@ -4519,17 +4533,19 @@ def send_marketing_to_all(text, keyboard=None, photo_url=None, campaign_key=None
     campaign_key = str(campaign_key).strip()
 
     # Головний захист від 2-3 однакових розсилок: фіксуємо запуск у Google Sheets ДО відправки.
-    # Це працює навіть якщо Render перезапустив worker або монітор відкрив URL кілька разів.
+    # Якщо попередній запуск завис, після BROADCAST_LOCK_TTL_SECONDS він зможе продовжитися.
     if not acquire_persistent_broadcast_lock(campaign_type, campaign_key):
-        return 0, 0
+        return 0, 0, False
 
     try:
-        # Створюємо лист історії одразу, навіть якщо клієнтів немає.
         get_broadcast_recipient_log_worksheet()
 
         client_ids = get_broadcast_client_ids()
         sent_keys, today_counts = get_broadcast_recipient_log_snapshot()
         sent_at = now_str()
+        max_per_run = int(BROADCAST_MAX_RECIPIENTS_PER_RUN or 25)
+        if max_per_run <= 0:
+            max_per_run = 25
 
         for client_id in client_ids:
             try:
@@ -4547,12 +4563,18 @@ def send_marketing_to_all(text, keyboard=None, photo_url=None, campaign_key=None
                     skipped += 1
                     continue
 
+                # Тут ми знайшли реального клієнта, якому ще треба спробувати відправити.
+                if processed_this_run >= max_per_run:
+                    paused = True
+                    break
+
                 ok = send_broadcast_telegram_message(
                     chat_id=client_id,
                     text=text,
                     keyboard=keyboard,
                     photo_url=photo_url
                 )
+                processed_this_run += 1
 
                 if ok:
                     sent += 1
@@ -4566,8 +4588,7 @@ def send_marketing_to_all(text, keyboard=None, photo_url=None, campaign_key=None
                         "Надіслано"
                     ])
 
-                    # Не чекаємо завершення всієї бази: фіксуємо пачками.
-                    # Якщо Render впаде посередині — вже відправлені клієнти не отримають дубль.
+                    # Пишемо маленькими пачками, щоб після падіння Render не було дублів.
                     if len(log_rows) >= BROADCAST_LOG_FLUSH_EVERY:
                         append_broadcast_recipient_logs(log_rows)
                         log_rows = []
@@ -4579,15 +4600,35 @@ def send_marketing_to_all(text, keyboard=None, photo_url=None, campaign_key=None
                 failed += 1
 
         append_broadcast_recipient_logs(log_rows)
-        finish_persistent_broadcast_lock(campaign_type, campaign_key, sent=sent, failed=failed, skipped=skipped)
 
-        print(f"send_marketing_to_all type={campaign_type}, key={campaign_key}, sent={sent}, failed={failed}, skipped={skipped}")
-        return sent, failed
+        completed = not paused
+        run_status = "Завершено" if completed else "Пауза"
+        finish_persistent_broadcast_lock(
+            campaign_type,
+            campaign_key,
+            sent=sent,
+            failed=failed,
+            skipped=skipped,
+            status=run_status
+        )
+
+        print(
+            f"send_marketing_to_all type={campaign_type}, key={campaign_key}, "
+            f"sent={sent}, failed={failed}, skipped={skipped}, completed={completed}"
+        )
+        return sent, failed, completed
 
     except Exception as e:
         print("send_marketing_to_all error:", e)
-        finish_persistent_broadcast_lock(campaign_type, campaign_key, sent=sent, failed=failed, skipped=skipped)
-        return sent, failed
+        finish_persistent_broadcast_lock(
+            campaign_type,
+            campaign_key,
+            sent=sent,
+            failed=failed,
+            skipped=skipped,
+            status="Помилка"
+        )
+        return sent, failed, False
 
 def process_marketing_broadcasts():
     """
@@ -4641,7 +4682,7 @@ def process_marketing_broadcasts():
             text = marketing_message_text(row_type, title, body, product)
             keyboard = product_marketing_keyboard(product_id if product else None, button_text)
             campaign_key = f"marketing|{campaign_id}|{product_id}|{date_raw}|{title}"
-            sent, failed = send_marketing_to_all(
+            sent, failed, completed = send_marketing_to_all(
                 text,
                 keyboard,
                 photo_url,
@@ -4649,11 +4690,12 @@ def process_marketing_broadcasts():
                 campaign_type="Маркетинг"
             )
 
-            update_cell_by_header(ws, row_index, headers, "Надіслано", "Так")
-            update_cell_by_header(ws, row_index, headers, "Дата надсилання", now_str())
+            if completed:
+                update_cell_by_header(ws, row_index, headers, "Надіслано", "Так")
+                update_cell_by_header(ws, row_index, headers, "Дата надсилання", now_str())
             sent_campaigns += 1
 
-            print(f"marketing campaign sent row={row_index}, sent={sent}, failed={failed}")
+            print(f"marketing campaign sent row={row_index}, sent={sent}, failed={failed}, completed={completed}")
 
         if sent_campaigns == 0:
             # Якщо ручних розсилок на сьогодні немає — автоматично надсилаємо "товар дня".
@@ -4802,7 +4844,7 @@ def process_sale_broadcasts():
             keyboard = product_marketing_keyboard(product_id, "🔥 Переглянути товар")
             campaign_key = f"sale|{broadcast_type}|{sale_broadcast_key(product)}"
 
-            sent, failed = send_marketing_to_all(
+            sent, failed, completed = send_marketing_to_all(
                 text,
                 keyboard,
                 photo_url,
@@ -4810,11 +4852,13 @@ def process_sale_broadcasts():
                 campaign_type=f"Акція: {broadcast_type}"
             )
 
-            # Позначаємо акцію як оброблену, щоб повторний запуск endpoint не дублював її.
-            mark_sale_product_broadcasted(product, broadcast_type)
+            # Позначаємо акцію як оброблену тільки коли всю базу завершено.
+            # Якщо Render обірве/зупинить запуск — наступний запуск продовжить розсилку.
+            if completed:
+                mark_sale_product_broadcasted(product, broadcast_type)
             sent_count += 1
 
-            print(f"sale broadcast type={broadcast_type}, product={product_id}, sent={sent}, failed={failed}")
+            print(f"sale broadcast type={broadcast_type}, product={product_id}, sent={sent}, failed={failed}, completed={completed}")
 
         return sent_count
 
@@ -5027,7 +5071,7 @@ def process_auto_product_day_broadcast():
         )
         keyboard = product_marketing_keyboard(product_id, "🛍 Переглянути товар")
         campaign_key = f"auto_product|{current_time().strftime('%d.%m.%Y')}|{product_id}"
-        sent, failed = send_marketing_to_all(
+        sent, failed, completed = send_marketing_to_all(
             text,
             keyboard,
             photo_url,
@@ -5035,9 +5079,13 @@ def process_auto_product_day_broadcast():
             campaign_type="Товар дня"
         )
 
-        if sent > 0:
+        if completed:
             mark_auto_product_broadcasted(product)
-            print(f"auto product broadcast sent product={product_id}, sent={sent}, failed={failed}")
+            print(f"auto product broadcast completed product={product_id}, sent={sent}, failed={failed}")
+            return 1
+
+        if sent > 0:
+            print(f"auto product broadcast paused product={product_id}, sent={sent}, failed={failed}")
             return 1
 
         return 0
