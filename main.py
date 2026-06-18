@@ -4559,6 +4559,40 @@ def get_broadcast_client_ids():
     return ids
 
 
+def has_remaining_broadcast_recipients(campaign_key, sent_keys=None, today_counts=None):
+    """
+    Перевіряє, чи залишились клієнти, яким ще треба спробувати відправити цю розсилку.
+    Викликається ПІСЛЯ запису історії та оновлення статусів заблокованих користувачів.
+    Якщо нікого не залишилось — у "Запуски розсилок" ставимо "Завершено", а не "Пауза".
+    """
+    try:
+        campaign_key = str(campaign_key or "").strip()
+        if not campaign_key:
+            return False
+
+        if sent_keys is None or today_counts is None:
+            sent_keys, today_counts = get_broadcast_recipient_log_snapshot()
+
+        for client_id in get_broadcast_client_ids():
+            client_id = str(client_id or "").strip()
+            if not client_id:
+                continue
+
+            if f"{client_id}|{campaign_key}" in sent_keys:
+                continue
+
+            if BROADCAST_DAILY_LIMIT_PER_USER > 0 and today_counts.get(client_id, 0) >= BROADCAST_DAILY_LIMIT_PER_USER:
+                continue
+
+            return True
+
+        return False
+    except Exception as e:
+        print("has_remaining_broadcast_recipients error:", e)
+        # Якщо не змогли перевірити — краще залишити Пауза, щоб не позначити розсилку завершеною помилково.
+        return True
+
+
 def get_product_by_id(product_id):
     products = get_cached_records("Товари")
     for product in products:
@@ -4733,7 +4767,14 @@ def send_marketing_to_all(text, keyboard=None, photo_url=None, campaign_key=None
         append_broadcast_recipient_logs(log_rows)
         batch_update_broadcast_user_statuses(status_rows)
 
-        completed = not paused
+        # ВАЖЛИВО: не ставимо "Пауза" автоматично тільки тому, що цей запуск дійшов до ліміту 25.
+        # Після запису успішних відправок і статусів заблокованих перевіряємо, чи реально хтось ще залишився.
+        remaining_recipients = has_remaining_broadcast_recipients(
+            campaign_key,
+            sent_keys=sent_keys,
+            today_counts=today_counts
+        )
+        completed = not remaining_recipients
         run_status = "Завершено" if completed else "Пауза"
         finish_persistent_broadcast_lock(
             campaign_type,
