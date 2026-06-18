@@ -4141,8 +4141,17 @@ def get_broadcast_runs_worksheet():
 
 def acquire_persistent_broadcast_lock(name, campaign_key):
     """
-    Sheet-lock проти дублювання, коли UptimeRobot/Render запускає один endpoint кілька разів
-    або worker перезапускається. Якщо такий ключ уже розпочато/завершено — другий запуск не шле дубль.
+    Sheet-lock проти дублювання, коли UptimeRobot/Render запускає endpoint кілька разів.
+
+    ВАЖЛИВО:
+    Раніше код перевіряв усі старі рядки з однаковим ключем і міг блокувати продовження,
+    бо бачив старий статус "Розпочато", навіть якщо нижче вже був рядок "Пауза".
+    Тепер дивимось тільки на ОСТАННІЙ рядок по цьому campaign_key.
+
+    Логіка:
+    - останній статус "Завершено" / "Надіслано" → не запускаємо повторно;
+    - останній статус "Розпочато" і він свіжий → не запускаємо паралельно;
+    - останній статус "Пауза" / "Помилка" / старий "Розпочато" → дозволяємо продовжити.
     """
     try:
         name = str(name or "Розсилка").strip()
@@ -4155,23 +4164,36 @@ def acquire_persistent_broadcast_lock(name, campaign_key):
         headers = rows[0] if rows else []
         now_dt = current_time()
 
-        for row in rows[1:]:
+        latest_row = None
+        latest_row_number = None
+
+        # Шукаємо саме останній запис по цьому ключу, а не всі старі записи.
+        for row_number, row in enumerate(rows[1:], start=2):
             row_key = str(get_cell_by_header(row, headers, "Ключ запуску", "")).strip()
-            row_status = str(get_cell_by_header(row, headers, "Статус", "")).strip().lower()
-            row_date_raw = str(get_cell_by_header(row, headers, "Дата", "")).strip()
+            if row_key == campaign_key:
+                latest_row = row
+                latest_row_number = row_number
 
-            if row_key != campaign_key:
-                continue
+        if latest_row:
+            latest_status = str(get_cell_by_header(latest_row, headers, "Статус", "")).strip().lower()
+            latest_date_raw = str(get_cell_by_header(latest_row, headers, "Дата", "")).strip()
+            latest_dt = parse_bot_datetime(latest_date_raw)
 
-            if row_status in ["завершено", "надіслано", "так", "sent"]:
+            if latest_status in ["завершено", "надіслано", "так", "sent"]:
                 print(f"broadcast skipped by sheet lock: already finished {campaign_key}")
                 return False
 
-            if row_status in ["розпочато", "в процесі", "running"]:
-                row_dt = parse_bot_datetime(row_date_raw)
-                if row_dt and (now_dt - row_dt).total_seconds() < BROADCAST_LOCK_TTL_SECONDS:
+            if latest_status in ["розпочато", "в процесі", "running"]:
+                if latest_dt and (now_dt - latest_dt).total_seconds() < BROADCAST_LOCK_TTL_SECONDS:
                     print(f"broadcast skipped by sheet lock: already running {campaign_key}")
                     return False
+
+                # Якщо Розпочато зависло довше TTL — дозволяємо продовжити.
+                print(f"broadcast stale running lock ignored: {campaign_key}, row={latest_row_number}")
+
+            # Пауза / Помилка / Обірвано — це не блок, а дозвіл продовжувати.
+            if latest_status in ["пауза", "помилка", "обірвано", "перервано", "paused", "error"]:
+                print(f"broadcast continuation allowed after status={latest_status}: {campaign_key}")
 
         google_call_with_retry(lambda: ws.append_row([
             now_str(),
@@ -4184,11 +4206,11 @@ def acquire_persistent_broadcast_lock(name, campaign_key):
         ], value_input_option="USER_ENTERED"))
         clear_cache(BROADCAST_RUNS_SHEET_NAME)
         return True
+
     except Exception as e:
         print("acquire_persistent_broadcast_lock error:", e)
         # Якщо Google тимчасово недоступний — не валимо бота, але in-memory lock все одно працює.
         return True
-
 
 def finish_persistent_broadcast_lock(name, campaign_key, sent=0, failed=0, skipped=0, status="Завершено"):
     try:
