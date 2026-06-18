@@ -4480,7 +4480,7 @@ def batch_update_broadcast_user_statuses(status_rows):
         return 0
 
 
-def get_marketing_worksheetdef get_marketing_worksheet():
+def get_marketing_worksheet():
     headers = [
         "ID розсилки",
         "Дата",
@@ -4559,7 +4559,7 @@ def get_broadcast_client_ids():
     return ids
 
 
-def get_product_by_iddef get_product_by_id(product_id):
+def get_product_by_id(product_id):
     products = get_cached_records("Товари")
     for product in products:
         if str(product.get("ID товару", "")).strip() == str(product_id).strip():
