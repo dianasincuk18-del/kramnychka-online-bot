@@ -4342,6 +4342,49 @@ def _read_broadcast_history_rows():
     return all_rows
 
 
+def normalize_broadcast_daily_bucket(campaign_type="", campaign_key=""):
+    """
+    Розділяє денний ліміт по типах розсилок.
+    Тобто користувач може отримати в один день і Товар дня, і Акцію,
+    але не отримає дубль тієї самої кампанії.
+    """
+    text = f"{campaign_type or ''} {campaign_key or ''}".strip().lower()
+
+    if "auto_product" in text or "товар дня" in text:
+        return "product_day"
+
+    if "sale" in text or "акція" in text or "акции" in text:
+        return "sale"
+
+    if "daily" in text or "комплімент" in text or "комплимент" in text or "гороскоп" in text or "повідомлення дня" in text:
+        return "daily_message"
+
+    if "cart_reminder" in text or "нагадування кошика" in text or "кошик" in text:
+        return "cart_reminder"
+
+    return "marketing"
+
+
+def broadcast_daily_limit_count(today_counts, telegram_id, campaign_type="", campaign_key=""):
+    try:
+        bucket = normalize_broadcast_daily_bucket(campaign_type, campaign_key)
+        return int(today_counts.get(f"{str(telegram_id).strip()}|{bucket}", 0) or 0)
+    except Exception:
+        return 0
+
+
+def increment_broadcast_daily_limit_count(today_counts, telegram_id, campaign_type="", campaign_key=""):
+    try:
+        telegram_id = str(telegram_id).strip()
+        bucket = normalize_broadcast_daily_bucket(campaign_type, campaign_key)
+        today_counts[f"{telegram_id}|{bucket}"] = today_counts.get(f"{telegram_id}|{bucket}", 0) + 1
+        # Загальний лічильник залишаємо для статистики/сумісності,
+        # але він більше не блокує різні типи розсилок.
+        today_counts[telegram_id] = today_counts.get(telegram_id, 0) + 1
+    except Exception as e:
+        print("increment_broadcast_daily_limit_count error:", e)
+
+
 def get_broadcast_recipient_log_snapshot():
     """
     Один раз читаємо історію перед масовою розсилкою.
@@ -4365,6 +4408,7 @@ def get_broadcast_recipient_log_snapshot():
                 row_date = str(get_cell_by_header(row, headers, "Дата", row[0] if len(row) > 0 else "")).strip()
                 row_user = str(get_cell_by_header(row, headers, "Telegram ID", row[1] if len(row) > 1 else "")).strip()
                 row_key = str(get_cell_by_header(row, headers, "Ключ розсилки", "")).strip()
+                row_type = str(get_cell_by_header(row, headers, "Тип розсилки", "")).strip()
                 row_status = str(get_cell_by_header(row, headers, "Статус", "")).strip().lower()
 
                 if not row_user or row_status not in ["надіслано", "sent", "так"]:
@@ -4374,6 +4418,9 @@ def get_broadcast_recipient_log_snapshot():
                     sent_keys.add(f"{row_user}|{row_key}")
 
                 if row_date.startswith(today_prefix):
+                    bucket = normalize_broadcast_daily_bucket(row_type, row_key)
+                    today_counts[f"{row_user}|{bucket}"] = today_counts.get(f"{row_user}|{bucket}", 0) + 1
+                    # Загальний лічильник залишаємо для статистики та старих викликів.
                     today_counts[row_user] = today_counts.get(row_user, 0) + 1
 
     except Exception as e:
@@ -4382,12 +4429,12 @@ def get_broadcast_recipient_log_snapshot():
     return sent_keys, today_counts
 
 
-def broadcast_recipient_already_sent_today(telegram_id):
+def broadcast_recipient_already_sent_today(telegram_id, campaign_type="", campaign_key=""):
     if BROADCAST_DAILY_LIMIT_PER_USER <= 0:
         return False
     try:
         _, today_counts = get_broadcast_recipient_log_snapshot()
-        return today_counts.get(str(telegram_id).strip(), 0) >= BROADCAST_DAILY_LIMIT_PER_USER
+        return broadcast_daily_limit_count(today_counts, telegram_id, campaign_type, campaign_key) >= BROADCAST_DAILY_LIMIT_PER_USER
     except Exception as e:
         print("broadcast_recipient_already_sent_today error:", e)
         return False
@@ -4641,7 +4688,7 @@ def get_broadcast_client_ids():
     return ids
 
 
-def has_remaining_broadcast_recipients(campaign_key, sent_keys=None, today_counts=None):
+def has_remaining_broadcast_recipients(campaign_key, sent_keys=None, today_counts=None, campaign_type="Маркетинг"):
     """
     Перевіряє, чи залишились клієнти, яким ще треба спробувати відправити цю розсилку.
     Викликається ПІСЛЯ запису історії та оновлення статусів заблокованих користувачів.
@@ -4663,7 +4710,7 @@ def has_remaining_broadcast_recipients(campaign_key, sent_keys=None, today_count
             if f"{client_id}|{campaign_key}" in sent_keys:
                 continue
 
-            if BROADCAST_DAILY_LIMIT_PER_USER > 0 and today_counts.get(client_id, 0) >= BROADCAST_DAILY_LIMIT_PER_USER:
+            if BROADCAST_DAILY_LIMIT_PER_USER > 0 and broadcast_daily_limit_count(today_counts, client_id, campaign_type, campaign_key) >= BROADCAST_DAILY_LIMIT_PER_USER:
                 continue
 
             return True
@@ -4793,7 +4840,7 @@ def send_marketing_to_all(text, keyboard=None, photo_url=None, campaign_key=None
                     skipped += 1
                     continue
 
-                if BROADCAST_DAILY_LIMIT_PER_USER > 0 and today_counts.get(client_id, 0) >= BROADCAST_DAILY_LIMIT_PER_USER:
+                if BROADCAST_DAILY_LIMIT_PER_USER > 0 and broadcast_daily_limit_count(today_counts, client_id, campaign_type, campaign_key) >= BROADCAST_DAILY_LIMIT_PER_USER:
                     skipped += 1
                     continue
 
@@ -4826,7 +4873,7 @@ def send_marketing_to_all(text, keyboard=None, photo_url=None, campaign_key=None
                 if ok:
                     sent += 1
                     sent_keys.add(unique_key)
-                    today_counts[client_id] = today_counts.get(client_id, 0) + 1
+                    increment_broadcast_daily_limit_count(today_counts, client_id, campaign_type, campaign_key)
                     log_rows.append([
                         sent_at,
                         client_id,
@@ -4854,7 +4901,8 @@ def send_marketing_to_all(text, keyboard=None, photo_url=None, campaign_key=None
         remaining_recipients = has_remaining_broadcast_recipients(
             campaign_key,
             sent_keys=sent_keys,
-            today_counts=today_counts
+            today_counts=today_counts,
+            campaign_type=campaign_type
         )
         completed = not remaining_recipients
         run_status = "Завершено" if completed else "Пауза"
