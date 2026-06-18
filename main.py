@@ -1339,7 +1339,15 @@ def write_user_status_batch(ws, updates):
 def process_users_status_check(limit=None, force=False):
     """
     Перевіряє статус користувачів пакетами.
-    Повертає статистику: скільки перевірено, активних, заблокованих тощо.
+
+    Як працює limit:
+    - якщо limit не передано і force=False → перевіряємо CHECK_USERS_STATUS_LIMIT_PER_RUN;
+    - якщо limit не передано і force=True → перевіряємо всіх користувачів;
+    - якщо limit=all / full / 0 → перевіряємо всіх користувачів;
+    - якщо limit=50 → перевіряємо максимум 50 користувачів.
+
+    Це потрібно, щоб /check-users-status?force=1 реально перевіряв усю базу,
+    а не тільки перші 50 користувачів.
     """
     result = {
         "checked": 0,
@@ -1347,13 +1355,28 @@ def process_users_status_check(limit=None, force=False):
         "blocked": 0,
         "unavailable": 0,
         "errors": 0,
-        "skipped": 0
+        "skipped": 0,
+        "total_users": 0,
+        "limit": ""
     }
 
     try:
-        limit = int(limit or CHECK_USERS_STATUS_LIMIT_PER_RUN)
-        if limit <= 0:
-            limit = CHECK_USERS_STATUS_LIMIT_PER_RUN
+        raw_limit = "" if limit is None else str(limit).strip().lower()
+
+        if raw_limit in ["all", "full", "всі", "усі", "0", "-1"]:
+            max_to_check = None
+        elif raw_limit:
+            try:
+                parsed_limit = int(float(raw_limit))
+                max_to_check = parsed_limit if parsed_limit > 0 else None
+            except Exception:
+                max_to_check = CHECK_USERS_STATUS_LIMIT_PER_RUN
+        else:
+            # Для ручної повної перевірки /check-users-status?force=1 перевіряємо всіх.
+            # Для звичайного планового запуску лишаємо безпечну пачку.
+            max_to_check = None if force else CHECK_USERS_STATUS_LIMIT_PER_RUN
+
+        result["limit"] = "all" if max_to_check is None else str(max_to_check)
 
         ws, cols = ensure_user_columns(["Статус бота", "Дата перевірки статусу", "Остання помилка бота"])
         if not ws or not cols:
@@ -1369,12 +1392,18 @@ def process_users_status_check(limit=None, force=False):
         now_value = now_str()
         updates = []
 
+        user_rows = []
         for row_index, row in enumerate(rows[1:], start=2):
-            if result["checked"] >= limit:
-                break
-
             telegram_id = str(row[0] if len(row) > 0 else "").strip()
-            if not telegram_id:
+            if telegram_id:
+                user_rows.append((row_index, row, telegram_id))
+
+        result["total_users"] = len(user_rows)
+
+        for row_index, row, telegram_id in user_rows:
+            if max_to_check is not None and result["checked"] >= max_to_check:
+                # Решту не перевіряли саме через ліміт запуску.
+                result["skipped"] += 1
                 continue
 
             if not should_check_user_status(row, cols, force=force):
@@ -1404,8 +1433,13 @@ def process_users_status_check(limit=None, force=False):
             })
             updates.append({
                 "range": f"{col_to_letter(error_col)}{row_index}",
-                "values": [[error_text]]
+                "values": [[str(error_text or '')[:500]]]
             })
+
+            # Пишемо пачками, щоб не накопичувати великий список і не впертися в timeout.
+            if len(updates) >= 150:
+                write_user_status_batch(ws, updates)
+                updates = []
 
             # Невелика пауза, щоб не бити Telegram занадто швидко.
             time.sleep(0.05)
@@ -8745,7 +8779,7 @@ def check_users_status_endpoint():
         return "Forbidden", 403
 
     try:
-        limit = request.args.get("limit", CHECK_USERS_STATUS_LIMIT_PER_RUN)
+        limit = request.args.get("limit", None)
         force = str(request.args.get("force", "")).strip().lower() in ["1", "true", "yes", "так"]
         result = process_users_status_check(limit=limit, force=force)
         return (
@@ -8754,7 +8788,9 @@ def check_users_status_endpoint():
             f"blocked: {result.get('blocked', 0)}; "
             f"unavailable: {result.get('unavailable', 0)}; "
             f"errors: {result.get('errors', 0)}; "
-            f"skipped: {result.get('skipped', 0)}"
+            f"skipped: {result.get('skipped', 0)}; "
+            f"total_users: {result.get('total_users', 0)}; "
+            f"limit: {result.get('limit', '')}"
         ), 200
     except Exception as e:
         print("check_users_status_endpoint error:", e)
