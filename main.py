@@ -1201,6 +1201,196 @@ def update_user_bot_status(chat_id, status, error_text="", force=False):
         print("update_user_bot_status error:", e)
         return False
 
+
+# =========================
+# USER BOT STATUS CHECK
+# =========================
+# Перевірка доступності бота для користувачів без видимих повідомлень.
+# Endpoint: /check-users-status
+# Можна запускати вручну або через монітор, наприклад раз на тиждень.
+CHECK_USERS_STATUS_LIMIT_PER_RUN = int(os.environ.get("CHECK_USERS_STATUS_LIMIT_PER_RUN", "50"))
+CHECK_USERS_STATUS_INTERVAL_DAYS = int(os.environ.get("CHECK_USERS_STATUS_INTERVAL_DAYS", "7"))
+
+
+def col_to_letter(col_number):
+    """Перетворює номер колонки Google Sheets у літеру: 1 -> A, 27 -> AA."""
+    try:
+        col_number = int(col_number)
+        result = ""
+        while col_number > 0:
+            col_number, remainder = divmod(col_number - 1, 26)
+            result = chr(65 + remainder) + result
+        return result
+    except Exception:
+        return "A"
+
+
+def should_check_user_status(row, cols, force=False):
+    """
+    Вирішує, чи потрібно перевіряти користувача зараз.
+    Якщо force=1 у URL — перевіряємо незалежно від дати останньої перевірки.
+    """
+    if force:
+        return True
+
+    try:
+        date_col = cols.get("Дата перевірки статусу")
+        if not date_col:
+            return True
+
+        last_raw = row[date_col - 1] if len(row) >= date_col else ""
+        last_dt = parse_bot_datetime(last_raw)
+        if not last_dt:
+            return True
+
+        days_passed = (current_time() - last_dt).total_seconds() / 86400
+        return days_passed >= CHECK_USERS_STATUS_INTERVAL_DAYS
+    except Exception:
+        return True
+
+
+def check_telegram_user_status(chat_id):
+    """
+    Перевіряє, чи бот може звернутися до користувача.
+    Використовує sendChatAction — це не створює повідомлення в чаті.
+    """
+    try:
+        response = requests.post(
+            f"{BASE_URL}/sendChatAction",
+            json={"chat_id": chat_id, "action": "typing"},
+            timeout=10
+        )
+
+        if response.ok:
+            return "Активний", ""
+
+        return classify_telegram_send_error(response.text), str(response.text or "")[:500]
+    except Exception as e:
+        return "Помилка перевірки", str(e)[:500]
+
+
+def write_user_status_batch(ws, updates):
+    """
+    Пише статуси пачкою, щоб не робити 3 окремі update_cell для кожного користувача.
+    """
+    if not updates:
+        return
+
+    try:
+        google_call_with_retry(lambda: ws.batch_update(updates, value_input_option="USER_ENTERED"))
+    except TypeError:
+        # Для старих версій gspread, де batch_update не приймає value_input_option.
+        google_call_with_retry(lambda: ws.batch_update(updates))
+    except Exception as e:
+        print("write_user_status_batch error:", e)
+        # Запасний варіант: якщо batch_update не спрацював, пишемо по клітинках.
+        for upd in updates:
+            try:
+                rng = upd.get("range", "")
+                values = upd.get("values", [[""]])
+                if not rng:
+                    continue
+                # Очікуємо формат на кшталт J25.
+                letters = "".join(ch for ch in rng if ch.isalpha())
+                digits = "".join(ch for ch in rng if ch.isdigit())
+                if not letters or not digits:
+                    continue
+                col = 0
+                for ch in letters.upper():
+                    col = col * 26 + (ord(ch) - 64)
+                row = int(digits)
+                value = values[0][0] if values and values[0] else ""
+                google_call_with_retry(lambda row=row, col=col, value=value: ws.update_cell(row, col, value))
+            except Exception as e2:
+                print("write_user_status_batch fallback cell error:", e2)
+
+
+def process_users_status_check(limit=None, force=False):
+    """
+    Перевіряє статус користувачів пакетами.
+    Повертає статистику: скільки перевірено, активних, заблокованих тощо.
+    """
+    result = {
+        "checked": 0,
+        "active": 0,
+        "blocked": 0,
+        "unavailable": 0,
+        "errors": 0,
+        "skipped": 0
+    }
+
+    try:
+        limit = int(limit or CHECK_USERS_STATUS_LIMIT_PER_RUN)
+        if limit <= 0:
+            limit = CHECK_USERS_STATUS_LIMIT_PER_RUN
+
+        ws, cols = ensure_user_columns(["Статус бота", "Дата перевірки статусу", "Остання помилка бота"])
+        if not ws or not cols:
+            return result
+
+        rows = google_call_with_retry(lambda: ws.get_all_values())
+        if len(rows) <= 1:
+            return result
+
+        status_col = cols.get("Статус бота")
+        date_col = cols.get("Дата перевірки статусу")
+        error_col = cols.get("Остання помилка бота")
+        now_value = now_str()
+        updates = []
+
+        for row_index, row in enumerate(rows[1:], start=2):
+            if result["checked"] >= limit:
+                break
+
+            telegram_id = str(row[0] if len(row) > 0 else "").strip()
+            if not telegram_id:
+                continue
+
+            if not should_check_user_status(row, cols, force=force):
+                result["skipped"] += 1
+                continue
+
+            status, error_text = check_telegram_user_status(telegram_id)
+            result["checked"] += 1
+
+            status_lower = str(status).lower()
+            if status == "Активний":
+                result["active"] += 1
+            elif "заблок" in status_lower:
+                result["blocked"] += 1
+            elif "помилка" in status_lower:
+                result["errors"] += 1
+            else:
+                result["unavailable"] += 1
+
+            updates.append({
+                "range": f"{col_to_letter(status_col)}{row_index}",
+                "values": [[status]]
+            })
+            updates.append({
+                "range": f"{col_to_letter(date_col)}{row_index}",
+                "values": [[now_value]]
+            })
+            updates.append({
+                "range": f"{col_to_letter(error_col)}{row_index}",
+                "values": [[error_text]]
+            })
+
+            # Невелика пауза, щоб не бити Telegram занадто швидко.
+            time.sleep(0.05)
+
+        write_user_status_batch(ws, updates)
+
+        if result["checked"]:
+            clear_cache("Користувачі")
+
+        print("process_users_status_check:", result)
+        return result
+
+    except Exception as e:
+        print("process_users_status_check error:", e)
+        return result
+
 def send_message(chat_id, text, keyboard=None):
     payload = {
         "chat_id": chat_id,
@@ -8173,6 +8363,32 @@ def update_user_menus_endpoint():
     except Exception as e:
         print("update_user_menus_endpoint error:", e)
         return "User menu update error", 500
+
+@app.route("/check-users-status", methods=["GET", "POST", "HEAD"])
+def check_users_status_endpoint():
+    if request.method == "HEAD":
+        return "", 200
+
+    token = request.args.get("token", "")
+    if CRON_SECRET and token != CRON_SECRET:
+        return "Forbidden", 403
+
+    try:
+        limit = request.args.get("limit", CHECK_USERS_STATUS_LIMIT_PER_RUN)
+        force = str(request.args.get("force", "")).strip().lower() in ["1", "true", "yes", "так"]
+        result = process_users_status_check(limit=limit, force=force)
+        return (
+            f"Users status checked: {result.get('checked', 0)}; "
+            f"active: {result.get('active', 0)}; "
+            f"blocked: {result.get('blocked', 0)}; "
+            f"unavailable: {result.get('unavailable', 0)}; "
+            f"errors: {result.get('errors', 0)}; "
+            f"skipped: {result.get('skipped', 0)}"
+        ), 200
+    except Exception as e:
+        print("check_users_status_endpoint error:", e)
+        return "Users status check error", 500
+
 
 @app.route("/welcome-bonus-broadcast", methods=["GET", "POST"])
 def welcome_bonus_broadcast_endpoint():
