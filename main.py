@@ -4,6 +4,7 @@ import requests
 import gspread
 import time
 import threading
+import uuid
 from flask import Flask, request
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime, timedelta
@@ -61,7 +62,7 @@ BROADCAST_RUN_LOCKS = {}
 # Створюється автоматично при першому запуску будь-якої розсилки.
 BROADCAST_HISTORY_SHEET_NAME = os.environ.get("BROADCAST_HISTORY_SHEET_NAME", "Історія розсилок")
 BROADCAST_RUNS_SHEET_NAME = os.environ.get("BROADCAST_RUNS_SHEET_NAME", "Запуски розсилок")
-BROADCAST_LOG_FLUSH_EVERY = int(os.environ.get("BROADCAST_LOG_FLUSH_EVERY", "5"))
+BROADCAST_LOG_FLUSH_EVERY = int(os.environ.get("BROADCAST_LOG_FLUSH_EVERY", "1"))
 # Скільки клієнтів обробляємо за один запуск розсилки.
 # Для Render Free краще 20–30, щоб worker не вбивало по памʼяті/timeout.
 BROADCAST_MAX_RECIPIENTS_PER_RUN = int(os.environ.get("BROADCAST_MAX_RECIPIENTS_PER_RUN", "25"))
@@ -4225,15 +4226,12 @@ def acquire_persistent_broadcast_lock(name, campaign_key):
     """
     Sheet-lock проти дублювання, коли UptimeRobot/Render запускає endpoint кілька разів.
 
-    ВАЖЛИВО:
-    Раніше код перевіряв усі старі рядки з однаковим ключем і міг блокувати продовження,
-    бо бачив старий статус "Розпочато", навіть якщо нижче вже був рядок "Пауза".
-    Тепер дивимось тільки на ОСТАННІЙ рядок по цьому campaign_key.
-
-    Логіка:
-    - останній статус "Завершено" / "Надіслано" → не запускаємо повторно;
-    - останній статус "Розпочато" і він свіжий → не запускаємо паралельно;
-    - останній статус "Пауза" / "Помилка" / старий "Розпочато" → дозволяємо продовжити.
+    Додатковий захист:
+    - кожен запуск отримує унікальний lock_token;
+    - після запису "Розпочато|token" код перечитує лист і перевіряє,
+      що саме його запис є останнім для цього campaign_key;
+    - якщо паралельно стартували 2 воркери, працювати продовжить тільки останній,
+      інший зупиниться ДО відправки клієнтам.
     """
     try:
         name = str(name or "Розсилка").strip()
@@ -4249,7 +4247,6 @@ def acquire_persistent_broadcast_lock(name, campaign_key):
         latest_row = None
         latest_row_number = None
 
-        # Шукаємо саме останній запис по цьому ключу, а не всі старі записи.
         for row_number, row in enumerate(rows[1:], start=2):
             row_key = str(get_cell_by_header(row, headers, "Ключ запуску", "")).strip()
             if row_key == campaign_key:
@@ -4265,34 +4262,59 @@ def acquire_persistent_broadcast_lock(name, campaign_key):
                 print(f"broadcast skipped by sheet lock: already finished {campaign_key}")
                 return False
 
-            if latest_status in ["розпочато", "в процесі", "running"]:
+            if latest_status.startswith("розпочато") or latest_status.startswith("в процесі") or latest_status.startswith("running"):
                 if latest_dt and (now_dt - latest_dt).total_seconds() < BROADCAST_LOCK_TTL_SECONDS:
                     print(f"broadcast skipped by sheet lock: already running {campaign_key}")
                     return False
 
-                # Якщо Розпочато зависло довше TTL — дозволяємо продовжити.
                 print(f"broadcast stale running lock ignored: {campaign_key}, row={latest_row_number}")
 
-            # Пауза / Помилка / Обірвано — це не блок, а дозвіл продовжувати.
             if latest_status in ["пауза", "помилка", "обірвано", "перервано", "paused", "error"]:
                 print(f"broadcast continuation allowed after status={latest_status}: {campaign_key}")
+
+        lock_token = uuid.uuid4().hex[:12]
+        lock_status = f"Розпочато|{lock_token}"
 
         google_call_with_retry(lambda: ws.append_row([
             now_str(),
             name,
             campaign_key,
-            "Розпочато",
+            lock_status,
             "",
             "",
             ""
         ], value_input_option="USER_ENTERED"))
         clear_cache(BROADCAST_RUNS_SHEET_NAME)
+
+        # Перевірка власності lock. Це прибирає дублювання при одночасному старті 2 worker-ів.
+        time.sleep(0.25)
+        rows_after = google_call_with_retry(lambda: ws.get_all_values())
+        headers_after = rows_after[0] if rows_after else headers
+        latest_after = None
+
+        for row in rows_after[1:]:
+            row_key = str(get_cell_by_header(row, headers_after, "Ключ запуску", "")).strip()
+            if row_key == campaign_key:
+                latest_after = row
+
+        latest_after_status = ""
+        if latest_after:
+            latest_after_status = str(get_cell_by_header(latest_after, headers_after, "Статус", "")).strip()
+
+        if latest_after_status != lock_status:
+            print(
+                f"broadcast skipped by sheet lock owner check: "
+                f"key={campaign_key}, my={lock_status}, latest={latest_after_status}"
+            )
+            return False
+
         return True
 
     except Exception as e:
         print("acquire_persistent_broadcast_lock error:", e)
-        # Якщо Google тимчасово недоступний — не валимо бота, але in-memory lock все одно працює.
-        return True
+        # Без sheet-lock краще НЕ запускати розсилку, бо інакше може бути дублювання.
+        return False
+
 
 def finish_persistent_broadcast_lock(name, campaign_key, sent=0, failed=0, skipped=0, status="Завершено"):
     try:
@@ -4883,7 +4905,7 @@ def send_marketing_to_all(text, keyboard=None, photo_url=None, campaign_key=None
                     ])
 
                     # Пишемо маленькими пачками, щоб після падіння Render не було дублів.
-                    if len(log_rows) >= BROADCAST_LOG_FLUSH_EVERY:
+                    if len(log_rows) >= 1:
                         append_broadcast_recipient_logs(log_rows)
                         log_rows = []
                 else:
