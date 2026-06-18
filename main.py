@@ -4362,12 +4362,16 @@ def mark_broadcast_recipient_sent(telegram_id, campaign_type, campaign_key):
 def send_broadcast_telegram_message(chat_id, text, keyboard=None, photo_url=None):
     """
     Легка відправка саме для масових розсилок.
-    ВАЖЛИВО: під час масової розсилки НЕ оновлюємо лист "Користувачі"
-    після кожної помилки Telegram. Це читало весь лист користувачів через
-    update_user_bot_status(), давало Google retry/sleep і Render вбивав worker.
 
-    Статуси заблокованих користувачів краще перевіряти окремим endpoint:
-    /check-users-status
+    Повертає:
+    {
+        "ok": True/False,
+        "status": "Активний" / "Заблокував бота" / "Чат не знайдено" / ...,
+        "error": текст помилки Telegram
+    }
+
+    ВАЖЛИВО: тут НЕ пишемо в Google Sheets після кожної помилки.
+    Статуси користувачів накопичуються і пишуться пачкою після завершення маленького запуску.
     """
     reply_markup = None
     if keyboard:
@@ -4388,10 +4392,12 @@ def send_broadcast_telegram_message(chat_id, text, keyboard=None, photo_url=None
             response = requests.post(f"{BASE_URL}/sendPhoto", json=payload, timeout=15)
 
             if response.ok:
-                return True
+                return {"ok": True, "status": "Активний", "error": ""}
 
-            print("send_broadcast photo telegram error:", chat_id, str(response.text or "")[:300])
-            return False
+            error_text = str(response.text or "")[:500]
+            status = classify_telegram_send_error(error_text)
+            print("send_broadcast photo telegram error:", chat_id, error_text)
+            return {"ok": False, "status": status, "error": error_text}
 
         payload = {
             "chat_id": chat_id,
@@ -4404,17 +4410,77 @@ def send_broadcast_telegram_message(chat_id, text, keyboard=None, photo_url=None
         response = requests.post(f"{BASE_URL}/sendMessage", json=payload, timeout=15)
 
         if response.ok:
-            return True
+            return {"ok": True, "status": "Активний", "error": ""}
 
-        print("send_broadcast message telegram error:", chat_id, str(response.text or "")[:300])
-        return False
+        error_text = str(response.text or "")[:500]
+        status = classify_telegram_send_error(error_text)
+        print("send_broadcast message telegram error:", chat_id, error_text)
+        return {"ok": False, "status": status, "error": error_text}
 
     except Exception as e:
-        print("send_broadcast_telegram_message error:", chat_id, e)
-        return False
+        error_text = str(e)[:500]
+        print("send_broadcast_telegram_message error:", chat_id, error_text)
+        return {"ok": False, "status": "Помилка відправки", "error": error_text}
 
 
-def get_marketing_worksheet():
+def batch_update_broadcast_user_statuses(status_rows):
+    """
+    Після маленького запуску розсилки одним batch_update позначаємо заблокованих/недоступних
+    у листі "Користувачі", щоб наступні розсилки їх пропускали.
+    Не викликається для кожного користувача окремо — це захищає Render від падінь.
+    """
+    try:
+        if not status_rows:
+            return 0
+
+        ws, cols = ensure_user_columns(["Статус бота", "Дата перевірки статусу", "Остання помилка бота"])
+        if not ws or not cols:
+            return 0
+
+        rows = google_call_with_retry(lambda: ws.get_all_values())
+        if len(rows) <= 1:
+            return 0
+
+        row_by_telegram_id = {}
+        for row_index, row in enumerate(rows[1:], start=2):
+            telegram_id = str(row[0] if len(row) > 0 else "").strip()
+            if telegram_id:
+                row_by_telegram_id[telegram_id] = row_index
+
+        now_value = now_str()
+        updates = []
+        updated = 0
+
+        for item in status_rows:
+            telegram_id = str(item.get("telegram_id", "")).strip()
+            status = str(item.get("status", "")).strip()
+            error_text = str(item.get("error", "") or "")[:500]
+
+            if not telegram_id or not status:
+                continue
+
+            row_index = row_by_telegram_id.get(telegram_id)
+            if not row_index:
+                continue
+
+            updates.append({"range": f"{col_to_letter(cols['Статус бота'])}{row_index}", "values": [[status]]})
+            updates.append({"range": f"{col_to_letter(cols['Дата перевірки статусу'])}{row_index}", "values": [[now_value]]})
+            updates.append({"range": f"{col_to_letter(cols['Остання помилка бота'])}{row_index}", "values": [[error_text]]})
+            updated += 1
+
+        if updates:
+            write_user_status_batch(ws, updates)
+            clear_cache("Користувачі")
+
+        print(f"batch_update_broadcast_user_statuses updated={updated}")
+        return updated
+
+    except Exception as e:
+        print("batch_update_broadcast_user_statuses error:", e)
+        return 0
+
+
+def get_marketing_worksheetdef get_marketing_worksheet():
     headers = [
         "ID розсилки",
         "Дата",
@@ -4448,23 +4514,52 @@ def get_sale_broadcasts_worksheet():
 
 def get_broadcast_client_ids():
     """
-    Беремо всіх користувачів, які хоча б раз взаємодіяли з ботом.
-    Адмінів не виключаємо, щоб власник теж бачив тестові розсилки.
+    Беремо користувачів, яким бот ще може писати.
+    Тих, хто вже має статус "Заблокував бота", "Чат не знайдено", "Неактивний акаунт",
+    у масові розсилки більше не включаємо.
     """
     ids = []
+    blocked_statuses = {
+        "заблокував бота",
+        "чат не знайдено",
+        "неактивний акаунт",
+        "недоступний"
+    }
+
     try:
-        rows = get_values("Користувачі")[1:]
-        for row in rows:
+        rows = get_values("Користувачі")
+        if not rows:
+            return ids
+
+        headers = rows[0]
+        status_col_index = None
+        for idx, header in enumerate(headers):
+            if str(header).strip().lower() == "статус бота":
+                status_col_index = idx
+                break
+
+        for row in rows[1:]:
             telegram_id = str(row[0] if len(row) > 0 else "").strip()
-            if telegram_id and telegram_id not in ids:
+            if not telegram_id:
+                continue
+
+            status = ""
+            if status_col_index is not None and len(row) > status_col_index:
+                status = str(row[status_col_index] or "").strip().lower()
+
+            if status in blocked_statuses:
+                continue
+
+            if telegram_id not in ids:
                 ids.append(telegram_id)
+
     except Exception as e:
         print("get_broadcast_client_ids error:", e)
 
     return ids
 
 
-def get_product_by_id(product_id):
+def get_product_by_iddef get_product_by_id(product_id):
     products = get_cached_records("Товари")
     for product in products:
         if str(product.get("ID товару", "")).strip() == str(product_id).strip():
@@ -4549,6 +4644,7 @@ def send_marketing_to_all(text, keyboard=None, photo_url=None, campaign_key=None
     processed_this_run = 0
     paused = False
     log_rows = []
+    status_rows = []
 
     if not campaign_key:
         campaign_key = f"{campaign_type}|{current_time().strftime('%d.%m.%Y')}|{str(text)[:80]}"
@@ -4590,13 +4686,26 @@ def send_marketing_to_all(text, keyboard=None, photo_url=None, campaign_key=None
                     paused = True
                     break
 
-                ok = send_broadcast_telegram_message(
+                send_result = send_broadcast_telegram_message(
                     chat_id=client_id,
                     text=text,
                     keyboard=keyboard,
                     photo_url=photo_url
                 )
                 processed_this_run += 1
+
+                ok = bool(send_result.get("ok")) if isinstance(send_result, dict) else bool(send_result)
+                send_status = send_result.get("status", "") if isinstance(send_result, dict) else ""
+                send_error = send_result.get("error", "") if isinstance(send_result, dict) else ""
+
+                # Успішних можна не писати щоразу, а от заблокованих/недоступних треба позначити,
+                # щоб наступні розсилки їх не брали.
+                if (not ok) and send_status in ["Заблокував бота", "Чат не знайдено", "Неактивний акаунт", "Недоступний"]:
+                    status_rows.append({
+                        "telegram_id": client_id,
+                        "status": send_status,
+                        "error": send_error
+                    })
 
                 if ok:
                     sent += 1
@@ -4622,6 +4731,7 @@ def send_marketing_to_all(text, keyboard=None, photo_url=None, campaign_key=None
                 failed += 1
 
         append_broadcast_recipient_logs(log_rows)
+        batch_update_broadcast_user_statuses(status_rows)
 
         completed = not paused
         run_status = "Завершено" if completed else "Пауза"
@@ -4642,6 +4752,10 @@ def send_marketing_to_all(text, keyboard=None, photo_url=None, campaign_key=None
 
     except Exception as e:
         print("send_marketing_to_all error:", e)
+        try:
+            batch_update_broadcast_user_statuses(status_rows)
+        except Exception as status_error:
+            print("send_marketing_to_all status update error:", status_error)
         finish_persistent_broadcast_lock(
             campaign_type,
             campaign_key,
