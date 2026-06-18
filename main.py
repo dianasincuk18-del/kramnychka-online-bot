@@ -4362,8 +4362,12 @@ def mark_broadcast_recipient_sent(telegram_id, campaign_type, campaign_key):
 def send_broadcast_telegram_message(chat_id, text, keyboard=None, photo_url=None):
     """
     Легка відправка саме для масових розсилок.
-    На успішній відправці НЕ пишемо статус Активний у Google Sheets для кожного клієнта.
-    Якщо Telegram повертає помилку — тоді статус користувача оновлюємо.
+    ВАЖЛИВО: під час масової розсилки НЕ оновлюємо лист "Користувачі"
+    після кожної помилки Telegram. Це читало весь лист користувачів через
+    update_user_bot_status(), давало Google retry/sleep і Render вбивав worker.
+
+    Статуси заблокованих користувачів краще перевіряти окремим endpoint:
+    /check-users-status
     """
     reply_markup = None
     if keyboard:
@@ -4386,11 +4390,8 @@ def send_broadcast_telegram_message(chat_id, text, keyboard=None, photo_url=None
             if response.ok:
                 return True
 
-            print("send_broadcast photo telegram error:", response.text)
-            error_text = str(response.text or "").lower()
-            if "forbidden" in error_text or "chat not found" in error_text or "blocked" in error_text:
-                update_user_bot_status(chat_id, classify_telegram_send_error(response.text), response.text, force=True)
-                return False
+            print("send_broadcast photo telegram error:", chat_id, str(response.text or "")[:300])
+            return False
 
         payload = {
             "chat_id": chat_id,
@@ -4405,12 +4406,11 @@ def send_broadcast_telegram_message(chat_id, text, keyboard=None, photo_url=None
         if response.ok:
             return True
 
-        print("send_broadcast message telegram error:", response.text)
-        update_user_bot_status(chat_id, classify_telegram_send_error(response.text), response.text, force=True)
+        print("send_broadcast message telegram error:", chat_id, str(response.text or "")[:300])
         return False
 
     except Exception as e:
-        print("send_broadcast_telegram_message error:", e)
+        print("send_broadcast_telegram_message error:", chat_id, e)
         return False
 
 
