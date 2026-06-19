@@ -67,6 +67,9 @@ BROADCAST_LOG_FLUSH_EVERY = int(os.environ.get("BROADCAST_LOG_FLUSH_EVERY", "1")
 # Для Render Free краще 20–30, щоб worker не вбивало по памʼяті/timeout.
 BROADCAST_MAX_RECIPIENTS_PER_RUN = int(os.environ.get("BROADCAST_MAX_RECIPIENTS_PER_RUN", "10"))
 
+# Внутрішній кеш: не перечитуємо заголовки службових листів при кожному записі логу.
+SERVICE_WORKSHEETS_READY = set()
+
 
 def register_service_message(chat_id, message_id):
     try:
@@ -348,10 +351,11 @@ def is_quota_error(error):
     return "429" in text or "quota exceeded" in text or "read requests" in text
 
 
-def google_call_with_retry(func, attempts=3):
+def google_call_with_retry(func, attempts=4):
     """
-    Якщо Google Sheets тимчасово віддає 429, пробуємо ще раз.
-    Це не замінює кеш, але допомагає не падати одразу.
+    Якщо Google Sheets тимчасово віддає 429, не валимо весь endpoint одразу.
+    Для Render Free важливо робити довшу паузу, бо короткі 2-5 секунд не встигають
+    звільнити квоту Read requests per minute.
     """
     last_error = None
 
@@ -362,7 +366,9 @@ def google_call_with_retry(func, attempts=3):
             last_error = e
             if not is_quota_error(e) or attempt == attempts - 1:
                 raise
-            time.sleep(2 + attempt * 3)
+            sleep_seconds = 15 + attempt * 15
+            print(f"google_call_with_retry quota pause {sleep_seconds}s: {e}")
+            time.sleep(sleep_seconds)
 
     raise last_error
 
@@ -4217,8 +4223,13 @@ def get_broadcast_runs_worksheet():
         "Помилок",
         "Пропущено"
     ]
+    # Не робимо get_all_values/ensure_headers на кожному зверненні — це давало 429.
+    if BROADCAST_RUNS_SHEET_NAME in SERVICE_WORKSHEETS_READY:
+        return get_cached_worksheet(BROADCAST_RUNS_SHEET_NAME)
+
     ws = get_or_create_worksheet(BROADCAST_RUNS_SHEET_NAME, headers)
     ensure_headers(ws, headers)
+    SERVICE_WORKSHEETS_READY.add(BROADCAST_RUNS_SHEET_NAME)
     return ws
 
 
@@ -4346,8 +4357,14 @@ def get_broadcast_recipient_log_worksheet():
         "Ключ розсилки",
         "Статус"
     ]
+    # Під час розсилки цей лист викликається багато разів.
+    # Якщо щоразу перевіряти заголовки через get_all_values(), Google Sheets швидко дає 429.
+    if BROADCAST_HISTORY_SHEET_NAME in SERVICE_WORKSHEETS_READY:
+        return get_cached_worksheet(BROADCAST_HISTORY_SHEET_NAME)
+
     ws = get_or_create_worksheet(BROADCAST_HISTORY_SHEET_NAME, headers)
     ensure_headers(ws, headers)
+    SERVICE_WORKSHEETS_READY.add(BROADCAST_HISTORY_SHEET_NAME)
     return ws
 
 
@@ -4478,7 +4495,10 @@ def broadcast_recipient_key_sent(telegram_id, campaign_key):
 
 def append_broadcast_recipient_logs(rows_to_append):
     """
-    Записуємо логи розсилки пачкою. Лист створюється автоматично.
+    Записуємо логи розсилки пачкою.
+    ВАЖЛИВО: не чистимо кеш після кожного клієнта, бо це провокувало повторні читання
+    всієї історії та помилку Google Sheets 429. Перед новим запуском кеш історії
+    чиститься один раз у send_marketing_to_all().
     """
     if not rows_to_append:
         return
@@ -4486,16 +4506,12 @@ def append_broadcast_recipient_logs(rows_to_append):
     try:
         ws = get_broadcast_recipient_log_worksheet()
         google_call_with_retry(lambda: ws.append_rows(rows_to_append, value_input_option="USER_ENTERED"))
-        clear_cache(BROADCAST_HISTORY_SHEET_NAME)
-        clear_cache("Надіслані розсилки клієнтам")
     except Exception as e:
         print("append_broadcast_recipient_logs error:", e)
         try:
             ws = get_broadcast_recipient_log_worksheet()
             for row in rows_to_append:
                 google_call_with_retry(lambda row=row: ws.append_row(row, value_input_option="USER_ENTERED"))
-            clear_cache(BROADCAST_HISTORY_SHEET_NAME)
-            clear_cache("Надіслані розсилки клієнтам")
         except Exception as e2:
             print("append_broadcast_recipient_logs fallback error:", e2)
 
@@ -4846,6 +4862,11 @@ def send_marketing_to_all(text, keyboard=None, photo_url=None, campaign_key=None
     try:
         get_broadcast_recipient_log_worksheet()
 
+        # Перед новим запуском один раз перечитуємо свіжу історію,
+        # але не робимо це після кожного відправленого клієнта.
+        clear_cache(BROADCAST_HISTORY_SHEET_NAME)
+        clear_cache("Надіслані розсилки клієнтам")
+
         client_ids = get_broadcast_client_ids()
         sent_keys, today_counts = get_broadcast_recipient_log_snapshot()
         sent_at = now_str()
@@ -4940,16 +4961,11 @@ def send_marketing_to_all(text, keyboard=None, photo_url=None, campaign_key=None
         append_broadcast_recipient_logs(log_rows)
         batch_update_broadcast_user_statuses(status_rows)
 
-        # ВАЖЛИВО: не ставимо "Пауза" автоматично тільки тому, що цей запуск дійшов до ліміту 25.
-        # Після запису успішних відправок і статусів заблокованих перевіряємо, чи реально хтось ще залишився.
-        remaining_recipients = has_remaining_broadcast_recipients(
-            campaign_key,
-            sent_keys=sent_keys,
-            today_counts=today_counts,
-            campaign_type=campaign_type
-        )
-        completed = not remaining_recipients
-        run_status = "Завершено" if completed else "Пауза"
+        # Якщо цикл сам дійшов до кінця списку клієнтів — ставимо завершено.
+        # Не робимо ще одне повне читання користувачів/історії через has_remaining_broadcast_recipients(),
+        # бо саме це часто добивало Google Sheets квоту 429 на Render Free.
+        completed = True
+        run_status = "Завершено"
         finish_persistent_broadcast_lock(
             campaign_type,
             campaign_key,
