@@ -4466,7 +4466,14 @@ def get_broadcast_recipient_log_snapshot():
                 row_type = str(get_cell_by_header(row, headers, "Тип розсилки", "")).strip()
                 row_status = str(get_cell_by_header(row, headers, "Статус", "")).strip().lower()
 
-                if not row_user or row_status not in ["надіслано", "sent", "так"]:
+                # Для антидублювання важливо враховувати не тільки фінальне "Надіслано",
+                # а й попередню фіксацію/резерв, якщо процес обірвався після запису в Sheets.
+                successful_or_reserved_statuses = [
+                    "надіслано", "sent", "так",
+                    "зарезервовано", "reserved", "резерв", "в процесі", "розпочато"
+                ]
+
+                if not row_user or row_status not in successful_or_reserved_statuses:
                     continue
 
                 if row_key:
@@ -5083,10 +5090,9 @@ def process_marketing_broadcasts():
 
             print(f"marketing campaign sent row={row_index}, sent={sent}, failed={failed}, completed={completed}")
 
-        if sent_campaigns == 0:
-            # Якщо ручних розсилок на сьогодні немає — автоматично надсилаємо "товар дня".
-            sent_campaigns += process_auto_product_day_broadcast()
-
+        # Важливо: /marketing-broadcasts відповідає тільки за лист "Розсилки".
+        # "Товар дня" запускається окремо через /auto-product-broadcasts або /scheduled-broadcasts.
+        # Так ми прибираємо плутанину, коли ручна маркетингова розсилка випадково стартує товар дня.
         return sent_campaigns
 
     finally:
@@ -8504,6 +8510,44 @@ def process_user_menu_updates():
         print("process_user_menu_updates error:", e)
         return 0
 
+
+
+def process_scheduled_broadcasts():
+    """
+    Єдина безпечна точка для автоматичних задач розсилок.
+
+    Її можна запускати планувальником, але НЕ використовувати як звичайний health-check.
+    Кожна внутрішня розсилка має власний захист: час, день, історія, sheet-lock, ліміт пачки.
+    За один виклик кожна кампанія обробляє тільки невелику пачку клієнтів.
+    """
+    result = {
+        "auto_product": 0,
+        "sales": 0,
+        "daily_messages": 0,
+        "cart_reminders": 0,
+        "marketing": 0,
+        "errors": []
+    }
+
+    tasks = [
+        ("auto_product", process_auto_product_day_broadcast),
+        ("sales", process_sale_broadcasts),
+        ("daily_messages", process_daily_soft_reminders),
+        ("cart_reminders", process_cart_reminders),
+        ("marketing", process_marketing_broadcasts),
+    ]
+
+    for key, func in tasks:
+        try:
+            result[key] = int(func() or 0)
+        except Exception as e:
+            error_text = f"{key}: {str(e)[:300]}"
+            print("process_scheduled_broadcasts error:", error_text)
+            result["errors"].append(error_text)
+
+    return result
+
+
 @app.route("/process-completed-orders", methods=["GET", "HEAD"])
 def process_completed_orders_route():
     if request.method == "HEAD":
@@ -9156,6 +9200,25 @@ def auto_product_broadcasts_endpoint():
     except Exception as e:
         print("auto_product_broadcasts_endpoint error:", e)
         return "Auto product broadcasts error", 500
+
+
+@app.route("/scheduled-broadcasts", methods=["GET", "POST", "HEAD"])
+def scheduled_broadcasts_endpoint():
+    token = request.args.get("token", "")
+
+    if CRON_SECRET and token != CRON_SECRET:
+        return "Forbidden", 403
+
+    if is_uptime_head_check():
+        return "", 200
+
+    try:
+        result = process_scheduled_broadcasts()
+        return json.dumps(result, ensure_ascii=False), 200, {"Content-Type": "application/json; charset=utf-8"}
+    except Exception as e:
+        print("scheduled_broadcasts_endpoint error:", e)
+        return "Scheduled broadcasts error", 500
+
 
 
 
