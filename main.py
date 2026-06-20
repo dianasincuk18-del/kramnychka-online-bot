@@ -83,6 +83,16 @@ BROADCAST_MAX_RECIPIENTS_PER_RUN = int(os.environ.get("BROADCAST_MAX_RECIPIENTS_
 # Внутрішній кеш: не перечитуємо заголовки службових листів при кожному записі логу.
 SERVICE_WORKSHEETS_READY = set()
 
+# =========================
+# SCHEDULED BROADCASTS
+# =========================
+# Один безпечний endpoint /scheduled-broadcasts можна викликати планувальником.
+# Він сам вирішує, що пора запускати, і НЕ дублює повідомлення клієнтам.
+SCHEDULED_PRODUCT_DAY_START_HOUR = int(os.environ.get("SCHEDULED_PRODUCT_DAY_START_HOUR", "10"))
+SCHEDULED_SALE_START_HOUR = int(os.environ.get("SCHEDULED_SALE_START_HOUR", "12"))
+SCHEDULED_DAILY_MESSAGE_START_HOUR = int(os.environ.get("SCHEDULED_DAILY_MESSAGE_START_HOUR", "15"))
+SCHEDULED_CART_REMINDERS_EVERY_RUN = os.environ.get("SCHEDULED_CART_REMINDERS_EVERY_RUN", "1").strip().lower() in ["1", "true", "yes", "так"]
+
 
 def register_service_message(chat_id, message_id):
     try:
@@ -4466,14 +4476,7 @@ def get_broadcast_recipient_log_snapshot():
                 row_type = str(get_cell_by_header(row, headers, "Тип розсилки", "")).strip()
                 row_status = str(get_cell_by_header(row, headers, "Статус", "")).strip().lower()
 
-                # Для антидублювання важливо враховувати не тільки фінальне "Надіслано",
-                # а й попередню фіксацію/резерв, якщо процес обірвався після запису в Sheets.
-                successful_or_reserved_statuses = [
-                    "надіслано", "sent", "так",
-                    "зарезервовано", "reserved", "резерв", "в процесі", "розпочато"
-                ]
-
-                if not row_user or row_status not in successful_or_reserved_statuses:
+                if not row_user or row_status not in ["надіслано", "sent", "так"]:
                     continue
 
                 if row_key:
@@ -5090,9 +5093,9 @@ def process_marketing_broadcasts():
 
             print(f"marketing campaign sent row={row_index}, sent={sent}, failed={failed}, completed={completed}")
 
-        # Важливо: /marketing-broadcasts відповідає тільки за лист "Розсилки".
-        # "Товар дня" запускається окремо через /auto-product-broadcasts або /scheduled-broadcasts.
-        # Так ми прибираємо плутанину, коли ручна маркетингова розсилка випадково стартує товар дня.
+        # ВАЖЛИВО: /marketing-broadcasts більше не запускає автоматично "Товар дня".
+        # Товар дня запускається тільки окремо через /auto-product-broadcasts
+        # або через єдиний планувальник /scheduled-broadcasts.
         return sent_campaigns
 
     finally:
@@ -8514,39 +8517,62 @@ def process_user_menu_updates():
 
 def process_scheduled_broadcasts():
     """
-    Єдина безпечна точка для автоматичних задач розсилок.
+    Єдиний автоматичний планувальник розсилок.
 
-    Її можна запускати планувальником, але НЕ використовувати як звичайний health-check.
-    Кожна внутрішня розсилка має власний захист: час, день, історія, sheet-lock, ліміт пачки.
-    За один виклик кожна кампанія обробляє тільки невелику пачку клієнтів.
+    Як працює:
+    - до 10:00 нічого масового не шле;
+    - з 10:00 запускає/продовжує Товар дня;
+    - з 12:00 запускає/продовжує Акції;
+    - з 15:00 запускає/продовжує Повідомлення дня/комплімент;
+    - нагадування кошика перевіряє у дозволений час.
+
+    Захист від дублів лишається у send_marketing_to_all():
+    один клієнт може отримати за день максимум 1 повідомлення в кожній категорії:
+    product_day, sale, daily_message, cart_reminder, marketing.
     """
+    now = current_time()
     result = {
-        "auto_product": 0,
-        "sales": 0,
-        "daily_messages": 0,
-        "cart_reminders": 0,
-        "marketing": 0,
-        "errors": []
+        "time": now.strftime("%d.%m.%Y %H:%M"),
+        "product_day": 0,
+        "sale": 0,
+        "daily_message": 0,
+        "cart_reminders": 0
     }
 
-    tasks = [
-        ("auto_product", process_auto_product_day_broadcast),
-        ("sales", process_sale_broadcasts),
-        ("daily_messages", process_daily_soft_reminders),
-        ("cart_reminders", process_cart_reminders),
-        ("marketing", process_marketing_broadcasts),
-    ]
+    if now.hour < BROADCAST_MIN_HOUR or now.hour >= BROADCAST_MAX_HOUR:
+        print("scheduled broadcasts skipped by send window:", now_str())
+        return result
 
-    for key, func in tasks:
+    # 1. Товар дня: стартує з 10:00 і продовжується пачками, поки вся база не завершена.
+    if now.hour >= SCHEDULED_PRODUCT_DAY_START_HOUR:
         try:
-            result[key] = int(func() or 0)
+            result["product_day"] = process_auto_product_day_broadcast()
         except Exception as e:
-            error_text = f"{key}: {str(e)[:300]}"
-            print("process_scheduled_broadcasts error:", error_text)
-            result["errors"].append(error_text)
+            print("scheduled product day error:", e)
 
+    # 2. Акції: стартують з 12:00 і теж продовжуються пачками.
+    if now.hour >= SCHEDULED_SALE_START_HOUR:
+        try:
+            result["sale"] = process_sale_broadcasts()
+        except Exception as e:
+            print("scheduled sale error:", e)
+
+    # 3. Комплімент/повідомлення дня: стартує з 15:00 у дозволені дні.
+    if now.hour >= SCHEDULED_DAILY_MESSAGE_START_HOUR:
+        try:
+            result["daily_message"] = process_daily_soft_reminders()
+        except Exception as e:
+            print("scheduled daily message error:", e)
+
+    # 4. Кошик: окрема логіка з власними 1/24/72 год і нічним обмеженням.
+    if SCHEDULED_CART_REMINDERS_EVERY_RUN:
+        try:
+            result["cart_reminders"] = process_cart_reminders()
+        except Exception as e:
+            print("scheduled cart reminders error:", e)
+
+    print("scheduled broadcasts result:", result)
     return result
-
 
 @app.route("/process-completed-orders", methods=["GET", "HEAD"])
 def process_completed_orders_route():
@@ -9202,6 +9228,10 @@ def auto_product_broadcasts_endpoint():
         return "Auto product broadcasts error", 500
 
 
+
+
+
+
 @app.route("/scheduled-broadcasts", methods=["GET", "POST", "HEAD"])
 def scheduled_broadcasts_endpoint():
     token = request.args.get("token", "")
@@ -9209,19 +9239,16 @@ def scheduled_broadcasts_endpoint():
     if CRON_SECRET and token != CRON_SECRET:
         return "Forbidden", 403
 
+    # HEAD-запит не має запускати розсилку.
     if is_uptime_head_check():
         return "", 200
 
     try:
         result = process_scheduled_broadcasts()
-        return json.dumps(result, ensure_ascii=False), 200, {"Content-Type": "application/json; charset=utf-8"}
+        return "Scheduled broadcasts: " + json.dumps(result, ensure_ascii=False)
     except Exception as e:
         print("scheduled_broadcasts_endpoint error:", e)
         return "Scheduled broadcasts error", 500
-
-
-
-
 
 @app.route("/health", methods=["GET", "HEAD"])
 def health_endpoint():
