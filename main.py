@@ -9239,12 +9239,18 @@ def scheduled_broadcasts_endpoint():
     if CRON_SECRET and token != CRON_SECRET:
         return "Forbidden", 403
 
-    # HEAD-запит не має запускати розсилку.
-    if is_uptime_head_check():
-        return "", 200
-
+    # ВАЖЛИВО:
+    # Для цього endpoint HEAD дозволений, бо безкоштовний UptimeRobot запускає саме HEAD.
+    # Усі старі endpoint-и /marketing-broadcasts, /sale-broadcasts, /daily-reminders
+    # при HEAD НЕ запускаються. А тут /scheduled-broadcasts є єдиною безпечною точкою
+    # автоматичного запуску по часу.
     try:
         result = process_scheduled_broadcasts()
+
+        # Для HEAD відповідь без тіла, але код 200, щоб UptimeRobot бачив "Up".
+        if request.method == "HEAD":
+            return "", 200
+
         return "Scheduled broadcasts: " + json.dumps(result, ensure_ascii=False)
     except Exception as e:
         print("scheduled_broadcasts_endpoint error:", e)
