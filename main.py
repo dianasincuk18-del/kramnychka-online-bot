@@ -4496,9 +4496,9 @@ def broadcast_recipient_key_sent(telegram_id, campaign_key):
 def append_broadcast_recipient_logs(rows_to_append):
     """
     Записуємо логи розсилки пачкою.
-    ВАЖЛИВО: не чистимо кеш після кожного клієнта, бо це провокувало повторні читання
-    всієї історії та помилку Google Sheets 429. Перед новим запуском кеш історії
-    чиститься один раз у send_marketing_to_all().
+    Якщо запис не вдався — кидаємо помилку вгору.
+    Це важливо: краще НЕ відправити повідомлення, ніж відправити без запису історії
+    і потім продублювати його при наступному запуску.
     """
     if not rows_to_append:
         return
@@ -4514,6 +4514,7 @@ def append_broadcast_recipient_logs(rows_to_append):
                 google_call_with_retry(lambda row=row: ws.append_row(row, value_input_option="USER_ENTERED"))
         except Exception as e2:
             print("append_broadcast_recipient_logs fallback error:", e2)
+            raise e2
 
 
 def mark_broadcast_recipient_sent(telegram_id, campaign_type, campaign_key):
@@ -4835,9 +4836,14 @@ def marketing_message_text(row_type, title, body, product=None):
 
 def send_marketing_to_all(text, keyboard=None, photo_url=None, campaign_key=None, campaign_type="Маркетинг"):
     """
-    Масова розсилка з безпечним продовженням.
-    За один запуск обробляє тільки BROADCAST_MAX_RECIPIENTS_PER_RUN клієнтів,
-    щоб Render не вбивав worker. Кожен успішний клієнт одразу фіксується в "Історія розсилок".
+    Масова розсилка з жорстким захистом від дублювання.
+
+    Головне правило: перед тим як відправити повідомлення в Telegram,
+    клієнт спочатку фіксується в листі "Історія розсилок".
+    Якщо Google Sheets не зміг записати цей рядок — повідомлення НЕ відправляємо.
+
+    Це прибирає ситуацію, коли Render/Google обриває процес після відправки,
+    але до запису історії, і той самий клієнт отримує розсилку повторно.
 
     Повертає: sent, failed, completed
     completed=True тільки коли по цій розсилці більше немає клієнтів для відправки.
@@ -4846,33 +4852,27 @@ def send_marketing_to_all(text, keyboard=None, photo_url=None, campaign_key=None
     failed = 0
     skipped = 0
     processed_this_run = 0
-    paused = False
-    log_rows = []
     status_rows = []
 
     if not campaign_key:
         campaign_key = f"{campaign_type}|{current_time().strftime('%d.%m.%Y')}|{str(text)[:80]}"
     campaign_key = str(campaign_key).strip()
 
-    # Головний захист від 2-3 однакових розсилок: фіксуємо запуск у Google Sheets ДО відправки.
-    # Якщо попередній запуск завис, після BROADCAST_LOCK_TTL_SECONDS він зможе продовжитися.
     if not acquire_persistent_broadcast_lock(campaign_type, campaign_key):
         return 0, 0, False
 
     try:
+        # Перед запуском беремо свіжу історію, щоб не повторювати тих,
+        # кому ця кампанія вже була зарезервована/надіслана.
         get_broadcast_recipient_log_worksheet()
-
-        # Перед новим запуском один раз перечитуємо свіжу історію,
-        # але не робимо це після кожного відправленого клієнта.
         clear_cache(BROADCAST_HISTORY_SHEET_NAME)
         clear_cache("Надіслані розсилки клієнтам")
 
         client_ids = get_broadcast_client_ids()
         sent_keys, today_counts = get_broadcast_recipient_log_snapshot()
-        sent_at = now_str()
-        max_per_run = int(BROADCAST_MAX_RECIPIENTS_PER_RUN or 25)
+        max_per_run = int(BROADCAST_MAX_RECIPIENTS_PER_RUN or 10)
         if max_per_run <= 0:
-            max_per_run = 25
+            max_per_run = 10
 
         for client_id in client_ids:
             try:
@@ -4882,24 +4882,22 @@ def send_marketing_to_all(text, keyboard=None, photo_url=None, campaign_key=None
 
                 unique_key = f"{client_id}|{campaign_key}"
 
+                # Якщо вже є в історії — не чіпаємо цього клієнта.
                 if unique_key in sent_keys:
                     skipped += 1
                     continue
 
+                # Денний ліміт рахується по bucket: товар дня окремо, акція окремо.
                 if BROADCAST_DAILY_LIMIT_PER_USER > 0 and broadcast_daily_limit_count(today_counts, client_id, campaign_type, campaign_key) >= BROADCAST_DAILY_LIMIT_PER_USER:
                     skipped += 1
                     continue
 
-                # Тут ми знайшли реального клієнта, якому ще треба спробувати відправити.
-                # Якщо пачка вже набрана — одразу фіксуємо "Пауза" і виходимо.
-                # Це важливо для Render: якщо чекати ще важкі перевірки, worker може обірватися
-                # і в листі лишиться "Розпочато", після чого розсилка ніби зависає.
+                # Пачка набрана — ставимо паузу і виходимо. Наступний запуск продовжить.
                 if processed_this_run >= max_per_run:
-                    paused = True
                     try:
                         batch_update_broadcast_user_statuses(status_rows)
                     except Exception as status_error:
-                        print("send_marketing_to_all early pause status update error:", status_error)
+                        print("send_marketing_to_all pause status update error:", status_error)
                     finish_persistent_broadcast_lock(
                         campaign_type,
                         campaign_key,
@@ -4909,10 +4907,36 @@ def send_marketing_to_all(text, keyboard=None, photo_url=None, campaign_key=None
                         status="Пауза"
                     )
                     print(
-                        f"send_marketing_to_all early pause type={campaign_type}, key={campaign_key}, "
+                        f"send_marketing_to_all pause type={campaign_type}, key={campaign_key}, "
                         f"sent={sent}, failed={failed}, skipped={skipped}"
                     )
                     return sent, failed, False
+
+                # КРИТИЧНО: резервуємо клієнта ДО Telegram-відправки.
+                # Якщо цей запис не вийде зробити — не відправляємо повідомлення,
+                # бо інакше при падінні Render буде дубль.
+                try:
+                    append_broadcast_recipient_logs([[
+                        now_str(),
+                        client_id,
+                        str(campaign_type or "").strip(),
+                        campaign_key,
+                        "Надіслано"
+                    ]])
+                except Exception as reserve_error:
+                    print("send_marketing_to_all reserve failed, stop before send:", client_id, reserve_error)
+                    finish_persistent_broadcast_lock(
+                        campaign_type,
+                        campaign_key,
+                        sent=sent,
+                        failed=failed,
+                        skipped=skipped,
+                        status="Пауза"
+                    )
+                    return sent, failed, False
+
+                sent_keys.add(unique_key)
+                increment_broadcast_daily_limit_count(today_counts, client_id, campaign_type, campaign_key)
 
                 send_result = send_broadcast_telegram_message(
                     chat_id=client_id,
@@ -4926,60 +4950,37 @@ def send_marketing_to_all(text, keyboard=None, photo_url=None, campaign_key=None
                 send_status = send_result.get("status", "") if isinstance(send_result, dict) else ""
                 send_error = send_result.get("error", "") if isinstance(send_result, dict) else ""
 
-                # Успішних можна не писати щоразу, а от заблокованих/недоступних треба позначити,
-                # щоб наступні розсилки їх не брали.
-                if (not ok) and send_status in ["Заблокував бота", "Чат не знайдено", "Неактивний акаунт", "Недоступний"]:
-                    status_rows.append({
-                        "telegram_id": client_id,
-                        "status": send_status,
-                        "error": send_error
-                    })
-
                 if ok:
                     sent += 1
-                    sent_keys.add(unique_key)
-                    increment_broadcast_daily_limit_count(today_counts, client_id, campaign_type, campaign_key)
-                    log_rows.append([
-                        sent_at,
-                        client_id,
-                        str(campaign_type or "").strip(),
-                        campaign_key,
-                        "Надіслано"
-                    ])
-
-                    # Пишемо маленькими пачками, щоб після падіння Render не було дублів.
-                    if len(log_rows) >= 1:
-                        append_broadcast_recipient_logs(log_rows)
-                        log_rows = []
                 else:
                     failed += 1
+                    if send_status in ["Заблокував бота", "Чат не знайдено", "Неактивний акаунт", "Недоступний"]:
+                        status_rows.append({
+                            "telegram_id": client_id,
+                            "status": send_status,
+                            "error": send_error
+                        })
 
             except Exception as e:
                 print("send_marketing_to_all user error:", client_id, e)
                 failed += 1
 
-        append_broadcast_recipient_logs(log_rows)
         batch_update_broadcast_user_statuses(status_rows)
 
-        # Якщо цикл сам дійшов до кінця списку клієнтів — ставимо завершено.
-        # Не робимо ще одне повне читання користувачів/історії через has_remaining_broadcast_recipients(),
-        # бо саме це часто добивало Google Sheets квоту 429 на Render Free.
-        completed = True
-        run_status = "Завершено"
         finish_persistent_broadcast_lock(
             campaign_type,
             campaign_key,
             sent=sent,
             failed=failed,
             skipped=skipped,
-            status=run_status
+            status="Завершено"
         )
 
         print(
             f"send_marketing_to_all type={campaign_type}, key={campaign_key}, "
-            f"sent={sent}, failed={failed}, skipped={skipped}, completed={completed}"
+            f"sent={sent}, failed={failed}, skipped={skipped}, completed=True"
         )
-        return sent, failed, completed
+        return sent, failed, True
 
     except Exception as e:
         print("send_marketing_to_all error:", e)
@@ -4996,6 +4997,7 @@ def send_marketing_to_all(text, keyboard=None, photo_url=None, campaign_key=None
             status="Помилка"
         )
         return sent, failed, False
+
 
 def process_marketing_broadcasts():
     """
