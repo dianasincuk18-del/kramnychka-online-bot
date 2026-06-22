@@ -2319,7 +2319,8 @@ def get_users_worksheet():
         "Прізвище",
         "Дата першого входу",
         "Дата останньої активності",
-        "Кількість входів"
+        "Кількість входів",
+        "Телефон"
     ]
     return get_or_create_worksheet("Користувачі", headers)
 
@@ -2400,6 +2401,64 @@ def register_user_activity(chat_id, user=None):
         print("register_user_activity error:", e)
         return False
 
+
+
+
+def update_user_phone(chat_id, phone, user=None):
+    """
+    Зберігає номер телефону клієнта у листі "Користувачі".
+    Колонка "Телефон" створюється автоматично, якщо її ще немає.
+    Telegram не передає номер при старті бота — тільки після кнопки "Поділитися номером"
+    або ручного введення номера під час оформлення/заявки.
+    """
+    try:
+        telegram_id = str(chat_id).strip()
+        phone = normalize_phone_number(phone)
+        if not telegram_id or not phone:
+            return False
+
+        user = user or {}
+        ws, cols = ensure_user_columns(["Телефон"])
+        phone_col = cols.get("Телефон")
+        if not ws or not phone_col:
+            return False
+
+        rows = google_call_with_retry(lambda: ws.get_all_values())
+        row_index = None
+
+        for i, row in enumerate(rows[1:], start=2):
+            if len(row) > 0 and str(row[0]).strip() == telegram_id:
+                row_index = i
+                break
+
+        # Якщо з якоїсь причини користувача ще немає в листі — створюємо рядок у A:G,
+        # а номер записуємо в колонку "Телефон".
+        if not row_index:
+            now = current_time().strftime("%d.%m.%Y %H:%M")
+            username = str(user.get("username", "") or "").strip()
+            first_name = str(user.get("first_name", "") or "").strip()
+            last_name = str(user.get("last_name", "") or "").strip()
+
+            last_user_row = 1
+            for existing_row_index, row in enumerate(rows[1:], start=2):
+                left_part = row[:7]
+                if any(str(cell).strip() for cell in left_part):
+                    last_user_row = existing_row_index
+
+            row_index = last_user_row + 1
+            google_call_with_retry(lambda: ws.update(
+                f"A{row_index}:G{row_index}",
+                [[telegram_id, username, first_name, last_name, now, now, 1]],
+                value_input_option="USER_ENTERED"
+            ))
+
+        google_call_with_retry(lambda: ws.update_cell(row_index, phone_col, phone))
+        clear_cache("Користувачі")
+        return True
+
+    except Exception as e:
+        print("update_user_phone error:", e)
+        return False
 
 def parse_bot_datetime(value):
     value = str(value or "").strip()
@@ -6851,6 +6910,10 @@ def handle_shared_contact(chat_id, message, user):
         send_flow_message(chat_id, "Не вдалося отримати номер телефону. Спробуйте, будь ласка, ще раз.", phone_request_keyboard())
         return True
 
+    # Одразу фіксуємо номер у листі "Користувачі".
+    # Колонка "Телефон" створиться автоматично, якщо її ще немає.
+    update_user_phone(chat_id, phone, user)
+
     state = USER_STATES.get(str(chat_id), {})
     step = state.get("step", "")
 
@@ -6918,6 +6981,7 @@ def handle_contact_state(chat_id, text, user):
 
         # Запасний варіант: якщо клієнт все ж написав номер вручну.
         state["contact_phone"] = normalize_phone_number(text)
+        update_user_phone(chat_id, state["contact_phone"], user)
         finish_contact_request(chat_id, user, state)
         USER_STATES.pop(str(chat_id), None)
         return True
@@ -6954,6 +7018,7 @@ def handle_order_state(chat_id, text, user):
 
         # Запасний варіант: якщо клієнт все ж написав номер вручну.
         state["phone"] = normalize_phone_number(text)
+        update_user_phone(chat_id, state["phone"], user)
         state["step"] = "waiting_delivery"
         USER_STATES[str(chat_id)] = state
 
