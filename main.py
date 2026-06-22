@@ -10,6 +10,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime, timedelta
 import re
 from zoneinfo import ZoneInfo
+from urllib.parse import quote
 
 app = Flask(__name__)
 
@@ -1726,6 +1727,8 @@ def callback_loading_text(data_value):
         return "🚚 Завантажуємо доставку та оплату..."
     if data_value in ["contact_manager_general", "manager_order"]:
         return "📞 Готуємо заявку менеджеру..."
+    if data_value in ["open_referral_program", "open_referral_conditions"]:
+        return "👥 Завантажуємо реферальну програму..."
     if data_value == "open_admin":
         return "👑 Відкриваємо кабінет..."
     if data_value in ["open_cart", "continue_checkout"]:
@@ -1885,6 +1888,10 @@ def get_subsection_by_button_text(text, subcategory_id=None):
 
 def inline_button(text, callback_data):
     return {"text": text, "callback_data": callback_data}
+
+
+def url_button(text, url):
+    return {"text": text, "url": url}
 
 
 def safe_text(value, default="—"):
@@ -2897,49 +2904,54 @@ def show_referral_program(chat_id, callback_message=None):
     referral_link = get_referral_link(chat_id)
     referral_stats = get_referral_stats_for_user(chat_id)
 
+    share_text = "Подивись, тут класна крамничка 💛"
+    share_url = f"https://t.me/share/url?url={quote(referral_link, safe='')}&text={quote(share_text, safe='')}"
+
     text = (
-        "👥 <b>Реферальна програма</b>\n\n"
-        "Запрошуйте друзів у нашу крамничку та отримуйте бонуси за їхні покупки 💛\n\n"
-        "🎁 <b>Що отримуєте Ви?</b>\n"
-        "За кожного нового клієнта, який перейшов за Вашим посиланням, оформив перше замовлення "
-        "та отримав його зі статусом <b>Завершено</b>, Вам нараховується "
-        f"<b>{REFERRAL_BONUS_AMOUNT} бонусів</b>.\n\n"
-        "💎 <b>Бонусна програма</b>\n"
-        f"Після кожного завершеного замовлення Вам автоматично нараховується <b>{int(PURCHASE_BONUS_PERCENT)}%</b> "
-        "від суми замовлення бонусами.\n"
-        "Наприклад: замовлення на 1000 грн → 50 бонусів.\n\n"
-        "💰 <b>Як використовувати бонуси?</b>\n"
-        "• 1 бонус = 1 грн\n"
-        f"• бонусами можна оплатити до <b>{int(BONUS_MAX_USE_PERCENT)}%</b> суми неакційних товарів\n"
-        "• бонуси не застосовуються до акційних товарів, подарунків за 1 грн та товарів зі знижкою\n"
-        f"• бонуси діють <b>{BONUS_VALID_DAYS} днів</b> з моменту нарахування\n\n"
-        "⚠️ <b>Умови програми</b>\n"
-        "• бонуси нараховуються тільки після статусу <b>Завершено</b>\n"
-        "• списати бонуси можна тільки на товари без активної акції\n"
-        f"• мінімальна сума першого замовлення друга для реферального бонусу — <b>{int(REFERRAL_MIN_ORDER_SUM)} грн</b>\n"
-        "• бонус за друга нараховується лише за його перше успішне замовлення\n"
-        "• один номер телефону може брати участь у програмі лише один раз\n"
-        "• якщо замовлення скасоване або повернене, бонуси анулюються\n"
-        "• запрошувати самого себе через інший акаунт заборонено\n\n"
-        f"🎁 Ваші доступні бонуси: <b>{balance}</b>\n"
-        f"👥 Запрошено друзів: <b>{referral_stats['invited_total']}</b>\n"
-        f"✅ Успішних рефералів: <b>{referral_stats['successful']}</b>\n"
-        f"⏳ Очікують першого замовлення: <b>{referral_stats['waiting']}</b>\n"
-        f"💛 Нараховано за рефералку: <b>{referral_stats['bonus_total']}</b> бонусів\n\n"
-        "🔗 <b>Ваше реферальне посилання:</b>\n"
+        "🎁 <b>Отримуйте бонуси за рекомендації</b>\n\n"
+        "Поділіться своїм посиланням з подругою або другом.\n"
+        "Коли людина перейде за Вашим посиланням і зробить перше успішне замовлення — "
+        "Ви отримаєте бонуси 💛\n\n"
+        f"Ваші бонуси зараз: <b>{balance}</b> грн\n"
+        f"Запрошено друзів: <b>{referral_stats['invited_total']}</b>\n"
+        f"Успішних запрошень: <b>{referral_stats['successful']}</b>\n\n"
+        "🔗 <b>Ваше посилання:</b>\n"
         f"{referral_link}"
     )
 
     keyboard = {
         "inline_keyboard": [
-            [inline_button("🎁 Мої бонуси", "open_bonus_cabinet")],
-            [inline_button("🛒 Перейти до кошика", "open_cart")]
+            [url_button("📤 Поділитися посиланням", share_url)],
+            [inline_button("ℹ️ Умови програми", "open_referral_conditions")],
+            [inline_button("🎁 Мої бонуси", "open_bonus_cabinet")]
         ]
     }
 
     update_service_message(chat_id, callback_message, text, keyboard)
 
 
+def show_referral_conditions(chat_id, callback_message=None):
+    text = (
+        "ℹ️ <b>Умови реферальної програми</b>\n\n"
+        "1. Надішліть своє посилання другу або подрузі.\n"
+        "2. Людина має перейти в бот саме за Вашим посиланням.\n"
+        "3. Бонуси нараховуються після її першого успішного замовлення.\n"
+        f"4. Мінімальна сума першого замовлення для бонусу — <b>{int(REFERRAL_MIN_ORDER_SUM)} грн</b>.\n"
+        f"5. За успішне запрошення Ви отримаєте <b>{REFERRAL_BONUS_AMOUNT} бонусів</b>.\n"
+        "6. Саму себе запросити не можна.\n"
+        "7. Один номер телефону може брати участь у програмі лише один раз.\n"
+        "8. Бонусами можна оплатити частину наступної покупки.\n\n"
+        "💛 1 бонус = 1 грн."
+    )
+
+    keyboard = {
+        "inline_keyboard": [
+            [inline_button("⬅️ До реферальної програми", "open_referral_program")],
+            [inline_button("🎁 Мої бонуси", "open_bonus_cabinet")]
+        ]
+    }
+
+    update_service_message(chat_id, callback_message, text, keyboard)
 
 
 def get_referral_stats_for_user(chat_id):
@@ -8914,7 +8926,10 @@ def webhook():
             with_loading(chat_id, "🎁 Завантажуємо Ваші бонуси...", show_bonus_cabinet, chat_id, callback_message)
 
         elif data_value == "open_referral_program":
-            with_loading(chat_id, "👥 Завантажуємо умови реферальної програми...", show_referral_program, chat_id, callback_message)
+            with_loading(chat_id, "👥 Завантажуємо реферальну програму...", show_referral_program, chat_id, callback_message)
+
+        elif data_value == "open_referral_conditions":
+            with_loading(chat_id, "ℹ️ Завантажуємо умови програми...", show_referral_conditions, chat_id, callback_message)
 
         elif data_value == "open_sales":
             clear_product_messages(chat_id)
