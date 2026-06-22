@@ -6775,6 +6775,95 @@ def looks_like_name(text):
     letters = sum(1 for ch in text if ch.isalpha())
     return letters >= 2 and digits == 0
 
+def normalize_phone_number(value):
+    """
+    Нормалізує номер телефону з Telegram contact або з ручного введення.
+    Telegram може передати номер без "+", тому для українських номерів додаємо "+".
+    """
+    phone = str(value or "").strip().replace(" ", "")
+    if phone.startswith("00"):
+        phone = "+" + phone[2:]
+    if phone and not phone.startswith("+") and phone.startswith("380"):
+        phone = "+" + phone
+    return phone
+
+
+def phone_request_keyboard():
+    """
+    Reply-кнопка Telegram, яка дозволяє клієнту поділитися номером одним кліком.
+    Telegram не дає номер автоматично без згоди клієнта, тому потрібна саме така кнопка.
+    """
+    return {
+        "keyboard": [
+            [{"text": "📱 Поділитися номером", "request_contact": True}],
+            [{"text": "⬅️ Назад"}]
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": True
+    }
+
+
+def ask_phone_via_contact_button(chat_id, text=None):
+    text = text or (
+        "📱 Натисніть, будь ласка, кнопку <b>«Поділитися номером»</b> нижче.\n\n"
+        "Так менеджер зможе швидше зв’язатися з Вами 💛"
+    )
+    send_flow_message(chat_id, text, phone_request_keyboard())
+
+
+def ask_delivery_method_after_phone(chat_id):
+    remove_reply_keyboard(chat_id)
+    keyboard = {
+        "inline_keyboard": [
+            [inline_button("🚚 Нова пошта", "delivery_np")],
+            [inline_button("📦 Укрпошта", "delivery_ukr")]
+        ]
+    }
+    send_flow_message(chat_id, "Оберіть, будь ласка, спосіб доставки:", keyboard)
+
+
+def handle_shared_contact(chat_id, message, user):
+    """
+    Обробляє кнопку Telegram «Поділитися номером».
+    Працює для:
+    - заявки менеджеру;
+    - оформлення замовлення.
+    Якщо клієнт натиснув кнопку, номер підтягується автоматично і не треба вводити вручну.
+    """
+    contact = message.get("contact") if isinstance(message, dict) else None
+    if not contact:
+        return False
+
+    phone = normalize_phone_number(contact.get("phone_number", ""))
+    if not phone:
+        send_flow_message(chat_id, "Не вдалося отримати номер телефону. Спробуйте, будь ласка, ще раз.", phone_request_keyboard())
+        return True
+
+    state = USER_STATES.get(str(chat_id), {})
+    step = state.get("step", "")
+
+    # Якщо це заявка на зв’язок з менеджером.
+    if step == "contact_waiting_phone":
+        state["contact_phone"] = phone
+        finish_contact_request(chat_id, user, state)
+        USER_STATES.pop(str(chat_id), None)
+        return True
+
+    # Якщо це оформлення замовлення.
+    if step == "waiting_phone":
+        state["phone"] = phone
+        state["step"] = "waiting_delivery"
+        USER_STATES[str(chat_id)] = state
+        ask_delivery_method_after_phone(chat_id)
+        return True
+
+    send_service_message(
+        chat_id,
+        "Номер отримано ✅\n\nОберіть, будь ласка, що хочете зробити далі:",
+        main_menu_inline(is_admin(chat_id))
+    )
+    return True
+
 
 def handle_contact_state(chat_id, text, user):
     state = USER_STATES.get(str(chat_id))
@@ -6800,15 +6889,23 @@ def handle_contact_state(chat_id, text, user):
         state["contact_full_name"] = text.strip()
         state["step"] = "contact_waiting_phone"
         USER_STATES[str(chat_id)] = state
-        send_flow_message(chat_id, "Введіть, будь ласка, Ваш номер телефону:")
+        ask_phone_via_contact_button(
+            chat_id,
+            "📱 Натисніть кнопку <b>«Поділитися номером»</b> нижче, щоб менеджер міг з Вами зв’язатися."
+        )
         return True
 
     if step == "contact_waiting_phone":
         if not looks_like_phone(text):
-            send_flow_message(chat_id, "Введіть, будь ласка, коректний номер телефону. Наприклад: +380XXXXXXXXX")
+            ask_phone_via_contact_button(
+                chat_id,
+                "📱 Натисніть кнопку <b>«Поділитися номером»</b> нижче.\n\n"
+                "Так номер підтягнеться автоматично, без ручного введення."
+            )
             return True
 
-        state["contact_phone"] = text.strip()
+        # Запасний варіант: якщо клієнт все ж написав номер вручну.
+        state["contact_phone"] = normalize_phone_number(text)
         finish_contact_request(chat_id, user, state)
         USER_STATES.pop(str(chat_id), None)
         return True
@@ -6828,21 +6925,27 @@ def handle_order_state(chat_id, text, user):
         state["full_name"] = text.strip()
         state["step"] = "waiting_phone"
         USER_STATES[str(chat_id)] = state
-        send_flow_message(chat_id, "Введіть, будь ласка, Ваш номер телефону:")
+        ask_phone_via_contact_button(
+            chat_id,
+            "📱 Натисніть кнопку <b>«Поділитися номером»</b> нижче, щоб ми підтягнули Ваш номер для замовлення."
+        )
         return True
 
     if step == "waiting_phone":
-        state["phone"] = text.strip()
+        if not looks_like_phone(text):
+            ask_phone_via_contact_button(
+                chat_id,
+                "📱 Натисніть кнопку <b>«Поділитися номером»</b> нижче.\n\n"
+                "Так номер підтягнеться автоматично, без ручного введення."
+            )
+            return True
+
+        # Запасний варіант: якщо клієнт все ж написав номер вручну.
+        state["phone"] = normalize_phone_number(text)
         state["step"] = "waiting_delivery"
         USER_STATES[str(chat_id)] = state
 
-        keyboard = {
-            "inline_keyboard": [
-                [inline_button("🚚 Нова пошта", "delivery_np")],
-                [inline_button("📦 Укрпошта", "delivery_ukr")]
-            ]
-        }
-        send_flow_message(chat_id, "Оберіть, будь ласка, спосіб доставки:", keyboard)
+        ask_delivery_method_after_phone(chat_id)
         return True
 
     if step == "waiting_city":
@@ -7236,6 +7339,7 @@ def contact_manager(chat_id, user, source="manual", product_id=""):
 
 def finish_contact_request(chat_id, user, state):
     clear_flow_messages(chat_id)
+    remove_reply_keyboard(chat_id)
     request_date = current_time().strftime("%d.%m.%Y %H:%M")
     full_name = state.get("contact_full_name", "")
     phone = state.get("contact_phone", "")
@@ -8597,6 +8701,9 @@ def webhook():
         text = message.get("text", "")
         user = message.get("from", {})
         is_new_user = register_user_activity(chat_id, user)
+
+        if handle_shared_contact(chat_id, message, user):
+            return "ok"
 
         if handle_payment_receipt(chat_id, message):
             return "ok"
