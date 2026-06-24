@@ -49,6 +49,8 @@ MANAGER_TELEGRAM_URL = f"https://t.me/{MANAGER_TELEGRAM_USERNAME}"
 CATALOG_CHANNEL_ID = os.environ.get("CATALOG_CHANNEL_ID", "@kramnychka_online").strip()
 CATALOG_BOT_URL = os.environ.get("CATALOG_BOT_URL", "https://t.me/kramnychka_online_ua_bot").strip()
 CHANNEL_PUBLISH_MAX_PER_RUN = int(os.environ.get("CHANNEL_PUBLISH_MAX_PER_RUN", "3"))
+# Окрема пачка для публікації акційних постів у канал.
+CHANNEL_SALES_PUBLISH_MAX_PER_RUN = int(os.environ.get("CHANNEL_SALES_PUBLISH_MAX_PER_RUN", "3"))
 
 USER_STATES = {}
 
@@ -6113,6 +6115,217 @@ def process_product_channel_publications(limit=None):
 
 
 
+# =========================
+# SALES CHANNEL PUBLISHING
+# =========================
+# Окрема функція для публікації саме акційних товарів у Telegram-канал.
+# Основну логіку бота, меню, кошик і замовлення це НЕ змінює.
+
+
+def ensure_sales_channel_columns():
+    """
+    Додає в лист "Товари" службові колонки для публікації акцій у канал, якщо їх ще немає.
+    Повертає worksheet та map назва колонки → номер колонки.
+    """
+    required_headers = [
+        "Опублікувати акцію в канал",
+        "Акція опублікована в канал",
+        "Дата публікації акції",
+        "ID повідомлення акції в каналі"
+    ]
+
+    ws = get_cached_worksheet("Товари")
+    rows = google_call_with_retry(lambda: ws.get_all_values())
+    headers = rows[0] if rows else []
+
+    if not headers:
+        google_call_with_retry(lambda: ws.append_row(required_headers, value_input_option="USER_ENTERED"))
+        headers = required_headers[:]
+
+    normalized = {str(h).strip().lower(): idx for idx, h in enumerate(headers, start=1) if str(h).strip()}
+    cols = {}
+    changed = False
+
+    for header in required_headers:
+        key = header.strip().lower()
+        if key in normalized:
+            cols[header] = normalized[key]
+            continue
+
+        new_col = len(headers) + 1
+        try:
+            current_cols = int(getattr(ws, "col_count", 0) or 0)
+            if current_cols < new_col:
+                google_call_with_retry(lambda new_col=new_col, current_cols=current_cols: ws.add_cols(new_col - current_cols))
+        except Exception as e:
+            print("ensure_sales_channel_columns add_cols error:", e)
+
+        google_call_with_retry(lambda new_col=new_col, header=header: ws.update_cell(1, new_col, header))
+        headers.append(header)
+        normalized[key] = new_col
+        cols[header] = new_col
+        changed = True
+
+    if changed:
+        clear_cache("Товари")
+        clear_sheet_connection_cache("Товари")
+
+    return ws, cols
+
+
+def sale_channel_caption(product, with_photo=True):
+    name = safe_text(product.get("Назва товару"), "Товар без назви")
+    description = safe_text(product.get("Опис"), "")
+    price = safe_text(product.get("Ціна"), "0")
+    old_price = str(product.get("Стара ціна", "") or "").strip() if is_product_sale_active(product) else ""
+    sale_price = get_active_sale_price(product)
+    sale = get_product_sale_text(product)
+    period_info = sale_period_text(product)
+    gift_info = promo_gift_text_for_product(product)
+
+    footer = product_channel_footer()
+
+    text = "🔥 <b>Акція в Крамничці!</b>\n\n"
+    text += f"🛍 <b>{name}</b>\n\n"
+
+    if description:
+        description_limit = 320 if with_photo else 900
+        if len(description) > description_limit:
+            description = description[:description_limit].rstrip() + "…"
+        text += f"{description}\n\n"
+
+    if old_price and sale_price:
+        text += f"💸 Стара ціна: <s>{old_price} грн</s>\n"
+        text += f"🔥 Акційна ціна: <b>{sale_price} грн</b>\n"
+    elif sale_price:
+        text += f"🔥 Акційна ціна: <b>{sale_price} грн</b>\n"
+    else:
+        text += f"💰 Ціна: <b>{price} грн</b>\n"
+
+    if sale:
+        text += f"🎁 Акція: <b>{sale}</b>\n"
+
+    if period_info:
+        text += f"{period_info}\n"
+
+    if gift_info:
+        text += f"\n{gift_info}\n"
+
+    text += footer
+
+    if with_photo:
+        return text[:1024]
+    return text[:3900]
+
+
+def publish_sale_to_channel(product):
+    photos = get_product_photos(product)
+    keyboard = product_channel_keyboard()
+
+    if photos:
+        message_id = send_channel_photo(
+            CATALOG_CHANNEL_ID,
+            photos[0],
+            sale_channel_caption(product, with_photo=True),
+            keyboard
+        )
+        if message_id:
+            return message_id
+
+        # Якщо Telegram не зміг взяти фото за посиланням — публікуємо хоча б текст.
+        print("publish_sale_to_channel: photo failed, fallback to text")
+
+    return send_channel_message(
+        CATALOG_CHANNEL_ID,
+        sale_channel_caption(product, with_photo=False),
+        keyboard
+    )
+
+
+def process_sales_channel_publications(limit=None):
+    """
+    Публікує в Telegram-канал саме акційні товари, де в листі "Товари" стоїть:
+    Опублікувати акцію в канал = Так
+    і ще не стоїть:
+    Акція опублікована в канал = Так
+    """
+    result = {"published": 0, "skipped": 0, "failed": 0, "limit": 0}
+
+    if not CATALOG_CHANNEL_ID:
+        print("process_sales_channel_publications: CATALOG_CHANNEL_ID is empty")
+        return result
+
+    max_to_publish = int(limit or CHANNEL_SALES_PUBLISH_MAX_PER_RUN or 3)
+    result["limit"] = max_to_publish
+
+    ws, cols = ensure_sales_channel_columns()
+    rows = google_call_with_retry(lambda: ws.get_all_values())
+    if len(rows) <= 1:
+        return result
+
+    headers = rows[0]
+    headers_map = {
+        str(header).strip().lower(): idx
+        for idx, header in enumerate(headers)
+        if str(header).strip()
+    }
+
+    publish_col = cols.get("Опублікувати акцію в канал")
+    published_col = cols.get("Акція опублікована в канал")
+    published_at_col = cols.get("Дата публікації акції")
+    message_id_col = cols.get("ID повідомлення акції в каналі")
+
+    now_value = now_str()
+
+    for row_index, row in enumerate(rows[1:], start=2):
+        if result["published"] >= max_to_publish:
+            break
+
+        product = {}
+        for header, idx in headers_map.items():
+            # Зберігаємо оригінальну назву заголовка, щоб існуючі функції працювали без змін.
+            original_header = headers[idx] if idx < len(headers) else header
+            product[original_header] = row[idx] if idx < len(row) else ""
+
+        publish_flag = row[publish_col - 1] if publish_col and len(row) >= publish_col else ""
+        already_published = row[published_col - 1] if published_col and len(row) >= published_col else ""
+
+        if not is_yes_value(publish_flag):
+            result["skipped"] += 1
+            continue
+
+        if is_yes_value(already_published):
+            result["skipped"] += 1
+            continue
+
+        if not is_active_product_row(product):
+            result["skipped"] += 1
+            continue
+
+        if not is_product_sale_active(product):
+            result["skipped"] += 1
+            continue
+
+        message_id = publish_sale_to_channel(product)
+        if message_id:
+            try:
+                google_call_with_retry(lambda row_index=row_index: ws.update_cell(row_index, published_col, "Так"))
+                google_call_with_retry(lambda row_index=row_index: ws.update_cell(row_index, published_at_col, now_value))
+                google_call_with_retry(lambda row_index=row_index, message_id=message_id: ws.update_cell(row_index, message_id_col, str(message_id)))
+                clear_cache("Товари")
+                result["published"] += 1
+            except Exception as e:
+                print("publish sale mark error:", e)
+                result["failed"] += 1
+        else:
+            result["failed"] += 1
+
+    print("process_sales_channel_publications:", result)
+    return result
+
+
+
+
 def build_product_keyboard(product_id, products, index, mode="category", category_id="", photo_index=0):
     product = products[index]
     photos = get_product_photos(product)
@@ -9504,6 +9717,31 @@ def publish_products_channel_endpoint():
     except Exception as e:
         print("publish_products_channel_endpoint error:", e)
         return "Channel products publish error", 500
+
+
+
+@app.route("/publish-sales-channel", methods=["GET", "POST", "HEAD"])
+def publish_sales_channel_endpoint():
+    if request.method == "HEAD":
+        return "", 200
+
+    token = request.args.get("token", "")
+    if CRON_SECRET and token != CRON_SECRET:
+        return "Forbidden", 403
+
+    try:
+        limit = request.args.get("limit", None)
+        result = process_sales_channel_publications(limit=limit)
+        return (
+            f"Channel sales published: {result.get('published', 0)}; "
+            f"failed: {result.get('failed', 0)}; "
+            f"skipped: {result.get('skipped', 0)}; "
+            f"limit: {result.get('limit', '')}"
+        ), 200
+    except Exception as e:
+        print("publish_sales_channel_endpoint error:", e)
+        return "Channel sales publish error", 500
+
 
 
 @app.route("/update-user-menus", methods=["GET", "POST", "HEAD"])
