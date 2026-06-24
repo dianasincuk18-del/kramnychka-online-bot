@@ -35,6 +35,11 @@ CRON_SECRET = os.environ.get("CRON_SECRET", "")
 
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+# Прямий контакт менеджера в Telegram.
+# За потреби можна змінити в Render Environment: MANAGER_TELEGRAM_USERNAME=manager_kramnychkaonline
+MANAGER_TELEGRAM_USERNAME = os.environ.get("MANAGER_TELEGRAM_USERNAME", "manager_kramnychkaonline").strip().replace("@", "")
+MANAGER_TELEGRAM_URL = f"https://t.me/{MANAGER_TELEGRAM_USERNAME}"
+
 USER_STATES = {}
 
 # =========================
@@ -1149,7 +1154,6 @@ def normalize_inline_keyboard(keyboard):
             "open_bonus_cabinet",
             "open_referral_program",
             "contact_manager_general",
-            "manager_order",
             "open_delivery_payment"
         }
         if main_callbacks.issubset(set(callbacks)):
@@ -1756,13 +1760,25 @@ def main_menu(is_admin=False):
     return {"remove_keyboard": True}
 
 
+def manager_contact_link_html():
+    return f'<a href="{MANAGER_TELEGRAM_URL}">@{MANAGER_TELEGRAM_USERNAME}</a>'
+
+
+def main_menu_text():
+    return (
+        "🏠 <b>Головне меню</b>\n\n"
+        "Оберіть, будь ласка, що хочете переглянути:\n\n"
+        f"💬 Швидкий зв’язок з менеджером у Telegram: {manager_contact_link_html()}"
+    )
+
+
 def main_menu_inline(is_admin=False):
     buttons = [
         [inline_button("📦 Каталог", "open_catalog"), inline_button("🔥 Акції", "open_sales")],
         [inline_button("🛒 Кошик", "open_cart"), inline_button("📦 Мої замовлення", "open_orders")],
         [inline_button("🎁 Мої бонуси", "open_bonus_cabinet"), inline_button("👥 Реферальна програма", "open_referral_program")],
-        [inline_button("📞 Зв’язатися з менеджером", "contact_manager_general")],
-        [inline_button("📞 Оформити через менеджера", "manager_order")],
+        [url_button("💬 Написати менеджеру в Telegram", MANAGER_TELEGRAM_URL)],
+        [inline_button("📞 Залишити заявку менеджеру", "contact_manager_general")],
         [inline_button("🚚 Доставка і оплата", "open_delivery_payment")]
     ]
 
@@ -1770,7 +1786,6 @@ def main_menu_inline(is_admin=False):
         buttons.append([inline_button("👑 Кабінет", "open_admin")])
 
     return {"inline_keyboard": buttons}
-
 
 def remove_reply_keyboard(chat_id):
     """
@@ -5889,16 +5904,16 @@ def start(chat_id):
         "Ми постійно оновлюємо асортимент, додаємо новинки та найкращі пропозиції для Вас ✨\n\n"
         "Обов'язково заглядайте до каталогу та розділу акцій — там регулярно з'являються нові товари та вигідні знижки 🔥\n\n"
         "Бажаємо приємних покупок та гарного настрою 🌸\n\n"
+        f"💬 Швидкий зв’язок з менеджером у Telegram: {manager_contact_link_html()}\n\n"
         "Оберіть, будь ласка, що хочете переглянути:"
     )
     send_service_message(chat_id, text, main_menu_inline(is_admin(chat_id)), clear_products=False)
-
 
 def show_main_menu(chat_id, callback_message=None):
     USER_STATES.pop(str(chat_id), None)
     clear_product_messages(chat_id)
     clear_flow_messages(chat_id)
-    text = "🏠 <b>Головне меню</b>\n\nОберіть, будь ласка, що хочете переглянути:"
+    text = main_menu_text()
     keyboard = main_menu_inline(is_admin(chat_id))
 
     if callback_message:
@@ -6816,6 +6831,7 @@ def is_menu_or_catalog_text(text):
         "🎁 Мої бонуси",
         "👥 Реферальна програма",
         "📞 Зв’язатися з менеджером",
+        "📞 Залишити заявку менеджеру",
         "📞 Оформити через менеджера",
         "🚚 Доставка і оплата",
         "👑 Кабінет",
@@ -8245,7 +8261,7 @@ def handle_admin_state(chat_id, text):
     admin_cancel_texts = [
         "📦 Каталог", "🔥 Акції", "🛒 Кошик", "📦 Мої замовлення",
         "🎁 Мої бонуси", "👥 Реферальна програма", "📞 Зв’язатися з менеджером",
-        "📞 Оформити через менеджера", "🚚 Доставка і оплата", "👑 Кабінет", "⬅️ Назад"
+        "📞 Залишити заявку менеджеру", "📞 Оформити через менеджера", "🚚 Доставка і оплата", "👑 Кабінет", "⬅️ Назад"
     ]
     if state.get("step", "").startswith("admin_order_") and str(text).strip() in admin_cancel_texts:
         USER_STATES.pop(str(chat_id), None)
@@ -8840,7 +8856,7 @@ def webhook():
         elif text == "👥 Реферальна програма":
             clear_product_messages(chat_id)
             with_loading(chat_id, "👥 Завантажуємо умови реферальної програми...", show_referral_program, chat_id)
-        elif text == "📞 Зв’язатися з менеджером":
+        elif text in ["📞 Зв’язатися з менеджером", "📞 Залишити заявку менеджеру"]:
             clear_service_messages(chat_id)
             clear_product_messages(chat_id)
             with_loading(chat_id, "📞 Відкриваємо форму звернення до менеджера...", contact_manager, chat_id, user)
@@ -9030,7 +9046,7 @@ def webhook():
             clear_service_messages(chat_id)
             send_service_message(
                 chat_id,
-                "🏠 <b>Головне меню</b>\n\nОберіть, будь ласка, що хочете переглянути:",
+                main_menu_text(),
                 main_menu_inline(is_admin(chat_id)),
                 clear_products=False
             )
