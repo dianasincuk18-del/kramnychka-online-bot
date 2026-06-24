@@ -40,6 +40,16 @@ BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 MANAGER_TELEGRAM_USERNAME = os.environ.get("MANAGER_TELEGRAM_USERNAME", "manager_kramnychkaonline").strip().replace("@", "")
 MANAGER_TELEGRAM_URL = f"https://t.me/{MANAGER_TELEGRAM_USERNAME}"
 
+# =========================
+# PRODUCT CATALOG CHANNEL
+# =========================
+# Окрема функція для дублювання товарів у Telegram-канал.
+# Основну логіку бота, меню, кошик і замовлення це НЕ змінює.
+# Бот має бути адміністратором каналу з правом публікувати повідомлення.
+CATALOG_CHANNEL_ID = os.environ.get("CATALOG_CHANNEL_ID", "@kramnychka_online").strip()
+CATALOG_BOT_URL = os.environ.get("CATALOG_BOT_URL", "https://t.me/kramnychka_online_ua_bot").strip()
+CHANNEL_PUBLISH_MAX_PER_RUN = int(os.environ.get("CHANNEL_PUBLISH_MAX_PER_RUN", "3"))
+
 USER_STATES = {}
 
 # =========================
@@ -5866,6 +5876,241 @@ def get_product_photos(product):
     return photos
 
 
+# =========================
+# PRODUCT CATALOG CHANNEL PUBLISHING
+# =========================
+
+def is_yes_value(value):
+    return str(value or "").strip().lower() in ["так", "yes", "true", "1", "+", "опублікувати", "publish", "активна", "активний"]
+
+
+def ensure_products_channel_columns():
+    """
+    Додає в лист "Товари" службові колонки для публікацій у канал, якщо їх ще немає.
+    Повертає worksheet та map назва колонки → номер колонки.
+    """
+    required_headers = [
+        "Опублікувати в канал",
+        "Опубліковано в канал",
+        "Дата публікації в канал",
+        "ID повідомлення в каналі"
+    ]
+
+    ws = get_cached_worksheet("Товари")
+    rows = google_call_with_retry(lambda: ws.get_all_values())
+    headers = rows[0] if rows else []
+
+    if not headers:
+        google_call_with_retry(lambda: ws.append_row(required_headers, value_input_option="USER_ENTERED"))
+        headers = required_headers[:]
+
+    normalized = {str(h).strip().lower(): idx for idx, h in enumerate(headers, start=1) if str(h).strip()}
+    cols = {}
+    changed = False
+
+    for header in required_headers:
+        key = header.strip().lower()
+        if key in normalized:
+            cols[header] = normalized[key]
+            continue
+
+        new_col = len(headers) + 1
+        try:
+            current_cols = int(getattr(ws, "col_count", 0) or 0)
+            if current_cols < new_col:
+                google_call_with_retry(lambda new_col=new_col, current_cols=current_cols: ws.add_cols(new_col - current_cols))
+        except Exception as e:
+            print("ensure_products_channel_columns add_cols error:", e)
+
+        google_call_with_retry(lambda new_col=new_col, header=header: ws.update_cell(1, new_col, header))
+        headers.append(header)
+        normalized[key] = new_col
+        cols[header] = new_col
+        changed = True
+
+    if changed:
+        clear_cache("Товари")
+        clear_sheet_connection_cache("Товари")
+
+    return ws, cols
+
+
+def product_channel_keyboard():
+    buttons = [
+        [url_button("🛒 Перейти в бот", CATALOG_BOT_URL)],
+        [url_button("💬 Написати менеджеру", MANAGER_TELEGRAM_URL)]
+    ]
+    return {"inline_keyboard": buttons}
+
+
+def product_channel_footer():
+    manager_text = f"@{MANAGER_TELEGRAM_USERNAME}" if MANAGER_TELEGRAM_USERNAME else "менеджеру"
+    return (
+        "\n\n"
+        "Щоб замовити товар — переходьте в бот або напишіть менеджеру 💛\n"
+        f"🛒 Бот: {CATALOG_BOT_URL}\n"
+        f"💬 Менеджер: {manager_text}"
+    )
+
+
+def product_channel_caption(product, with_photo=True):
+    footer = product_channel_footer()
+    if with_photo:
+        # Caption під фото має ліміт Telegram 1024 символи, тому скорочуємо опис із запасом.
+        max_product_len = max(300, 1000 - len(footer))
+        return (product_photo_caption(product, max_len=max_product_len) + footer)[:1024]
+
+    text = product_text(product) + footer
+    return text[:3900]
+
+
+def send_channel_photo(chat_id, photo_url, caption, keyboard=None):
+    payload = {
+        "chat_id": chat_id,
+        "photo": photo_url,
+        "caption": caption,
+        "parse_mode": "HTML"
+    }
+
+    if keyboard:
+        payload["reply_markup"] = json.dumps(keyboard, ensure_ascii=False)
+
+    try:
+        response = requests.post(f"{BASE_URL}/sendPhoto", json=payload, timeout=20)
+        if not response.ok:
+            print("send_channel_photo telegram error:", response.text)
+            return None
+        data = response.json()
+        return data.get("result", {}).get("message_id")
+    except Exception as e:
+        print("send_channel_photo error:", e)
+        return None
+
+
+def send_channel_message(chat_id, text, keyboard=None):
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+
+    if keyboard:
+        payload["reply_markup"] = json.dumps(keyboard, ensure_ascii=False)
+
+    try:
+        response = requests.post(f"{BASE_URL}/sendMessage", json=payload, timeout=20)
+        if not response.ok:
+            print("send_channel_message telegram error:", response.text)
+            return None
+        data = response.json()
+        return data.get("result", {}).get("message_id")
+    except Exception as e:
+        print("send_channel_message error:", e)
+        return None
+
+
+def publish_product_to_channel(product):
+    photos = get_product_photos(product)
+    keyboard = product_channel_keyboard()
+
+    if photos:
+        message_id = send_channel_photo(
+            CATALOG_CHANNEL_ID,
+            photos[0],
+            product_channel_caption(product, with_photo=True),
+            keyboard
+        )
+        if message_id:
+            return message_id
+
+        # Якщо Telegram не зміг взяти фото за посиланням — публікуємо хоча б текст.
+        print("publish_product_to_channel: photo failed, fallback to text")
+
+    return send_channel_message(
+        CATALOG_CHANNEL_ID,
+        product_channel_caption(product, with_photo=False),
+        keyboard
+    )
+
+
+def process_product_channel_publications(limit=None):
+    """
+    Публікує в Telegram-канал товари, де в листі "Товари" стоїть:
+    Опублікувати в канал = Так
+    і ще не стоїть:
+    Опубліковано в канал = Так
+    """
+    result = {"published": 0, "skipped": 0, "failed": 0, "limit": 0}
+
+    if not CATALOG_CHANNEL_ID:
+        print("process_product_channel_publications: CATALOG_CHANNEL_ID is empty")
+        return result
+
+    max_to_publish = int(limit or CHANNEL_PUBLISH_MAX_PER_RUN or 3)
+    result["limit"] = max_to_publish
+
+    ws, cols = ensure_products_channel_columns()
+    rows = google_call_with_retry(lambda: ws.get_all_values())
+    if len(rows) <= 1:
+        return result
+
+    headers = rows[0]
+    headers_map = {
+        str(header).strip().lower(): idx
+        for idx, header in enumerate(headers)
+        if str(header).strip()
+    }
+
+    publish_col = cols.get("Опублікувати в канал")
+    published_col = cols.get("Опубліковано в канал")
+    published_at_col = cols.get("Дата публікації в канал")
+    message_id_col = cols.get("ID повідомлення в каналі")
+
+    now_value = now_str()
+
+    for row_index, row in enumerate(rows[1:], start=2):
+        if result["published"] >= max_to_publish:
+            break
+
+        product = {}
+        for header, idx in headers_map.items():
+            # Зберігаємо оригінальну назву заголовка, щоб існуючі функції product_text/get_product_photos працювали без змін.
+            original_header = headers[idx] if idx < len(headers) else header
+            product[original_header] = row[idx] if idx < len(row) else ""
+
+        publish_flag = row[publish_col - 1] if publish_col and len(row) >= publish_col else ""
+        already_published = row[published_col - 1] if published_col and len(row) >= published_col else ""
+
+        if not is_yes_value(publish_flag):
+            result["skipped"] += 1
+            continue
+
+        if is_yes_value(already_published):
+            result["skipped"] += 1
+            continue
+
+        if not is_active_product_row(product):
+            result["skipped"] += 1
+            continue
+
+        message_id = publish_product_to_channel(product)
+        if message_id:
+            try:
+                google_call_with_retry(lambda row_index=row_index: ws.update_cell(row_index, published_col, "Так"))
+                google_call_with_retry(lambda row_index=row_index: ws.update_cell(row_index, published_at_col, now_value))
+                google_call_with_retry(lambda row_index=row_index, message_id=message_id: ws.update_cell(row_index, message_id_col, str(message_id)))
+                clear_cache("Товари")
+                result["published"] += 1
+            except Exception as e:
+                print("publish product mark error:", e)
+                result["failed"] += 1
+        else:
+            result["failed"] += 1
+
+    print("process_product_channel_publications:", result)
+    return result
+
 
 
 def build_product_keyboard(product_id, products, index, mode="category", category_id="", photo_index=0):
@@ -9236,6 +9481,29 @@ def webhook():
 
 
 
+
+
+@app.route("/publish-products-channel", methods=["GET", "POST", "HEAD"])
+def publish_products_channel_endpoint():
+    if request.method == "HEAD":
+        return "", 200
+
+    token = request.args.get("token", "")
+    if CRON_SECRET and token != CRON_SECRET:
+        return "Forbidden", 403
+
+    try:
+        limit = request.args.get("limit", None)
+        result = process_product_channel_publications(limit=limit)
+        return (
+            f"Channel products published: {result.get('published', 0)}; "
+            f"failed: {result.get('failed', 0)}; "
+            f"skipped: {result.get('skipped', 0)}; "
+            f"limit: {result.get('limit', '')}"
+        ), 200
+    except Exception as e:
+        print("publish_products_channel_endpoint error:", e)
+        return "Channel products publish error", 500
 
 
 @app.route("/update-user-menus", methods=["GET", "POST", "HEAD"])
