@@ -51,6 +51,10 @@ CATALOG_BOT_URL = os.environ.get("CATALOG_BOT_URL", "https://t.me/kramnychka_onl
 CHANNEL_PUBLISH_MAX_PER_RUN = int(os.environ.get("CHANNEL_PUBLISH_MAX_PER_RUN", "3"))
 # Окрема пачка для публікації акційних постів у канал.
 CHANNEL_SALES_PUBLISH_MAX_PER_RUN = int(os.environ.get("CHANNEL_SALES_PUBLISH_MAX_PER_RUN", "3"))
+# За скільки днів до завершення акції додавати товар у дайджест "Акції скоро завершуються".
+CHANNEL_SALES_DIGEST_DAYS_BEFORE_END = int(os.environ.get("CHANNEL_SALES_DIGEST_DAYS_BEFORE_END", "3"))
+# Максимальна кількість товарів у одному пості-дайджесті акцій.
+CHANNEL_SALES_DIGEST_MAX_ITEMS = int(os.environ.get("CHANNEL_SALES_DIGEST_MAX_ITEMS", "10"))
 
 USER_STATES = {}
 
@@ -6325,6 +6329,238 @@ def process_sales_channel_publications(limit=None):
 
 
 
+# =========================
+# SALES ENDING DIGEST CHANNEL PUBLISHING
+# =========================
+# Окремий пост у канал зі списком акцій, які скоро завершуються.
+# Нова акція як і раніше публікується окремим постом через /publish-sales-channel.
+# Цей блок лише нагадує в каналі, що активні акції скоро закінчуються.
+
+
+def ensure_sales_digest_channel_columns():
+    """
+    Додає в лист "Товари" службові колонки для дайджесту завершення акцій.
+    Якщо товар уже потрапив у дайджест, повторно в такий самий дайджест він не піде,
+    доки вручну не очистити колонку "Дайджест завершення акції опубліковано".
+    """
+    required_headers = [
+        "Додати в дайджест завершення акцій",
+        "Дайджест завершення акції опубліковано",
+        "Дата дайджесту завершення акції",
+        "ID повідомлення дайджесту акцій"
+    ]
+
+    ws = get_cached_worksheet("Товари")
+    rows = google_call_with_retry(lambda: ws.get_all_values())
+    headers = rows[0] if rows else []
+
+    if not headers:
+        google_call_with_retry(lambda: ws.append_row(required_headers, value_input_option="USER_ENTERED"))
+        headers = required_headers[:]
+
+    normalized = {str(h).strip().lower(): idx for idx, h in enumerate(headers, start=1) if str(h).strip()}
+    cols = {}
+    changed = False
+
+    for header in required_headers:
+        key = header.strip().lower()
+        if key in normalized:
+            cols[header] = normalized[key]
+            continue
+
+        new_col = len(headers) + 1
+        try:
+            current_cols = int(getattr(ws, "col_count", 0) or 0)
+            if current_cols < new_col:
+                google_call_with_retry(lambda new_col=new_col, current_cols=current_cols: ws.add_cols(new_col - current_cols))
+        except Exception as e:
+            print("ensure_sales_digest_channel_columns add_cols error:", e)
+
+        google_call_with_retry(lambda new_col=new_col, header=header: ws.update_cell(1, new_col, header))
+        headers.append(header)
+        normalized[key] = new_col
+        cols[header] = new_col
+        changed = True
+
+    if changed:
+        clear_cache("Товари")
+        clear_sheet_connection_cache("Товари")
+
+    return ws, cols
+
+
+def sale_digest_line(product):
+    name = safe_text(product.get("Назва товару"), "Товар без назви")
+    old_price = str(product.get("Стара ціна", "") or "").strip() if is_product_sale_active(product) else ""
+    sale_price = get_active_sale_price(product)
+    price = str(product.get("Ціна", "") or "").strip()
+    sale = get_product_sale_text(product)
+    end = get_product_sale_end(product)
+    days_left = sale_days_left(product)
+
+    offer = ""
+    if old_price and sale_price:
+        offer = f"{sale_price} грн замість {old_price} грн"
+    elif sale_price:
+        offer = f"{sale_price} грн"
+    elif sale:
+        offer = sale
+    elif price:
+        offer = f"{price} грн"
+
+    ending = ""
+    if end:
+        ending = f"до {end.strftime('%d.%m.%Y')}"
+        if days_left == 0:
+            ending += " — останній день"
+        elif days_left == 1:
+            ending += " — залишився 1 день"
+        elif days_left is not None and days_left > 1:
+            ending += f" — залишилось {days_left} дні"
+
+    parts = [f"• <b>{name}</b>"]
+    if offer:
+        parts.append(f"— {offer}")
+    if ending:
+        parts.append(f"({ending})")
+
+    return " ".join(parts)
+
+
+def sales_digest_channel_text(products):
+    lines = [sale_digest_line(product) for product in products]
+
+    text = (
+        "🔥 <b>Акції скоро завершуються!</b>\n\n"
+        "Встигніть замовити товари за вигідною ціною, поки пропозиції ще активні 💛\n\n"
+        "<b>Акційні товари:</b>\n"
+        + "\n".join(lines)
+        + "\n\n"
+        "👇 Для замовлення переходьте в бот або пишіть менеджеру"
+        + product_channel_footer()
+    )
+
+    return text[:3900]
+
+
+def should_include_product_in_sales_digest(product, manual_flag=False):
+    """
+    Автоматично беремо тільки активні акції, які мають дату завершення
+    і закінчуються сьогодні або протягом CHANNEL_SALES_DIGEST_DAYS_BEFORE_END днів.
+    Якщо вручну стоїть "Додати в дайджест завершення акцій = Так" — беремо активну акцію навіть без дати.
+    """
+    if not is_active_product_row(product):
+        return False
+
+    if not is_product_sale_active(product):
+        return False
+
+    if manual_flag:
+        return True
+
+    days_left = sale_days_left(product)
+    if days_left is None:
+        return False
+
+    return 0 <= days_left <= CHANNEL_SALES_DIGEST_DAYS_BEFORE_END
+
+
+def process_sales_digest_channel_publication(limit=None):
+    """
+    Публікує в канал один загальний пост:
+    "Акції скоро завершуються" зі списком акційних товарів.
+
+    Нові акції окремими постами не змінюються:
+    для них як і раніше використовується /publish-sales-channel.
+    """
+    result = {"published": 0, "items": 0, "skipped": 0, "failed": 0, "limit": 0}
+
+    if not CATALOG_CHANNEL_ID:
+        print("process_sales_digest_channel_publication: CATALOG_CHANNEL_ID is empty")
+        return result
+
+    max_items = int(limit or CHANNEL_SALES_DIGEST_MAX_ITEMS or 10)
+    result["limit"] = max_items
+
+    ws, cols = ensure_sales_digest_channel_columns()
+    rows = google_call_with_retry(lambda: ws.get_all_values())
+    if len(rows) <= 1:
+        return result
+
+    headers = rows[0]
+    headers_map = {
+        str(header).strip().lower(): idx
+        for idx, header in enumerate(headers)
+        if str(header).strip()
+    }
+
+    manual_col = cols.get("Додати в дайджест завершення акцій")
+    published_col = cols.get("Дайджест завершення акції опубліковано")
+    published_at_col = cols.get("Дата дайджесту завершення акції")
+    message_id_col = cols.get("ID повідомлення дайджесту акцій")
+
+    products_for_digest = []
+    row_indexes = []
+
+    for row_index, row in enumerate(rows[1:], start=2):
+        if len(products_for_digest) >= max_items:
+            break
+
+        product = {}
+        for header, idx in headers_map.items():
+            original_header = headers[idx] if idx < len(headers) else header
+            product[original_header] = row[idx] if idx < len(row) else ""
+
+        already_published = row[published_col - 1] if published_col and len(row) >= published_col else ""
+        if is_yes_value(already_published):
+            result["skipped"] += 1
+            continue
+
+        manual_flag = row[manual_col - 1] if manual_col and len(row) >= manual_col else ""
+
+        if not should_include_product_in_sales_digest(product, manual_flag=is_yes_value(manual_flag)):
+            result["skipped"] += 1
+            continue
+
+        products_for_digest.append(product)
+        row_indexes.append(row_index)
+
+    result["items"] = len(products_for_digest)
+
+    if not products_for_digest:
+        print("process_sales_digest_channel_publication: no items")
+        return result
+
+    message_id = send_channel_message(
+        CATALOG_CHANNEL_ID,
+        sales_digest_channel_text(products_for_digest),
+        product_channel_keyboard()
+    )
+
+    if not message_id:
+        result["failed"] += 1
+        print("process_sales_digest_channel_publication: send failed")
+        return result
+
+    now_value = now_str()
+
+    for row_index in row_indexes:
+        try:
+            google_call_with_retry(lambda row_index=row_index: ws.update_cell(row_index, published_col, "Так"))
+            google_call_with_retry(lambda row_index=row_index: ws.update_cell(row_index, published_at_col, now_value))
+            google_call_with_retry(lambda row_index=row_index, message_id=message_id: ws.update_cell(row_index, message_id_col, str(message_id)))
+        except Exception as e:
+            print("sales digest mark row error:", e, "row:", row_index)
+            result["failed"] += 1
+
+    clear_cache("Товари")
+    result["published"] = 1
+
+    print("process_sales_digest_channel_publication:", result)
+    return result
+
+
+
 
 def build_product_keyboard(product_id, products, index, mode="category", category_id="", photo_index=0):
     product = products[index]
@@ -9741,6 +9977,31 @@ def publish_sales_channel_endpoint():
     except Exception as e:
         print("publish_sales_channel_endpoint error:", e)
         return "Channel sales publish error", 500
+
+
+
+@app.route("/publish-sales-digest-channel", methods=["GET", "POST", "HEAD"])
+def publish_sales_digest_channel_endpoint():
+    if request.method == "HEAD":
+        return "", 200
+
+    token = request.args.get("token", "")
+    if CRON_SECRET and token != CRON_SECRET:
+        return "Forbidden", 403
+
+    try:
+        limit = request.args.get("limit", None)
+        result = process_sales_digest_channel_publication(limit=limit)
+        return (
+            f"Channel sales digest published: {result.get('published', 0)}; "
+            f"items: {result.get('items', 0)}; "
+            f"failed: {result.get('failed', 0)}; "
+            f"skipped: {result.get('skipped', 0)}; "
+            f"limit: {result.get('limit', '')}"
+        ), 200
+    except Exception as e:
+        print("publish_sales_digest_channel_endpoint error:", e)
+        return "Channel sales digest publish error", 500
 
 
 
