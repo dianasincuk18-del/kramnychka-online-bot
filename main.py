@@ -55,6 +55,9 @@ CHANNEL_SALES_PUBLISH_MAX_PER_RUN = int(os.environ.get("CHANNEL_SALES_PUBLISH_MA
 CHANNEL_SALES_DIGEST_DAYS_BEFORE_END = int(os.environ.get("CHANNEL_SALES_DIGEST_DAYS_BEFORE_END", "3"))
 # Максимальна кількість товарів у одному пості-дайджесті акцій.
 CHANNEL_SALES_DIGEST_MAX_ITEMS = int(os.environ.get("CHANNEL_SALES_DIGEST_MAX_ITEMS", "10"))
+# Окрема функція для добірок товарів у боті та Telegram-каналі.
+COLLECTIONS_SHEET_NAME = os.environ.get("COLLECTIONS_SHEET_NAME", "Добірки").strip()
+CHANNEL_COLLECTIONS_PUBLISH_MAX_PER_RUN = int(os.environ.get("CHANNEL_COLLECTIONS_PUBLISH_MAX_PER_RUN", "3"))
 
 USER_STATES = {}
 
@@ -1169,6 +1172,7 @@ def normalize_inline_keyboard(keyboard):
             "open_orders",
             "open_bonus_cabinet",
             "open_referral_program",
+            "open_collections",
             "contact_manager_general",
             "open_delivery_payment"
         }
@@ -1749,6 +1753,8 @@ def callback_loading_text(data_value):
         return "📞 Готуємо заявку менеджеру..."
     if data_value in ["open_referral_program", "open_referral_conditions"]:
         return "👥 Завантажуємо реферальну програму..."
+    if data_value == "open_collections" or data_value.startswith("collection_"):
+        return "🛍 Завантажуємо добірки товарів..."
     if data_value == "open_admin":
         return "👑 Відкриваємо кабінет..."
     if data_value in ["open_cart", "continue_checkout"]:
@@ -1793,6 +1799,7 @@ def main_menu_inline(is_admin=False):
         [inline_button("📦 Каталог", "open_catalog"), inline_button("🔥 Акції", "open_sales")],
         [inline_button("🛒 Кошик", "open_cart"), inline_button("📦 Мої замовлення", "open_orders")],
         [inline_button("🎁 Мої бонуси", "open_bonus_cabinet"), inline_button("👥 Реферальна програма", "open_referral_program")],
+        [inline_button("🛍 Добірки товарів", "open_collections")],
         [url_button("💬 Написати менеджеру в Telegram", MANAGER_TELEGRAM_URL)],
         [inline_button("📞 Залишити заявку менеджеру", "contact_manager_general")],
         [inline_button("🚚 Доставка і оплата", "open_delivery_payment")]
@@ -6562,6 +6569,371 @@ def process_sales_digest_channel_publication(limit=None):
 
 
 
+
+# =========================
+# PRODUCT COLLECTIONS
+# =========================
+# Добірки товарів працюють окремо від основного каталогу:
+# 1) автоматично створюють лист "Добірки";
+# 2) показуються в боті як окремий розділ;
+# 3) можуть публікуватись у Telegram-канал одним постом-списком.
+# Основний каталог, кошик, акції та замовлення не змінюються.
+
+COLLECTIONS_HEADERS = [
+    "ID добірки",
+    "Назва добірки",
+    "Опис",
+    "ID товарів",
+    "Показувати в боті",
+    "Опублікувати в канал",
+    "Опубліковано в канал",
+    "Дата публікації в канал",
+    "ID повідомлення в каналі"
+]
+
+
+def ensure_collections_worksheet():
+    """
+    Автоматично створює лист "Добірки" з потрібними колонками.
+    Якщо лист уже є — акуратно додає відсутні колонки в кінець.
+    """
+    ws = get_or_create_worksheet(COLLECTIONS_SHEET_NAME, COLLECTIONS_HEADERS)
+    rows = google_call_with_retry(lambda: ws.get_all_values())
+    headers = rows[0] if rows else []
+
+    if not headers:
+        google_call_with_retry(lambda: ws.append_row(COLLECTIONS_HEADERS, value_input_option="USER_ENTERED"))
+        headers = COLLECTIONS_HEADERS[:]
+
+    normalized = {str(h).strip().lower(): idx for idx, h in enumerate(headers, start=1) if str(h).strip()}
+    cols = {}
+    changed = False
+
+    for header in COLLECTIONS_HEADERS:
+        key = header.strip().lower()
+        if key in normalized:
+            cols[header] = normalized[key]
+            continue
+
+        new_col = len(headers) + 1
+        try:
+            current_cols = int(getattr(ws, "col_count", 0) or 0)
+            if current_cols < new_col:
+                google_call_with_retry(lambda new_col=new_col, current_cols=current_cols: ws.add_cols(new_col - current_cols))
+        except Exception as e:
+            print("ensure_collections_worksheet add_cols error:", e)
+
+        google_call_with_retry(lambda new_col=new_col, header=header: ws.update_cell(1, new_col, header))
+        headers.append(header)
+        normalized[key] = new_col
+        cols[header] = new_col
+        changed = True
+
+    if changed:
+        clear_cache(COLLECTIONS_SHEET_NAME)
+        clear_sheet_connection_cache(COLLECTIONS_SHEET_NAME)
+
+    return ws, cols
+
+
+def get_collections_records():
+    ensure_collections_worksheet()
+    clear_cache(COLLECTIONS_SHEET_NAME)
+    return get_records(COLLECTIONS_SHEET_NAME)
+
+
+def normalize_collection_id(value):
+    value = str(value or "").strip()
+    value = re.sub(r"\s+", "_", value)
+    value = re.sub(r"[^A-Za-zА-Яа-яІіЇїЄєҐґ0-9_\-]", "", value)
+    return value[:50]
+
+
+def split_collection_product_ids(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return []
+
+    parts = re.split(r"[,;\n]+", raw)
+    result = []
+    for part in parts:
+        item = str(part or "").strip()
+        if item and item not in result:
+            result.append(item)
+
+    return result
+
+
+def get_products_for_collection(collection):
+    product_ids = split_collection_product_ids(collection.get("ID товарів"))
+    if not product_ids:
+        return []
+
+    products = get_cached_records("Товари")
+    products_map = {}
+    for product in products:
+        product_id = str(product.get("ID товару", "")).strip()
+        if product_id:
+            products_map[product_id] = product
+
+    result = []
+    for product_id in product_ids:
+        product = products_map.get(str(product_id).strip())
+        if not product:
+            continue
+        if not is_active_product_row(product):
+            continue
+        result.append(product)
+
+    return result
+
+
+def collection_price_line(product):
+    name = safe_text(product.get("Назва товару"), "Товар")
+    price = str(product.get("Ціна", "") or "").strip()
+    old_price = str(product.get("Стара ціна", "") or "").strip() if is_product_sale_active(product) else ""
+    sale_price = get_active_sale_price(product)
+    sale = get_product_sale_text(product)
+
+    if old_price and sale_price:
+        return f"• <b>{name}</b> — <s>{old_price} грн</s> → <b>{sale_price} грн</b>"
+    if sale_price:
+        return f"• <b>{name}</b> — <b>{sale_price} грн</b>"
+    if sale:
+        return f"• <b>{name}</b> — {sale}"
+    if price:
+        return f"• <b>{name}</b> — <b>{price} грн</b>"
+    return f"• <b>{name}</b>"
+
+
+def collection_channel_text(collection, products):
+    title = safe_text(collection.get("Назва добірки"), "🛍 Добірка товарів")
+    description = str(collection.get("Опис") or "").strip()
+
+    text = f"🛍 <b>{title}</b>\n\n"
+    if description:
+        text += f"{description}\n\n"
+
+    text += "Товари у добірці:\n"
+    for product in products[:20]:
+        text += collection_price_line(product) + "\n"
+
+    if len(products) > 20:
+        text += f"…і ще {len(products) - 20} товарів у боті\n"
+
+    text += "\n👇 Для замовлення переходьте в бот або пишіть менеджеру 💛"
+    text += f"\n🛒 Бот: {CATALOG_BOT_URL}"
+    if MANAGER_TELEGRAM_USERNAME:
+        text += f"\n💬 Менеджер: @{MANAGER_TELEGRAM_USERNAME}"
+
+    return text[:3900]
+
+
+def publish_collection_to_channel(collection):
+    products = get_products_for_collection(collection)
+    if not products:
+        return None
+
+    return send_channel_message(
+        CATALOG_CHANNEL_ID,
+        collection_channel_text(collection, products),
+        product_channel_keyboard()
+    )
+
+
+def process_collections_channel_publications(limit=None):
+    """
+    Публікує в Telegram-канал добірки, де в листі "Добірки" стоїть:
+    Опублікувати в канал = Так
+    і ще не стоїть:
+    Опубліковано в канал = Так
+    """
+    result = {"published": 0, "skipped": 0, "failed": 0, "limit": 0}
+
+    if not CATALOG_CHANNEL_ID:
+        print("process_collections_channel_publications: CATALOG_CHANNEL_ID is empty")
+        return result
+
+    max_to_publish = int(limit or CHANNEL_COLLECTIONS_PUBLISH_MAX_PER_RUN or 3)
+    result["limit"] = max_to_publish
+
+    ws, cols = ensure_collections_worksheet()
+    rows = google_call_with_retry(lambda: ws.get_all_values())
+    if len(rows) <= 1:
+        return result
+
+    headers = rows[0]
+    headers_map = {
+        str(header).strip().lower(): idx
+        for idx, header in enumerate(headers)
+        if str(header).strip()
+    }
+
+    publish_col = cols.get("Опублікувати в канал")
+    published_col = cols.get("Опубліковано в канал")
+    published_at_col = cols.get("Дата публікації в канал")
+    message_id_col = cols.get("ID повідомлення в каналі")
+
+    now_value = now_str()
+
+    for row_index, row in enumerate(rows[1:], start=2):
+        if result["published"] >= max_to_publish:
+            break
+
+        collection = {}
+        for header, idx in headers_map.items():
+            original_header = headers[idx] if idx < len(headers) else header
+            collection[original_header] = row[idx] if idx < len(row) else ""
+
+        publish_flag = row[publish_col - 1] if publish_col and len(row) >= publish_col else ""
+        already_published = row[published_col - 1] if published_col and len(row) >= published_col else ""
+
+        if not is_yes_value(publish_flag):
+            result["skipped"] += 1
+            continue
+
+        if is_yes_value(already_published):
+            result["skipped"] += 1
+            continue
+
+        products = get_products_for_collection(collection)
+        if not products:
+            result["skipped"] += 1
+            continue
+
+        message_id = send_channel_message(
+            CATALOG_CHANNEL_ID,
+            collection_channel_text(collection, products),
+            product_channel_keyboard()
+        )
+
+        if message_id:
+            try:
+                google_call_with_retry(lambda row_index=row_index: ws.update_cell(row_index, published_col, "Так"))
+                google_call_with_retry(lambda row_index=row_index: ws.update_cell(row_index, published_at_col, now_value))
+                google_call_with_retry(lambda row_index=row_index, message_id=message_id: ws.update_cell(row_index, message_id_col, str(message_id)))
+                clear_cache(COLLECTIONS_SHEET_NAME)
+                result["published"] += 1
+            except Exception as e:
+                print("publish collection mark error:", e)
+                result["failed"] += 1
+        else:
+            result["failed"] += 1
+
+    print("process_collections_channel_publications:", result)
+    return result
+
+
+def show_collections_menu(chat_id, callback_message=None):
+    clear_product_messages(chat_id)
+    collections = []
+    for collection in get_collections_records():
+        collection_id = normalize_collection_id(collection.get("ID добірки"))
+        title = str(collection.get("Назва добірки") or "").strip()
+        visible = collection.get("Показувати в боті")
+
+        if not collection_id or not title:
+            continue
+        if not is_yes_value(visible):
+            continue
+
+        products = get_products_for_collection(collection)
+        if not products:
+            continue
+
+        collections.append({
+            "id": collection_id,
+            "title": title,
+            "description": str(collection.get("Опис") or "").strip()
+        })
+
+    if not collections:
+        text = (
+            "🛍 <b>Добірки товарів</b>\n\n"
+            "Поки активних добірок немає 😔\n\n"
+            "Загляньте в каталог або перегляньте акції — там вже є цікаві пропозиції 💛"
+        )
+        keyboard = {
+            "inline_keyboard": [
+                [inline_button("📦 Відкрити каталог", "open_catalog")],
+                [inline_button("🔥 Переглянути акції", "open_sales")],
+                [inline_button("⬅️ Назад у меню", "back_main")]
+            ]
+        }
+        update_service_message(chat_id, callback_message, text, keyboard)
+        return
+
+    buttons = []
+    for collection in collections:
+        buttons.append([inline_button(collection["title"], f"collection_{collection['id']}")])
+
+    buttons.append([inline_button("📦 Відкрити каталог", "open_catalog")])
+    buttons.append([inline_button("⬅️ Назад у меню", "back_main")])
+
+    text = (
+        "🛍 <b>Добірки товарів</b>\n\n"
+        "Зібрали для Вас товари за темами, категоріями та вигідними пропозиціями 💛\n\n"
+        "Оберіть добірку нижче 👇"
+    )
+
+    USER_STATES[str(chat_id)] = {"step": "collections_menu"}
+    update_service_message(chat_id, callback_message, text, {"inline_keyboard": buttons})
+
+
+def show_collection_by_id(chat_id, collection_id, callback_message=None):
+    clear_product_messages(chat_id)
+    collection_id = normalize_collection_id(collection_id)
+
+    selected = None
+    for collection in get_collections_records():
+        if normalize_collection_id(collection.get("ID добірки")) == collection_id:
+            selected = collection
+            break
+
+    if not selected:
+        show_main_options(chat_id, "Добірку не знайдено 😔", callback_message)
+        return
+
+    if not is_yes_value(selected.get("Показувати в боті")):
+        show_main_options(chat_id, "Ця добірка зараз недоступна 😔", callback_message)
+        return
+
+    products = get_products_for_collection(selected)
+    if not products:
+        show_main_options(chat_id, "У цій добірці поки немає активних товарів 😔", callback_message)
+        return
+
+    title = safe_text(selected.get("Назва добірки"), "Добірка товарів")
+    description = str(selected.get("Опис") or "").strip()
+
+    intro = f"🛍 <b>{title}</b>\n\n"
+    if description:
+        intro += f"{description}\n\n"
+    intro += f"Товарів у добірці: <b>{len(products)}</b>"
+
+    update_service_message(
+        chat_id,
+        callback_message,
+        intro,
+        {
+            "inline_keyboard": [
+                [inline_button("⬅️ До добірок", "open_collections")],
+                [inline_button("🛒 Кошик", "open_cart")]
+            ]
+        },
+        clear_products=False
+    )
+
+    show_products_page(
+        chat_id=chat_id,
+        products=products,
+        page=0,
+        mode="collection",
+        category_id=collection_id,
+        callback_message=None
+    )
+
+
 def build_product_keyboard(product_id, products, index, mode="category", category_id="", photo_index=0):
     product = products[index]
     photos = get_product_photos(product)
@@ -6890,7 +7262,7 @@ def show_product_card(chat_id, products, index=0, mode="category", category_id="
 
 
 
-def build_products_page_keyboard(page, total_pages):
+def build_products_page_keyboard(page, total_pages, back_callback="back_categories", back_text="📦 До каталогу"):
     buttons = []
 
     nav_row = []
@@ -6902,7 +7274,7 @@ def build_products_page_keyboard(page, total_pages):
     if nav_row:
         buttons.append(nav_row)
 
-    buttons.append([inline_button("📦 До каталогу", "back_categories")])
+    buttons.append([inline_button(back_text, back_callback)])
     buttons.append([inline_button("🛒 Перейти в кошик", "open_cart")])
     return {"inline_keyboard": buttons}
 
@@ -6940,7 +7312,7 @@ def show_products_page(chat_id, products, page=0, mode="category", category_id="
         f"Сторінка: <b>{page + 1}</b> з <b>{total_pages}</b>"
     )
 
-    update_service_message(chat_id, callback_message, header, build_products_page_keyboard(page, total_pages), clear_products=False)
+    update_service_message(chat_id, callback_message, header, build_products_page_keyboard(page, total_pages, "open_collections" if mode == "collection" else "back_categories", "🛍 До добірок" if mode == "collection" else "📦 До каталогу"), clear_products=False)
 
     for idx in range(start_index, end_index):
         show_product_card(
@@ -6956,7 +7328,7 @@ def show_products_page(chat_id, products, page=0, mode="category", category_id="
     nav_message_id = send_message(
         chat_id,
         f"📄 Сторінка <b>{page + 1}</b> з <b>{total_pages}</b>",
-        build_products_page_keyboard(page, total_pages)
+        build_products_page_keyboard(page, total_pages, "open_collections" if mode == "collection" else "back_categories", "🛍 До добірок" if mode == "collection" else "📦 До каталогу")
     )
     register_product_message(chat_id, nav_message_id, PRODUCT_CARD_AUTO_DELETE_SECONDS)
 
@@ -9527,6 +9899,9 @@ def webhook():
         elif text == "📦 Каталог":
             clear_product_messages(chat_id)
             with_loading(chat_id, "🛍️ Зачекайте, будь ласка...\n\nПідбираємо для Вас товари ✨", show_catalog_menu, chat_id)
+        elif text == "🛍 Добірки товарів":
+            clear_product_messages(chat_id)
+            with_loading(chat_id, "🛍 Завантажуємо добірки товарів...", show_collections_menu, chat_id)
         elif category:
             with_loading(chat_id, "📂 Завантажуємо розділи...", show_subcategories_reply, chat_id, category.get("ID категорії"))
         elif get_subcategory_by_button_text(text, USER_STATES.get(str(chat_id), {}).get("category_id")):
@@ -9709,6 +10084,14 @@ def webhook():
         elif data_value == "open_sales":
             clear_product_messages(chat_id)
             with_loading(chat_id, "🔥 Завантажуємо акційні пропозиції...", show_sales, chat_id, callback_message)
+
+        elif data_value == "open_collections":
+            clear_product_messages(chat_id)
+            with_loading(chat_id, "🛍 Завантажуємо добірки товарів...", show_collections_menu, chat_id, callback_message)
+
+        elif data_value.startswith("collection_"):
+            collection_id = data_value.replace("collection_", "", 1)
+            with_loading(chat_id, "🛍 Відкриваємо добірку товарів...", show_collection_by_id, chat_id, collection_id, callback_message)
 
         elif data_value == "open_orders":
             clear_product_messages(chat_id)
@@ -10002,6 +10385,48 @@ def publish_sales_digest_channel_endpoint():
     except Exception as e:
         print("publish_sales_digest_channel_endpoint error:", e)
         return "Channel sales digest publish error", 500
+
+
+
+@app.route("/setup-collections-sheet", methods=["GET", "POST", "HEAD"])
+def setup_collections_sheet_endpoint():
+    if request.method == "HEAD":
+        return "", 200
+
+    token = request.args.get("token", "")
+    if CRON_SECRET and token != CRON_SECRET:
+        return "Forbidden", 403
+
+    try:
+        ensure_collections_worksheet()
+        return f"Collections sheet ready: {COLLECTIONS_SHEET_NAME}", 200
+    except Exception as e:
+        print("setup_collections_sheet_endpoint error:", e)
+        return "Collections sheet setup error", 500
+
+
+
+@app.route("/publish-collections-channel", methods=["GET", "POST", "HEAD"])
+def publish_collections_channel_endpoint():
+    if request.method == "HEAD":
+        return "", 200
+
+    token = request.args.get("token", "")
+    if CRON_SECRET and token != CRON_SECRET:
+        return "Forbidden", 403
+
+    try:
+        limit = request.args.get("limit", None)
+        result = process_collections_channel_publications(limit=limit)
+        return (
+            f"Channel collections published: {result.get('published', 0)}; "
+            f"failed: {result.get('failed', 0)}; "
+            f"skipped: {result.get('skipped', 0)}; "
+            f"limit: {result.get('limit', '')}"
+        ), 200
+    except Exception as e:
+        print("publish_collections_channel_endpoint error:", e)
+        return "Channel collections publish error", 500
 
 
 
