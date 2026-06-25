@@ -6826,6 +6826,10 @@ def process_collections_channel_publications(limit=None):
 
 def show_collections_menu(chat_id, callback_message=None):
     clear_product_messages(chat_id)
+    # Беремо свіжі дані, щоб зміни в листі "Добірки" одразу підтягувались у боті.
+    clear_cache(COLLECTIONS_SHEET_NAME)
+    clear_cache("Товари")
+
     collections = []
     for collection in get_collections_records():
         collection_id = normalize_collection_id(collection.get("ID добірки"))
@@ -6837,14 +6841,15 @@ def show_collections_menu(chat_id, callback_message=None):
         if not is_yes_value(visible):
             continue
 
+        # Важливо: добірку показуємо в меню навіть якщо частина ID товарів ще не підтягнулась.
+        # Інакше через один неправильний/неактивний товар або кеш у боті видно не всі добірки.
         products = get_products_for_collection(collection)
-        if not products:
-            continue
 
         collections.append({
             "id": collection_id,
             "title": title,
-            "description": str(collection.get("Опис") or "").strip()
+            "description": str(collection.get("Опис") or "").strip(),
+            "products_count": len(products)
         })
 
     if not collections:
@@ -6898,13 +6903,30 @@ def show_collection_by_id(chat_id, collection_id, callback_message=None):
         show_main_options(chat_id, "Ця добірка зараз недоступна 😔", callback_message)
         return
 
+    # Перед відкриттям добірки перечитуємо товари без кешу.
+    clear_cache("Товари")
     products = get_products_for_collection(selected)
-    if not products:
-        show_main_options(chat_id, "У цій добірці поки немає активних товарів 😔", callback_message)
-        return
 
     title = safe_text(selected.get("Назва добірки"), "Добірка товарів")
     description = str(selected.get("Опис") or "").strip()
+
+    if not products:
+        text = f"🛍 <b>{title}</b>\n\n"
+        if description:
+            text += f"{description}\n\n"
+        text += (
+            "У цій добірці поки немає активних товарів 😔\n\n"
+            "Перевірте, будь ласка, щоб у колонці <b>ID товарів</b> були правильні ID з листа <b>Товари</b>, "
+            "а самі товари були активні."
+        )
+        keyboard = {
+            "inline_keyboard": [
+                [inline_button("⬅️ До добірок", "open_collections")],
+                [inline_button("📦 Відкрити каталог", "open_catalog")]
+            ]
+        }
+        update_service_message(chat_id, callback_message, text, keyboard)
+        return
 
     intro = f"🛍 <b>{title}</b>\n\n"
     if description:
