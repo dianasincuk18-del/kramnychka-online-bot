@@ -1937,6 +1937,43 @@ def safe_text(value, default="—"):
     return value if value else default
 
 
+def html_escape(value):
+    """Безпечно екранує текст для HTML-повідомлень Telegram."""
+    return (
+        str(value or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def normalize_start_payload_value(value):
+    """Telegram deep-link payload підтримує тільки латиницю, цифри, _ та -."""
+    value = str(value or "").strip()
+    value = re.sub(r"[^A-Za-z0-9_\-]", "", value)
+    return value[:50]
+
+
+def bot_start_link(payload):
+    """Формує посилання на бот із payload /start."""
+    base_url = str(CATALOG_BOT_URL or "").strip().split("?", 1)[0].rstrip("/")
+    if not base_url:
+        return ""
+    payload = normalize_start_payload_value(payload)
+    if not payload:
+        return base_url
+    return f"{base_url}?start={quote(payload, safe='')}"
+
+
+def product_start_link(product_id):
+    """Посилання, яке відкриває конкретний товар у боті."""
+    product_id = normalize_start_payload_value(product_id)
+    if not product_id:
+        return ""
+    return bot_start_link(f"product_{product_id}")
+
+
 def safe_float(value, default=0):
     try:
         if value is None or value == "":
@@ -6688,22 +6725,34 @@ def get_products_for_collection(collection):
     return result
 
 
-def collection_price_line(product):
-    name = safe_text(product.get("Назва товару"), "Товар")
-    price = str(product.get("Ціна", "") or "").strip()
-    old_price = str(product.get("Стара ціна", "") or "").strip() if is_product_sale_active(product) else ""
-    sale_price = get_active_sale_price(product)
-    sale = get_product_sale_text(product)
+def collection_product_name_html(product, clickable=False):
+    name = html_escape(safe_text(product.get("Назва товару"), "Товар"))
+    product_id = str(product.get("ID товару", "") or "").strip()
+
+    if clickable and product_id:
+        link = product_start_link(product_id)
+        if link:
+            return f'<a href="{html_escape(link)}">{name}</a>'
+
+    return f"<b>{name}</b>"
+
+
+def collection_price_line(product, clickable=False):
+    name = collection_product_name_html(product, clickable=clickable)
+    price = html_escape(str(product.get("Ціна", "") or "").strip())
+    old_price = html_escape(str(product.get("Стара ціна", "") or "").strip()) if is_product_sale_active(product) else ""
+    sale_price = html_escape(get_active_sale_price(product))
+    sale = html_escape(get_product_sale_text(product))
 
     if old_price and sale_price:
-        return f"• <b>{name}</b> — <s>{old_price} грн</s> → <b>{sale_price} грн</b>"
+        return f"• {name} — <s>{old_price} грн</s> → <b>{sale_price} грн</b>"
     if sale_price:
-        return f"• <b>{name}</b> — <b>{sale_price} грн</b>"
+        return f"• {name} — <b>{sale_price} грн</b>"
     if sale:
-        return f"• <b>{name}</b> — {sale}"
+        return f"• {name} — {sale}"
     if price:
-        return f"• <b>{name}</b> — <b>{price} грн</b>"
-    return f"• <b>{name}</b>"
+        return f"• {name} — <b>{price} грн</b>"
+    return f"• {name}"
 
 
 def collection_channel_text(collection, products):
@@ -6716,12 +6765,12 @@ def collection_channel_text(collection, products):
 
     text += "Товари у добірці:\n"
     for product in products[:20]:
-        text += collection_price_line(product) + "\n"
+        text += collection_price_line(product, clickable=True) + "\n"
 
     if len(products) > 20:
         text += f"…і ще {len(products) - 20} товарів у боті\n"
 
-    text += "\n👇 Для замовлення переходьте в бот або пишіть менеджеру 💛"
+    text += "\n👇 Натискайте на назву товару, щоб відкрити його в боті, або пишіть менеджеру 💛"
     text += f"\n🛒 Бот: {CATALOG_BOT_URL}"
     if MANAGER_TELEGRAM_USERNAME:
         text += f"\n💬 Менеджер: @{MANAGER_TELEGRAM_USERNAME}"
@@ -9893,10 +9942,21 @@ def webhook():
 
         if text.startswith("/start"):
             parts = text.split(maxsplit=1)
-            if len(parts) > 1 and parts[1].startswith("ref_"):
-                register_referral_from_start(chat_id, parts[1].replace("ref_", "").strip())
+            start_payload = parts[1].strip() if len(parts) > 1 else ""
+
+            if start_payload.startswith("ref_"):
+                register_referral_from_start(chat_id, start_payload.replace("ref_", "", 1).strip())
+
             grant_welcome_bonus(chat_id, only_if_new=is_new_user)
-            with_loading(chat_id, "🌸 Раді бачити Вас у нашій крамничці!\n\n⏳ Завантажуємо меню для Вас...", start, chat_id)
+
+            if start_payload.startswith("product_"):
+                product_id = start_payload.replace("product_", "", 1).strip()
+                with_loading(chat_id, "🛍 Відкриваємо товар для Вас...", show_product_by_id, chat_id, product_id)
+            elif start_payload.startswith("p_"):
+                product_id = start_payload.replace("p_", "", 1).strip()
+                with_loading(chat_id, "🛍 Відкриваємо товар для Вас...", show_product_by_id, chat_id, product_id)
+            else:
+                with_loading(chat_id, "🌸 Раді бачити Вас у нашій крамничці!\n\n⏳ Завантажуємо меню для Вас...", start, chat_id)
         elif text == "/myid":
             show_my_id(chat_id)
         elif handle_contact_state(chat_id, text, user):
